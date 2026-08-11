@@ -542,6 +542,107 @@ def events_asof(tickers: list[str], as_of: date | str,
     """, params, parse_dates=['filed'])
 
 
+FRAMES = ('https://data.sec.gov/api/xbrl/frames/dei/'
+          'EntityCommonStockSharesOutstanding/shares/{frame}.json')
+
+
+def _recent_frames(as_of: date, back: int = 4) -> list[str]:
+    """Quarterly instant-frame identifiers, newest first."""
+    q = pd.Timestamp(as_of).to_period('Q')
+    return [f'CY{p.year}Q{p.quarter}I' for p in
+            (q - i for i in range(back))]
+
+
+def share_counts_via_frames(as_of: date | str | None = None,
+                            back: int = 4) -> pd.DataFrame:
+    """
+    Cover-page share counts for the whole market, a few calls in total.
+
+    The frames endpoint returns one concept for every filer in a period —
+    3,386 companies in a single request — where companyfacts costs one request
+    per ticker. Several quarters are merged because a filer appears in the
+    frame matching its own fiscal calendar, not everyone's.
+
+    Multi-class filers are absent by construction: their per-class counts are
+    dimensioned facts, and no frame carries those. Berkshire's newest
+    undimensioned count anywhere in SEC XBRL is from 2011.
+
+    Returns (cik, ticker, shares, filed, frame), newest per CIK.
+    """
+    as_of = pd.to_datetime(as_of or date.today()).date()
+    rows: list[dict] = []
+    for frame in _recent_frames(as_of, back):
+        payload = http.fetch_json(FRAMES.format(frame=frame),
+                                  category='submissions', ttl=6 * 3600)
+        for r in (payload or {}).get('data', []):
+            val, cik = r.get('val'), r.get('cik')
+            if not val or cik is None:
+                continue
+            rows.append({'cik': f'{int(cik):010d}', 'shares': float(val),
+                         'frame': frame, 'end': r.get('end'),
+                         'accession': r.get('accn')})
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df['end'] = pd.to_datetime(df['end'], errors='coerce')
+    # Newest observation per filer across the frames pulled.
+    df = (df.sort_values('end').drop_duplicates('cik', keep='last')
+            .reset_index(drop=True))
+
+    known = db.read_sql('SELECT ticker, cik FROM securities WHERE cik IS NOT NULL')
+    if known.empty:
+        return df
+    known['cik'] = known['cik'].astype(str).str.zfill(10)
+    return df.merge(known, on='cik', how='inner')
+
+
+def update_share_counts(as_of: date | str | None = None) -> int:
+    """
+    Refresh cover-page share counts for the whole market via frames.
+
+    Four HTTP calls cover ~450 of the S&P 500, against one call per ticker
+    through companyfacts. Rows are written into sec_facts under the same
+    concept the per-ticker path uses, so every downstream read, cache key and
+    point-in-time gate works unchanged.
+
+    A frame row carries an accession but no filing date, and a point-in-time
+    read needs one — so the accession is joined to sec_filings. Rows whose
+    filing we have not indexed are skipped rather than given an estimated
+    date: a guessed `filed` is exactly the kind of quiet fiction the rest of
+    this pipeline exists to avoid.
+    """
+    df = share_counts_via_frames(as_of)
+    if df.empty:
+        return 0
+
+    filings = db.read_sql(
+        'SELECT accession, filing_date FROM sec_filings WHERE filing_date IS NOT NULL',
+        parse_dates=['filing_date'])
+    if filings.empty:
+        log.info('share counts: no indexed filings to date them against')
+        return 0
+
+    merged = df.merge(filings, on='accession', how='inner')
+    if merged.empty:
+        return 0
+
+    rows = [{
+        'cik': r['cik'], 'tag': 'EntityCommonStockSharesOutstanding',
+        'unit': 'shares',
+        'period_start': r['end'].date(), 'period_end': r['end'].date(),
+        'filed': r['filing_date'].date(), 'form': 'FRAME',
+        'ticker': r['ticker'], 'concept': 'shares_outstanding',
+        'fy': None, 'fp': None, 'val': float(r['shares']),
+    } for _i, r in merged.iterrows()]
+
+    written = db.upsert(db.sec_facts, rows)
+    log.info('share counts: %d tickers from %d frame rows', len(merged), len(df))
+    db.record_ingest('share_counts', 'frames', rows=written)
+    return written
+
+
 def insiders_asof(tickers: list[str], as_of: date | str,
                   lookback_days: int = 180) -> pd.DataFrame:
     """Insider transactions filed in the window ending at `as_of`."""

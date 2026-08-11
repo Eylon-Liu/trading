@@ -83,6 +83,9 @@ SOURCES: dict[str, Source] = {
                          note='CIK and SIC sector; effectively static.'),
     'prices':     Source('prices', 'Daily bars', 12, True,
                          note='Also checked against the last session.'),
+    'share_counts': Source('share_counts', 'Cover-page share counts', 12, True,
+                           key_mode='global',
+                           note='Whole market in four calls via the frames API.'),
     'facts':      Source('facts', 'SEC XBRL facts', 12, True,
                          key_mode='ticker_prefix', log_source='sec_facts',
                          note='New facts appear only when a filing lands.'),
@@ -375,6 +378,7 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
 
     handlers = {
         'securities': lambda ts: sec.update_securities(ts),
+        'share_counts': lambda ts: sec.update_share_counts(),
         'facts': lambda ts: sec.update_facts(ts),
         'filings': lambda ts: sec.update_filings(ts),
         'profiles': lambda ts: yahoo.update_profiles(ts),

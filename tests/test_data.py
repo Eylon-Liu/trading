@@ -201,3 +201,54 @@ def test_summarize_respects_length_cap():
 def test_summarize_empty_is_safe():
     assert SUM.summarize('') == ''
     assert SUM.textrank('') == []
+
+
+# ─────────────────────────────────────────────
+# BULK SHARE COUNTS VIA FRAMES
+# ─────────────────────────────────────────────
+
+def test_recent_frames_are_quarterly_and_newest_first():
+    from datetime import date as _d
+
+    from data import sec
+    frames = sec._recent_frames(_d(2026, 8, 11), back=4)
+    assert frames[0] == 'CY2026Q3I'
+    assert frames == ['CY2026Q3I', 'CY2026Q2I', 'CY2026Q1I', 'CY2025Q4I']
+    assert all(f.endswith('I') for f in frames), 'instant frames only'
+
+
+def test_frames_rows_without_a_known_filing_are_skipped(monkeypatch):
+    """A frame row carries an accession but no filing date.
+
+    Point-in-time reads gate on `filed`, so a row we cannot date is dropped
+    rather than given an estimate — a guessed filing date is exactly the quiet
+    fiction the rest of the pipeline exists to prevent.
+    """
+    import pandas as pd
+
+    from data import sec
+
+    monkeypatch.setattr(sec, 'share_counts_via_frames', lambda *a, **kw: pd.DataFrame([
+        {'cik': '0000320193', 'ticker': 'AAPL', 'shares': 1.46e10,
+         'end': pd.Timestamp('2026-06-30'), 'accession': 'known-1'},
+        {'cik': '0000789019', 'ticker': 'MSFT', 'shares': 7.4e9,
+         'end': pd.Timestamp('2026-06-30'), 'accession': 'unindexed-9'},
+    ]))
+    monkeypatch.setattr(sec.db, 'read_sql', lambda *a, **kw: pd.DataFrame(
+        [{'accession': 'known-1', 'filing_date': pd.Timestamp('2026-07-31')}]))
+
+    written = {}
+
+    def fake_upsert(table, rows):
+        written['rows'] = rows
+        return len(rows)
+
+    monkeypatch.setattr(sec.db, 'upsert', fake_upsert)
+    monkeypatch.setattr(sec.db, 'record_ingest', lambda *a, **kw: None)
+
+    n = sec.update_share_counts()
+    assert n == 1
+    assert [r['ticker'] for r in written['rows']] == ['AAPL']
+    row = written['rows'][0]
+    assert row['concept'] == 'shares_outstanding'
+    assert str(row['filed']) == '2026-07-31', 'must use the real filing date'
