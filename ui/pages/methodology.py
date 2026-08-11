@@ -15,14 +15,25 @@ from dash import Input, Output, callback, dcc, html
 
 from quant import factor_docs as FD
 from quant import strategies as ST
+from quant import strategy_notes as SN
 from ui import components as C
 from ui import theme as TH
 
-MONO = {'fontFamily': 'ui-monospace, SFMono-Regular, Menlo, monospace',
-        'fontSize': '0.76rem', 'whiteSpace': 'pre', 'overflowX': 'auto',
-        'background': TH.PANEL_ALT, 'padding': '12px 14px',
-        'borderRadius': '6px', 'color': TH.TEXT, 'lineHeight': '1.5',
-        'margin': '0'}
+# Formulas are the point of this page, so they get real reading sizes rather
+# than the small type used for incidental captions elsewhere. 0.76rem monospace
+# on a dark background was legible only if you leaned in.
+MONO = {'fontFamily': 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, '
+                      'Consolas, monospace',
+        'fontSize': '0.92rem', 'whiteSpace': 'pre', 'overflowX': 'auto',
+        'background': '#12141f', 'padding': '16px 18px',
+        'border': f'1px solid {TH.BORDER}',
+        'borderRadius': '8px', 'color': '#e8eaf2', 'lineHeight': '1.7',
+        'letterSpacing': '0.2px', 'margin': '0'}
+
+# Explanatory prose. Slightly larger and looser than the app default, because
+# this page is read rather than scanned.
+PROSE = {'fontSize': '0.94rem', 'lineHeight': '1.75', 'color': '#d7dae6'}
+LABEL = {'fontSize': '0.86rem', 'color': TH.MUTED}
 
 FAMILY_COLOR = {
     'Value': '#38ef7d', 'Quality': '#00d4ff', 'Growth': '#c77dff',
@@ -73,25 +84,65 @@ def layout() -> html.Div:
 
 def _factor_body(d: FD.FactorDoc) -> html.Div:
     bits = [
-        html.Pre(d.formula, style={**MONO, 'marginBottom': '10px'}),
+        html.Pre(d.formula, style={**MONO, 'marginBottom': '14px'}),
         html.Div([
-            html.B('Inputs: ', style={'color': TH.MUTED}),
+            html.B('Inputs: ', style=LABEL),
             html.Span(d.inputs, style={'color': TH.TEXT}),
-        ], style={'fontSize': '0.8rem', 'marginBottom': '6px'}),
+        ], style={'fontSize': '0.88rem', 'marginBottom': '7px'}),
         html.Div([
-            html.B('Direction: ', style={'color': TH.MUTED}),
+            html.B('Direction: ', style=LABEL),
             html.Span(f'{d.direction} is better',
-                      style={'color': TH.POS if d.direction == 'higher' else TH.WARN}),
-        ], style={'fontSize': '0.8rem', 'marginBottom': '10px'}),
-        html.Div(d.rationale, style={'fontSize': '0.84rem', 'lineHeight': '1.6',
-                                     'marginBottom': '8px'}),
+                      style={'color': TH.POS if d.direction == 'higher' else TH.WARN,
+                             'fontWeight': '600'}),
+        ], style={'fontSize': '0.88rem', 'marginBottom': '12px'}),
+        html.Div(d.rationale, style={**PROSE, 'marginBottom': '10px'}),
     ]
     if d.caveat:
         bits.append(html.Div([
             html.B('⚠️ Caveat: ', style={'color': TH.WARN}),
-            html.Span(d.caveat, style={'color': TH.MUTED}),
-        ], style={'fontSize': '0.8rem', 'lineHeight': '1.55'}))
+            html.Span(d.caveat, style={'color': '#b9bfd0'}),
+        ], style={'fontSize': '0.88rem', 'lineHeight': '1.7',
+                  'background': 'rgba(255,183,77,0.07)',
+                  'borderLeft': f'3px solid {TH.WARN}',
+                  'padding': '9px 13px', 'borderRadius': '5px'}))
     return html.Div(bits)
+
+
+def _notes_block(key: str):
+    """Benefit, drawback and failure mode — the part a weight vector cannot say."""
+    note = SN.get(key)
+    if note is None:
+        return None
+
+    def row(icon, label, text, colour, bg):
+        return html.Div([
+            html.Div([html.Span(icon, style={'marginRight': '7px'}),
+                      html.B(label, style={'color': colour})],
+                     style={'fontSize': '0.84rem', 'marginBottom': '3px'}),
+            html.Div(text, style={'fontSize': '0.89rem', 'lineHeight': '1.7',
+                                  'color': '#d7dae6'}),
+        ], style={'background': bg, 'borderLeft': f'3px solid {colour}',
+                  'padding': '10px 14px', 'borderRadius': '5px',
+                  'marginBottom': '9px'})
+
+    return html.Div([
+        html.Div([html.B('How it differs: ', style={'color': TH.INFO}),
+                  html.Span(note.differentiator)],
+                 style={**PROSE, 'marginBottom': '12px'}),
+        row('✅', 'Benefit', note.benefit, TH.POS, 'rgba(56,239,125,0.06)'),
+        row('⚖️', 'Drawback', note.drawback, TH.WARN, 'rgba(255,183,77,0.06)'),
+        row('⚠️', 'How it fails', note.risk, TH.NEG, 'rgba(255,107,157,0.06)'),
+        dbc.Row([
+            dbc.Col(html.Div([html.B('Best when: ', style={'color': TH.POS}),
+                              html.Span(note.best_when)],
+                             style={'fontSize': '0.85rem', 'lineHeight': '1.6'}),
+                    md=6),
+            dbc.Col(html.Div([html.B('Worst when: ', style={'color': TH.NEG}),
+                              html.Span(note.worst_when)],
+                             style={'fontSize': '0.85rem', 'lineHeight': '1.6'}),
+                    md=6),
+        ], className='mb-3'),
+    ])
 
 
 def _factor_reference() -> html.Div:
@@ -149,11 +200,11 @@ def _render_strategies(horizon):
 
         body = html.Div([
             html.Div(strat.description,
-                     style={'fontSize': '0.9rem', 'marginBottom': '8px'}),
+                     style={**PROSE, 'marginBottom': '10px'}),
             html.Div([html.B('Thesis: ', style={'color': TH.ACCENT}),
                       html.Span(strat.thesis)],
-                     style={'fontSize': '0.84rem', 'lineHeight': '1.6',
-                            'marginBottom': '12px'}),
+                     style={**PROSE, 'marginBottom': '14px'}),
+            _notes_block(key),
             html.Div([
                 C.horizon_badge(strat.horizon),
                 dbc.Badge(

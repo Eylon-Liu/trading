@@ -36,12 +36,18 @@ FACTS_URL = 'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
 SUBS_URL = 'https://data.sec.gov/submissions/CIK{cik}.json'
 ARCHIVE = 'https://www.sec.gov/Archives/edgar/data/{cik}/{acc}'
 
-# Reverse lookup: us-gaap tag -> our concept name.
+# Reverse lookup: XBRL tag -> our concept name, per namespace.
 _TAG_TO_CONCEPT = {
     tag: concept
     for concept, tags in config.SEC_TAG_MAP.items()
     for tag in tags
 }
+_DEI_TAG_TO_CONCEPT = {
+    tag: concept
+    for concept, tags in config.SEC_DEI_TAG_MAP.items()
+    for tag in tags
+}
+NAMESPACES = (('us-gaap', _TAG_TO_CONCEPT), ('dei', _DEI_TAG_TO_CONCEPT))
 
 
 # ─────────────────────────────────────────────
@@ -138,30 +144,32 @@ def _fact_rows(cik: str, ticker: str, payload: dict) -> list[dict]:
     the span you cannot tell them apart, and every TTM figure built on them
     would be wrong.
     """
-    gaap = (payload.get('facts') or {}).get('us-gaap') or {}
+    facts_by_ns = payload.get('facts') or {}
     rows: list[dict] = []
 
-    for tag, concept in _TAG_TO_CONCEPT.items():
-        node = gaap.get(tag)
-        if not node:
-            continue
-        for unit, facts in (node.get('units') or {}).items():
-            for f in facts:
-                end = f.get('end')
-                filed = f.get('filed')
-                val = f.get('val')
-                if not end or not filed or val is None:
-                    continue
-                rows.append({
-                    'cik': cik, 'tag': tag, 'unit': unit,
-                    'period_start': _d(f.get('start')) or _d(end),
-                    'period_end': _d(end),
-                    'filed': _d(filed),
-                    'form': f.get('form') or '',
-                    'ticker': ticker, 'concept': concept,
-                    'fy': f.get('fy'), 'fp': f.get('fp'),
-                    'val': float(val),
-                })
+    for namespace, tag_map in NAMESPACES:
+        node_set = facts_by_ns.get(namespace) or {}
+        for tag, concept in tag_map.items():
+            node = node_set.get(tag)
+            if not node:
+                continue
+            for unit, facts in (node.get('units') or {}).items():
+                for f in facts:
+                    end = f.get('end')
+                    filed = f.get('filed')
+                    val = f.get('val')
+                    if not end or not filed or val is None:
+                        continue
+                    rows.append({
+                        'cik': cik, 'tag': tag, 'unit': unit,
+                        'period_start': _d(f.get('start')) or _d(end),
+                        'period_end': _d(end),
+                        'filed': _d(filed),
+                        'form': f.get('form') or '',
+                        'ticker': ticker, 'concept': concept,
+                        'fy': f.get('fy'), 'fp': f.get('fp'),
+                        'val': float(val),
+                    })
     return rows
 
 

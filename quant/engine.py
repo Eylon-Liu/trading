@@ -274,19 +274,20 @@ def generate_signals(scores: pd.DataFrame, raw: pd.DataFrame,
 def run(spec: UniverseSpec, strategy_key: str, as_of: date | str | None = None,
         top_n: int | None = None, persist: bool = True,
         plan_params: TP.PlanParams | None = None,
-        sync: bool = True, sync_progress=None) -> RunResult:
+        sync: bool = False, sync_progress=None) -> RunResult:
     """
-    Sync, then score. Two phases, in that order, every time.
+    Score a universe from stored data.
 
-    The pull phase refreshes only what is stale and writes it to SQLite; the
-    read phase computes from the database and never touches the network. When
-    nothing is stale the pull is a few SQL queries, the data version does not
-    move, and the factor cache serves the previous frame — which is what makes
-    a repeat run fast instead of a rebuild.
+    Reading and pulling are separate operations, and this is the read.
+    Fetching lives in one place — the Data tab's refresh button, or
+    `cli.py ingest` — so that screening, backtesting and comparing are pure
+    database work: fast, reproducible, and unable to stall on a rate-limited
+    provider mid-click.
 
-    `sync=False` forces a store-only run. Historical as-of dates set it
-    automatically: syncing fetches *today's* data, which cannot inform a past
-    date and would only invalidate caches.
+    `sync=True` opts a caller into refreshing stale sources first; the CLI
+    uses it for unattended runs. Historical as-of dates ignore it either way,
+    since fetching *today's* data cannot inform a past date and would only
+    invalidate caches.
     """
     as_of = pd.to_datetime(as_of or date.today()).date()
     strategy = ST.get(strategy_key)

@@ -214,19 +214,27 @@ def _latest_filed_date(facts: pd.DataFrame, concept: str,
 
 def share_count(facts: pd.DataFrame, memo: dict | None = None) -> float:
     """
-    Shares outstanding, preferring diluted but falling back to basic.
+    Shares outstanding, in descending order of what the number actually means.
 
-    Filers switch XBRL tags. Exxon stopped reporting
-    WeightedAverageNumberOfDilutedSharesOutstanding after 2013 and reports only
-    the basic count; taking diluted unconditionally pinned its share count to a
-    2013 figure and, through it, market cap and every yield factor derived from
-    market cap. Whichever tag was filed most recently is the one that reflects
-    the company today.
+    1. `dei:EntityCommonStockSharesOutstanding` — the cover-page count, the
+       exact shares outstanding on the filing date. This is what market
+       capitalisation is defined on, so it is used whenever present.
+    2. Diluted weighted average — an EPS denominator, not a point-in-time
+       count. It averages over the period and includes dilutive securities, so
+       it drifts from the true figure for anyone issuing or buying back.
+    3. Basic weighted average — same caveat, used when the diluted tag is
+       absent or has gone stale.
 
-    Both are weighted averages for EPS rather than a period-end count, so this
-    is an estimate — but an estimate from this year beats an exact figure from
-    twelve years ago.
+    The fallbacks matter because filers switch tags: Exxon stopped reporting
+    the diluted tag after 2013, so taking it unconditionally pinned its share
+    count — and through it market cap and every yield factor — to a twelve-year
+    old figure. Between the two averages, whichever was filed most recently
+    wins.
     """
+    exact = latest_stock(facts, 'shares_outstanding', memo)
+    if np.isfinite(exact) and exact > 0:
+        return exact
+
     diluted = latest_stock(facts, 'shares_diluted', memo)
     basic = latest_stock(facts, 'shares_basic', memo)
 

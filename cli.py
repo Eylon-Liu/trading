@@ -91,6 +91,42 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def cmd_test_email(args) -> int:
+    """Send a one-line test message, and explain clearly when it fails."""
+    from reports import email as mailer
+
+    print(f'SMTP_SERVER : {config.SMTP_SERVER}:{config.SMTP_PORT}')
+    print(f'SMTP_USER   : {config.SMTP_USER or "(not set)"}')
+    print(f'SMTP_PASS   : {"set" if config.SMTP_PASS else "(not set)"}')
+
+    if not (config.SMTP_USER and config.SMTP_PASS):
+        print('\n❌  Credentials missing. Add SMTP_USER and SMTP_PASS to .env.')
+        print('    Gmail needs an App Password, not your account password:')
+        print('    https://myaccount.google.com/apppasswords')
+        return 1
+
+    body = ('<h2>Quant Research Terminal</h2>'
+            '<p>SMTP is configured correctly. Scheduled reports will send.</p>')
+    try:
+        mailer.send_report(body, args.to, subject='Test — Quant Research Terminal')
+    except mailer.SMTPNotConfigured as exc:
+        print(f'\n❌  {exc}')
+        return 1
+    except Exception as exc:                       # noqa: BLE001
+        msg = str(exc)
+        print(f'\n❌  Send failed: {type(exc).__name__}: {msg[:200]}')
+        if 'Username and Password not accepted' in msg or '535' in msg:
+            print('    Google rejects normal account passwords. Create an App '
+                  'Password at https://myaccount.google.com/apppasswords')
+        elif 'Connection refused' in msg or 'timed out' in msg:
+            print(f'    Could not reach {config.SMTP_SERVER}:{config.SMTP_PORT}. '
+                  f'Check the server/port, or whether a firewall blocks it.')
+        return 1
+
+    print(f'\n✅  Test email sent to {args.to}. Check the inbox (and spam).')
+    return 0
+
+
 def cmd_freshness(args) -> int:
     """Show what is fresh, what is stale, and when each was last pulled."""
     from data import sync
@@ -272,6 +308,10 @@ def build_parser() -> argparse.ArgumentParser:
         .set_defaults(func=cmd_status)
     sub.add_parser('freshness', help='show which sources are stale') \
         .set_defaults(func=cmd_freshness)
+
+    te = sub.add_parser('test-email', help='verify SMTP settings')
+    te.add_argument('--to', required=True, help='recipient address')
+    te.set_defaults(func=cmd_test_email)
     return p
 
 

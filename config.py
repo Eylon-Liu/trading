@@ -239,7 +239,19 @@ SEC_TAG_MAP = {
         'PaymentsOfDividendsCommonStock', 'PaymentsOfDividends',
     ],
     'buybacks': ['PaymentsForRepurchaseOfCommonStock'],
-    'inventory': ['InventoryNet'],
+    'inventory': ['InventoryNet', 'InventoryGross',
+                  'InventoryFinishedGoodsNetOfReserves'],
+}
+
+# The `dei` (Document & Entity Information) namespace, which arrives in the
+# same companyfacts payload as us-gaap and used to be discarded.
+#
+# EntityCommonStockSharesOutstanding is the cover-page share count — the exact
+# number of shares outstanding on the filing date, not the weighted average
+# used as an EPS denominator. It is what market capitalisation actually means,
+# and it carries a `filed` date like everything else, so it stays point-in-time.
+SEC_DEI_TAG_MAP = {
+    'shares_outstanding': ['EntityCommonStockSharesOutstanding'],
 }
 
 # 8-K item codes worth treating as structured corporate events. These need no

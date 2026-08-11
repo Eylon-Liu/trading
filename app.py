@@ -54,6 +54,26 @@ app.index_string = TH.INDEX_STRING
 app.layout = serve_layout
 
 
+@server.route('/reports/<path:name>')
+def _serve_report(name: str):
+    """
+    Serve a generated report so it can be opened in its own tab.
+
+    Only files directly inside the report directory are served, and the
+    resolved path is checked to be inside it — otherwise a crafted name like
+    `../../.env` would turn this into an arbitrary file read.
+    """
+    from flask import abort, send_file
+
+    root = config.REPORT_DIR.resolve()
+    target = (root / name).resolve()
+    if root not in target.parents or not target.is_file():
+        abort(404)
+    if target.suffix.lower() not in ('.html', '.pdf'):
+        abort(404)
+    return send_file(target)
+
+
 @callback(
     [Output(f'panel-{tab_id}', 'style') for tab_id, _l, _m in TABS],
     Input('tabs', 'active_tab'),

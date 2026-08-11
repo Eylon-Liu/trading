@@ -263,3 +263,32 @@ def test_share_count_is_nan_when_neither_tag_exists():
         {'concept': 'revenue', 'period_start': '2026-01-01',
          'period_end': '2026-03-31', 'filed': '2026-04-30', 'val': 1.0}])
     assert np.isnan(F.share_count(facts))
+
+
+# ─────────────────────────────────────────────
+# STRATEGY DOCUMENTATION
+# ─────────────────────────────────────────────
+
+def test_every_strategy_has_notes():
+    """A strategy nobody can distinguish from its neighbour is not usable."""
+    from quant import strategy_notes as SN
+    c = SN.coverage()
+    assert c['missing'] == [], f'strategies without notes: {c["missing"]}'
+    assert c['orphan'] == [], f'notes for strategies that do not exist: {c["orphan"]}'
+
+
+def test_notes_are_substantive():
+    """Guards against placeholder text creeping in.
+
+    The regime fields are naturally terse ("Steady trending markets"), so they
+    carry a lower bar than the explanatory ones.
+    """
+    from quant import strategy_notes as SN
+    minimums = {'differentiator': 60, 'benefit': 60, 'drawback': 60,
+                'risk': 60, 'best_when': 15, 'worst_when': 15}
+    for key, n in SN.NOTES.items():
+        for field_name, floor in minimums.items():
+            text = getattr(n, field_name)
+            assert len(text) >= floor, (
+                f'{key}.{field_name} is too short ({len(text)} < {floor}): {text!r}')
+            assert 'TODO' not in text.upper(), f'{key}.{field_name} has a TODO'

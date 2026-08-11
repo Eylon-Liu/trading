@@ -14,7 +14,7 @@ from datetime import date
 
 import dash_bootstrap_components as dbc
 import pandas as pd
-from dash import Input, Output, callback, dcc, html, no_update
+from dash import Input, Output, State, callback, dcc, html, no_update
 
 import config
 from core import db, http
@@ -41,6 +41,49 @@ python cli.py ingest --index SPY
 
 def layout() -> html.Div:
     return html.Div([
+        # The only place in the app that reaches the network. Every other tab
+        # reads SQLite, so a screen or a backtest can never stall on a
+        # rate-limited provider — and its speed no longer depends on what the
+        # network is doing.
+        C.card('⬇️ Pull new data', [
+            dbc.Row([
+                dbc.Col([
+                    C.label('Universe to refresh'),
+                    dcc.Dropdown(
+                        id='pull-index',
+                        options=[{'label': f'{k} — {v}', 'value': k}
+                                 for k, v in config.INDEX_OPTIONS.items()],
+                        value='DIA', clearable=False),
+                ], lg=4, md=6, className='mb-2'),
+                dbc.Col([
+                    C.label('Scope'),
+                    dcc.RadioItems(
+                        id='pull-scope',
+                        options=[
+                            {'label': '  Stale only (recommended)', 'value': 'stale'},
+                            {'label': '  Everything (slow)', 'value': 'force'},
+                        ],
+                        value='stale', inline=False,
+                        inputStyle={'marginRight': '6px'},
+                        labelStyle={'display': 'block', 'fontSize': '0.83rem'}),
+                ], lg=4, md=6, className='mb-2'),
+                dbc.Col([
+                    C.gradient_button('⬇️  Pull new data', 'pull-button'),
+                ], lg=4, md=12, className='mb-2 d-flex align-items-end'),
+            ], className='align-items-end'),
+
+            C.loading(html.Div(id='pull-status',
+                               style={'fontSize': '0.85rem', 'minHeight': '26px',
+                                      'marginTop': '12px'}),
+                      'pull-loading'),
+            html.Div(id='pull-report'),
+
+            C.note('Only sources outside their refresh window are fetched, so '
+                   'pressing this when everything is current costs nothing. '
+                   'Screens, backtests and reports read stored data and never '
+                   'fetch on their own.', 'info'),
+        ], className='mb-3'),
+
         dbc.Row([
             dbc.Col(C.card('🗄️ Stored data', html.Div(id='data-tables')),
                     lg=6, className='mb-3'),
@@ -77,6 +120,53 @@ def layout() -> html.Div:
         C.card('🤖 AI analysis layer', html.Div(id='data-ai'),
                className='mb-3'),
     ])
+
+
+@callback(
+    Output('pull-status', 'children'), Output('pull-report', 'children'),
+    Output('data-sync', 'children', allow_duplicate=True),
+    Output('data-tables', 'children', allow_duplicate=True),
+    Input('pull-button', 'n_clicks'),
+    State('pull-index', 'value'), State('pull-scope', 'value'),
+    prevent_initial_call=True,
+)
+def _pull(n_clicks, index, scope):
+    """Refresh stale sources. The single network entry point in the UI."""
+    if not n_clicks:
+        return no_update, no_update, no_update, no_update
+
+    try:
+        tickers = members.latest_members(index)
+        if not tickers:
+            return (f'❌ Could not resolve members for {index}. Run '
+                    f'"python cli.py ingest --index {index}" once to seed it.',
+                    None, no_update, no_update)
+
+        report = SY.sync(tickers, index=index, force=(scope == 'force'))
+    except Exception as exc:                       # noqa: BLE001
+        log.exception('pull failed')
+        return (f'❌ {type(exc).__name__}: {str(exc)[:220]}',
+                None, no_update, no_update)
+
+    icon = '✅' if report.changed else 'ℹ️'
+    msg = f'{icon} {report.summary()}'
+    if not report.changed:
+        msg += '  ·  nothing was stale, so nothing was fetched'
+    else:
+        msg += '  ·  re-run your screen to pick up the new data'
+
+    detail = C.card('📋 What was pulled',
+                    C.data_table(report.to_frame(), page_size=12),
+                    className='mt-3 mb-0')
+
+    try:
+        counts = db.table_counts()
+        counts = counts[counts['rows'] > 0]
+        tables = C.data_table(counts, page_size=14)
+    except Exception:                              # noqa: BLE001
+        tables = no_update
+
+    return msg, detail, _sync_status_block(), tables
 
 
 def _sync_status_block() -> html.Div:
