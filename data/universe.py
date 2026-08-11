@@ -125,20 +125,35 @@ class UniverseSpec:
         # 3. size and fundamentals
         prof = yahoo.profile_asof(candidates, as_of)
         if not prof.empty:
+            # Filter only on values we actually have. Absence of a snapshot is
+            # not evidence of a small company, and treating it as one is
+            # catastrophic here: `fillna(0)` meant that the moment
+            # profile_snapshots held any rows at all, every name *without* one
+            # scored zero market cap and was dropped. Nine stored snapshots
+            # cut an S&P 500 screen to nine names.
             keep = pd.Series(True, index=prof.index)
-            if self.min_market_cap:
-                keep &= prof['market_cap'].fillna(0) >= self.min_market_cap
-            if self.max_market_cap:
-                keep &= prof['market_cap'].fillna(float('inf')) <= self.max_market_cap
+
+            def _within(col: str, lo=None, hi=None) -> pd.Series:
+                if col not in prof.columns:
+                    return pd.Series(True, index=prof.index)
+                v = pd.to_numeric(prof[col], errors='coerce')
+                ok = pd.Series(True, index=prof.index)
+                if lo is not None:
+                    ok &= v >= lo
+                if hi is not None:
+                    ok &= v <= hi
+                return v.isna() | ok          # unknown passes
+
+            if self.min_market_cap or self.max_market_cap:
+                keep &= _within('market_cap', self.min_market_cap,
+                                self.max_market_cap)
             if self.dividend_payers_only:
-                keep &= prof['dividend_yield'].fillna(0) > 0
+                keep &= _within('dividend_yield', lo=1e-9)
             if self.profitable_only:
-                keep &= prof['trailing_eps'].fillna(-1) > 0
-            filtered = set(prof.index[keep])
-            # Keep names with no profile only when size filters are inactive.
-            if self.min_market_cap or self.max_market_cap or \
-               self.dividend_payers_only or self.profitable_only:
-                candidates = [t for t in candidates if t in filtered]
+                keep &= _within('trailing_eps', lo=1e-9)
+
+            excluded = set(prof.index[~keep])
+            candidates = [t for t in candidates if t not in excluded]
 
         if not candidates:
             return []

@@ -107,6 +107,32 @@ def score_universe(raw: pd.DataFrame, strategy: ST.Strategy
 # FILTERS
 # ─────────────────────────────────────────────
 
+def _apply_size_filters(raw: pd.DataFrame, spec: UniverseSpec) -> pd.DataFrame:
+    """
+    Apply the universe's size bounds against computed market caps.
+
+    A name whose market cap could not be computed is kept rather than dropped:
+    not knowing a company's size is not grounds for asserting it is too small.
+    The Data tab reports how many names are in that position.
+    """
+    if 'MARKET_CAP' not in raw.columns:
+        return raw
+    if not (spec.min_market_cap or spec.max_market_cap):
+        return raw
+
+    mcap = pd.to_numeric(raw['MARKET_CAP'], errors='coerce')
+    keep = pd.Series(True, index=raw.index)
+    if spec.min_market_cap:
+        keep &= mcap.isna() | (mcap >= spec.min_market_cap)
+    if spec.max_market_cap:
+        keep &= mcap.isna() | (mcap <= spec.max_market_cap)
+
+    dropped = int((~keep).sum())
+    if dropped:
+        log.info('size filters removed %d of %d names', dropped, len(raw))
+    return raw[keep]
+
+
 def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
     """Names that satisfy the strategy's hard gates."""
     keep = pd.Series(True, index=raw.index)
@@ -325,6 +351,18 @@ def run(spec: UniverseSpec, strategy_key: str, as_of: date | str | None = None,
 
     raw = FA.build_all(universe, as_of)
     if raw.empty:
+        return RunResult(str(uuid.uuid4()), as_of, strategy,
+                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                         sync_report)
+
+    # Size filters are applied here, not during universe resolution. At
+    # resolve time the only market caps available are stored snapshots, which
+    # cover a handful of names; here we have a computed cap for almost the
+    # whole universe. Filtering early on what is mostly unknown either drops
+    # everything or nothing — both were observed.
+    raw = _apply_size_filters(raw, spec)
+    if raw.empty:
+        log.warning('size filters removed every name for %s', spec.describe())
         return RunResult(str(uuid.uuid4()), as_of, strategy,
                          pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report)

@@ -139,15 +139,34 @@ def update_market_caps(tickers: list[str],
     if df.empty:
         return 0
 
-    rows = [{
-        'ticker': r['ticker'],
-        # Today's snapshot. Reads gate on snapshot_date <= as_of, so this is
-        # invisible to any historical run — a quote has no history and must
-        # not be allowed to pretend otherwise.
-        'snapshot_date': as_of,
-        'market_cap': r['market_cap'],
-        'shares_out': r.get('shares_out'),
-    } for _i, r in df.iterrows()]
+    # The provider's share count carries the same class problem as the SEC
+    # cover page: Finnhub reports 1.4M shares for BRK-B — Class A — alongside
+    # a correctly consolidated $1.03T market cap. Keeping that count would
+    # reintroduce the bug the market cap is here to fix, so it is stored only
+    # when price x shares reproduces the quoted cap.
+    from data import yahoo
+    px = yahoo.latest_prices(list(df['ticker']), as_of)
+
+    rows = []
+    for _i, r in df.iterrows():
+        shares = r.get('shares_out')
+        price = px.get(r['ticker'])
+        if shares and price and price > 0:
+            implied = shares * price
+            if not (0.8 <= implied / r['market_cap'] <= 1.25):
+                log.debug('%s: dropping share count %.4g (implies %.4g vs '
+                          'quoted %.4g)', r['ticker'], shares, implied,
+                          r['market_cap'])
+                shares = None
+        rows.append({
+            'ticker': r['ticker'],
+            # Today's snapshot. Reads gate on snapshot_date <= as_of, so this
+            # is invisible to any historical run — a quote has no history and
+            # must not be allowed to pretend otherwise.
+            'snapshot_date': as_of,
+            'market_cap': r['market_cap'],
+            'shares_out': shares,
+        })
 
     written = db.upsert(db.profile_snapshots, rows)
     db.record_ingest('market_caps', str(as_of), rows=written)

@@ -252,3 +252,53 @@ def test_frames_rows_without_a_known_filing_are_skipped(monkeypatch):
     row = written['rows'][0]
     assert row['concept'] == 'shares_outstanding'
     assert str(row['filed']) == '2026-07-31', 'must use the real filing date'
+
+
+# ─────────────────────────────────────────────
+# SIZE FILTERS AND MISSING DATA
+# ─────────────────────────────────────────────
+
+def test_unknown_market_cap_does_not_fail_a_size_filter():
+    """Absence of a snapshot is not evidence that a company is small.
+
+    The universe filter used `fillna(0)`, so the moment profile_snapshots held
+    any rows at all, every name *without* one scored zero market cap and was
+    dropped. Nine stored snapshots cut an S&P 500 screen to nine names.
+    """
+    import pandas as pd
+
+    from data.universe import UniverseSpec
+    from quant.engine import _apply_size_filters
+
+    raw = pd.DataFrame({'MARKET_CAP': [5e11, 1e9, float('nan')]},
+                       index=['BIG', 'SMALL', 'UNKNOWN'])
+    spec = UniverseSpec(preset='SPY', min_market_cap=1e10)
+
+    kept = _apply_size_filters(raw, spec)
+    assert 'BIG' in kept.index
+    assert 'SMALL' not in kept.index, 'a known-small name must be dropped'
+    assert 'UNKNOWN' in kept.index, 'an unknown size must not be assumed small'
+
+
+def test_size_filters_are_a_noop_without_bounds():
+    import pandas as pd
+
+    from data.universe import UniverseSpec
+    from quant.engine import _apply_size_filters
+
+    raw = pd.DataFrame({'MARKET_CAP': [1.0, float('nan')]}, index=['A', 'B'])
+    spec = UniverseSpec(preset='SPY', min_market_cap=None)
+    assert len(_apply_size_filters(raw, spec)) == 2
+
+
+def test_max_market_cap_also_tolerates_unknowns():
+    import pandas as pd
+
+    from data.universe import UniverseSpec
+    from quant.engine import _apply_size_filters
+
+    raw = pd.DataFrame({'MARKET_CAP': [5e11, 1e9, float('nan')]},
+                       index=['BIG', 'SMALL', 'UNKNOWN'])
+    spec = UniverseSpec(preset='SPY', min_market_cap=None, max_market_cap=1e10)
+    kept = _apply_size_filters(raw, spec)
+    assert set(kept.index) == {'SMALL', 'UNKNOWN'}

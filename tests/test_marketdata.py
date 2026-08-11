@@ -128,3 +128,38 @@ def test_finnhub_millions_are_converted(with_key, monkeypatch):
 def test_a_response_without_market_cap_is_skipped(with_key, monkeypatch):
     monkeypatch.setattr(MD.http, 'fetch_json', lambda *a, **kw: {'name': 'X'})
     assert MD.fetch_market_caps(['NOPE']).empty
+
+
+def test_provider_share_count_dropped_when_it_contradicts_the_quote(
+        with_key, monkeypatch):
+    """Finnhub reports BRK-B's Class A count beside a consolidated market cap.
+
+    1.4M shares x a Class B price implies well under a billion against a
+    quoted $1.03T. Storing that count would recreate the exact bug the
+    external market cap exists to fix.
+    """
+    monkeypatch.setattr(MD, 'gaps', lambda *a, **kw: ['BRK-B', 'HSY'])
+    monkeypatch.setattr(MD, 'fetch_market_caps', lambda ts: pd.DataFrame([
+        {'ticker': 'BRK-B', 'market_cap': 1.03e12, 'shares_out': 1.4e6},
+        {'ticker': 'HSY', 'market_cap': 3.67e10, 'shares_out': 2.028e8},
+    ]))
+    monkeypatch.setattr(MD.db, 'record_ingest', lambda *a, **kw: None)
+
+    import data.yahoo as _y
+    monkeypatch.setattr(_y, 'latest_prices',
+                        lambda t, a: pd.Series({'BRK-B': 529.0, 'HSY': 181.0}))
+
+    captured = {}
+    monkeypatch.setattr(MD.db, 'upsert',
+                        lambda table, rows: captured.setdefault('rows', rows) and 0
+                        or len(rows))
+
+    MD.update_market_caps(['BRK-B', 'HSY'], as_of=date(2026, 8, 11))
+    by_ticker = {r['ticker']: r for r in captured['rows']}
+
+    # Market cap is kept for both — it is the quoted, consolidated figure.
+    assert by_ticker['BRK-B']['market_cap'] == 1.03e12
+    assert by_ticker['HSY']['market_cap'] == 3.67e10
+    # The contradicted share count is dropped; the consistent one is kept.
+    assert by_ticker['BRK-B']['shares_out'] is None
+    assert by_ticker['HSY']['shares_out'] == 2.028e8

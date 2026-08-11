@@ -40,6 +40,10 @@ PATTERNS: list[tuple[str, re.Pattern]] = [
     ('Google App Password',
      re.compile(r'(?i)\b(?:SMTP_PASS|smtp_password|app[_-]?password)\b\s*[:=]\s*'
                 r'["\']?(?:[a-z]{4}[ -]?){4}["\']?')),
+    # Finnhub keys are 40 lowercase alphanumerics, often two 20-char halves.
+    # The generic rule below misses a bare unquoted assignment.
+    ('Finnhub API key',
+     re.compile(r'(?i)\bfinnhub[_-]?(?:api[_-]?)?key\b\s*[:=]\s*["\']?[a-z0-9]{30,}')),
     ('SMTP credentials in code',
      re.compile(r'(?i)\.login\(\s*["\'][^"\']+["\']\s*,\s*["\'][^"\']{8,}["\']')),
     ('Private key block', re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----')),
