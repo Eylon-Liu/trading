@@ -1,0 +1,4 @@
+#!/bin/sh
+# Block commits containing anything that looks like a live credential.
+# Enable with:  git config core.hooksPath .githooks
+exec python3 "$(git rev-parse --show-toplevel)/tools/scan_secrets.py"

@@ -1,0 +1,230 @@
+"""
+Data tab — coverage, freshness, and where the sources disagree.
+
+Deliberately surfaces the membership disagreement between the crowd-sourced
+Wikipedia spine and the ETF's own N-PORT filing rather than resolving it
+silently. When two sources differ, that is information about data quality, and
+hiding it behind a single reconciled number would be the wrong call.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date
+
+import dash_bootstrap_components as dbc
+import pandas as pd
+from dash import Input, Output, callback, dcc, html, no_update
+
+import config
+from core import db, http
+from data import members
+from data import sync as SY
+from nlp import llm as LLM
+from ui import components as C
+from ui import theme as TH
+
+log = logging.getLogger(__name__)
+
+INGEST_HELP = """\
+# One-time setup for a full S&P 500 universe (takes a while)
+python cli.py init
+python cli.py ingest --index SPY --full --members-from 2015-01-01
+
+# Faster: the Dow's 30 names
+python cli.py ingest --index DIA --full
+
+# Then, nightly
+python cli.py ingest --index SPY
+"""
+
+
+def layout() -> html.Div:
+    return html.Div([
+        dbc.Row([
+            dbc.Col(C.card('🗄️ Stored data', html.Div(id='data-tables')),
+                    lg=6, className='mb-3'),
+            dbc.Col(C.card('🕐 Ingest freshness', html.Div(id='data-freshness')),
+                    lg=6, className='mb-3'),
+        ]),
+        dbc.Row([
+            dbc.Col(C.card('🔍 Index membership sources',
+                           html.Div(id='data-members')), lg=7, className='mb-3'),
+            dbc.Col(C.card('💾 HTTP cache', html.Div(id='data-cache')),
+                    lg=5, className='mb-3'),
+        ]),
+        C.card('🚀 Populating data', [
+            html.P('All ingest runs from the command line, which is what makes '
+                   'scheduling possible. Data is stored locally in SQLite and '
+                   'refreshed incrementally — a second run over the same '
+                   'tickers issues no network calls.',
+                   style={'fontSize': '0.84rem'}),
+            html.Pre(INGEST_HELP,
+                     style={'background': TH.PANEL_ALT, 'padding': '14px',
+                            'borderRadius': '8px', 'fontSize': '0.74rem',
+                            'color': TH.TEXT, 'overflowX': 'auto'}),
+            html.Div(f'Database: {config.DATABASE_URL}',
+                     style={'color': TH.MUTED, 'fontSize': '0.72rem'}),
+        ], className='mb-3'),
+
+        C.card('🔄 Source freshness',
+               html.Div(id='data-sync'),
+               subtitle='Every run syncs first, then reads. A source inside '
+                        'its refresh window is served from the database and '
+                        'never re-fetched.',
+               className='mb-3'),
+
+        C.card('🤖 AI analysis layer', html.Div(id='data-ai'),
+               className='mb-3'),
+    ])
+
+
+def _sync_status_block() -> html.Div:
+    """Per-source age against its refresh window."""
+    try:
+        df = SY.freshness()
+    except Exception as exc:                       # noqa: BLE001
+        return C.note(f'Could not read freshness: {exc}', 'error')
+
+    fresh_n = int((df['status'] == 'fresh').sum())
+    return html.Div([
+        C.metric_row([
+            (fresh_n, 'fresh', TH.POS),
+            (int((df['status'] == 'stale').sum()), 'stale', TH.WARN),
+            (int((df['status'] == 'never fetched').sum()), 'never fetched',
+             TH.MUTED),
+            (str(SY.last_session()), 'last session', TH.TEXT),
+        ]),
+        html.Hr(style={'borderColor': TH.BORDER}),
+        C.data_table(df, page_size=12),
+        html.Div('Stale simply means the next run will refresh it. Nothing is '
+                 'fetched while a source is inside its window, which is what '
+                 'makes a repeat run fast.',
+                 style={'color': TH.MUTED, 'fontSize': '0.74rem',
+                        'marginTop': '10px'}),
+    ])
+
+
+def _ai_status_block() -> html.Div:
+    """Whether the optional narrative layer is live, and on which backend."""
+    st = LLM.status()
+    ok = st['enabled']
+    return html.Div([
+        html.Div([
+            dbc.Badge('ENABLED' if ok else 'LOCAL ONLY',
+                      color='success' if ok else 'secondary',
+                      className='me-2'),
+            html.Span(st['reason'], style={'fontSize': '0.84rem'}),
+        ], className='mb-2'),
+        html.Div(
+            'This layer only interprets numbers the quant engine already '
+            'computed. It never contributes to a score, a rank or a trade '
+            'level — those come from the formulas in the Methodology tab and '
+            'are identical with or without a key.',
+            style={'color': TH.MUTED, 'fontSize': '0.76rem',
+                   'lineHeight': '1.55'}),
+        html.Div(
+            'Configure with GEMINI_API_KEY or ANTHROPIC_API_KEY in .env; '
+            'LLM_PROVIDER accepts auto | gemini | anthropic | off.',
+            style={'color': TH.MUTED, 'fontSize': '0.72rem',
+                   'marginTop': '8px'}),
+    ])
+
+
+@callback(
+    Output('data-tables', 'children'), Output('data-freshness', 'children'),
+    Output('data-members', 'children'), Output('data-cache', 'children'),
+    Output('data-ai', 'children'), Output('data-sync', 'children'),
+    Input('tabs', 'active_tab'),
+)
+def _refresh(active_tab):
+    if active_tab != 'tab-data':
+        return (no_update,) * 6
+
+    # ── row counts ────────────────────────────────────────────────
+    try:
+        counts = db.table_counts()
+        counts = counts[counts['rows'] > 0]
+        tables = C.data_table(counts, page_size=14) if not counts.empty \
+            else C.placeholder('Database is empty — run an ingest.')
+    except Exception as exc:                       # noqa: BLE001
+        tables = C.note(f'Could not read the database: {exc}', 'error')
+
+    # ── freshness ─────────────────────────────────────────────────
+    try:
+        fresh = db.read_sql("""
+            SELECT source,
+                   COUNT(*) AS keys,
+                   MAX(last_success) AS newest,
+                   SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) AS errors,
+                   SUM(rows) AS rows
+            FROM ingest_log GROUP BY source ORDER BY source
+        """)
+        if fresh.empty:
+            freshness = C.placeholder('Nothing ingested yet.')
+        else:
+            fresh['newest'] = pd.to_datetime(fresh['newest']).dt.strftime('%m-%d %H:%M')
+            freshness = C.data_table(fresh, page_size=14, extra_conditional=[
+                {'if': {'filter_query': '{errors} > 0', 'column_id': 'errors'},
+                 'color': TH.NEG, 'fontWeight': '700'}])
+    except Exception as exc:                       # noqa: BLE001
+        freshness = C.note(f'{exc}', 'error')
+
+    # ── membership sources & disagreement ─────────────────────────
+    member_panels = []
+    try:
+        for idx in ('SPY', 'QQQ', 'DIA'):
+            cov = members.coverage(idx)
+            if cov.empty:
+                continue
+            member_panels.append(html.Div([
+                html.B(f'{idx} — {config.INDEX_OPTIONS.get(idx, "")}',
+                       style={'color': TH.ACCENT, 'fontSize': '0.86rem'}),
+                C.data_table(cov, page_size=5),
+            ], className='mb-3'))
+
+            cmp_ = members.compare_sources(idx, date.today())
+            if cmp_.get('comparable'):
+                agree = cmp_['agreement_pct']
+                member_panels.append(html.Div([
+                    C.metric_row([
+                        (cmp_['wiki_n'], 'wiki spine', TH.TEXT),
+                        (cmp_['nport_n'], 'N-PORT filing', TH.TEXT),
+                        (f'{agree:.0f}%', 'agreement',
+                         TH.POS if agree > 90 else TH.WARN),
+                    ]),
+                    html.Div(
+                        f'wiki only: {", ".join(cmp_["wiki_only"][:8])}  |  '
+                        f'N-PORT only: {", ".join(cmp_["nport_only"][:8])}',
+                        style={'color': TH.MUTED, 'fontSize': '0.7rem',
+                               'marginTop': '6px'}),
+                    C.note('Disagreement is shown rather than reconciled. Most '
+                           'of it is share classes (BF-A vs BF-B) and the '
+                           '~2-month N-PORT filing lag, both legitimate.',
+                           'info'),
+                ], className='mb-3'))
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('membership panel failed: %s', exc)
+
+    membership = html.Div(member_panels) if member_panels else \
+        C.placeholder('No membership data — run an ingest with --members-from.')
+
+    # ── cache ─────────────────────────────────────────────────────
+    try:
+        stats = http.cache_stats()
+        if stats:
+            cdf = pd.DataFrame([{'category': k, 'files': v['files'], 'MB': v['mb']}
+                                for k, v in sorted(stats.items())])
+            cache = html.Div([
+                C.data_table(cdf, page_size=10),
+                html.Div(f'total {cdf["MB"].sum():.1f} MB',
+                         style={'color': TH.MUTED, 'fontSize': '0.76rem',
+                                'marginTop': '8px'}),
+            ])
+        else:
+            cache = C.placeholder('Cache is empty.')
+    except Exception as exc:                       # noqa: BLE001
+        cache = C.note(f'{exc}', 'error')
+
+    return (tables, freshness, membership, cache,
+            _ai_status_block(), _sync_status_block())

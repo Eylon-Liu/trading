@@ -1,0 +1,31 @@
+# Secrets — never commit. .env holds live API keys; .env.example is the
+# documented template and is safe to track.
+.env
+.env.local
+*.pem
+*.key
+
+# Local data store. Rebuildable with `python cli.py init && python cli.py ingest`,
+# and large enough that committing it would be unpleasant.
+db/
+cache/
+reports/out/
+
+# Generated
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

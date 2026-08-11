@@ -1,0 +1,32 @@
+# ── Web UI ────────────────────────────────────────────────
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+plotly>=5.18.0
+
+# ── Data / numerics ───────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+statsmodels>=0.14.0
+SQLAlchemy>=2.0.0
+
+# ── Providers ─────────────────────────────────────────────
+yfinance>=0.2.60
+requests>=2.31.0
+curl_cffi>=0.7.0          # helps yfinance survive Yahoo's rate limiting
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+feedparser>=6.0.0
+
+# ── NLP (all local, no API key required) ──────────────────
+nltk>=3.8.0
+
+# ── Config / reports ──────────────────────────────────────
+python-dotenv>=1.0.0
+Jinja2>=3.1.0
+
+# ── Optional ──────────────────────────────────────────────
+# AI analysis layer. Gemini needs no extra package — it speaks REST over
+# `requests`, already required above. Claude needs its SDK:
+# anthropic>=0.40.0       # only for the ANTHROPIC_API_KEY backend
+# weasyprint>=60.0        # only if you want PDF reports (needs system libs)
