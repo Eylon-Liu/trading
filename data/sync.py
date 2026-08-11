@@ -90,6 +90,9 @@ SOURCES: dict[str, Source] = {
                          key_mode='ticker_prefix', log_source='sec_facts',
                          note='New facts appear only when a filing lands.'),
     'filings':    Source('filings', 'SEC filings & 8-K items', 12, False),
+    'market_caps': Source('market_caps', 'Market cap (external fill)', 24, False,
+                          key_mode='global',
+                          note='Only the names SEC cannot supply; needs a key.'),
     'profiles':   Source('profiles', 'Market-cap snapshots', 24, False,
                          key_mode='global',
                          note='Yahoo enrichment; rate-limited, best effort.'),
@@ -328,7 +331,7 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
               force: bool, emit) -> SourceResult:
     # Imported lazily so `import sync` stays cheap and a broken optional
     # provider cannot prevent the module from loading.
-    from data import altdata, members, news, policy, sec, yahoo
+    from data import altdata, marketdata, members, news, policy, sec, yahoo
 
     src = SOURCES[name]
 
@@ -379,6 +382,7 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
     handlers = {
         'securities': lambda ts: sec.update_securities(ts),
         'share_counts': lambda ts: sec.update_share_counts(),
+        'market_caps': lambda ts: marketdata.update_market_caps(ts),
         'facts': lambda ts: sec.update_facts(ts),
         'filings': lambda ts: sec.update_filings(ts),
         'profiles': lambda ts: yahoo.update_profiles(ts),

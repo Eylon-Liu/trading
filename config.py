@@ -378,6 +378,11 @@ LLM_MODEL = os.environ.get('LLM_MODEL', 'claude-opus-5')
 
 # Google AI Studio. GOOGLE_API_KEY is accepted as an alias because that is
 # what the Google SDKs read by default.
+# Finnhub — optional, free tier (60 req/min). Fills market cap only for
+# the multi-class filers whose consolidated share count SEC does not
+# publish. Get a key at finnhub.io/register
+FINNHUB_API_KEY = os.environ.get('FINNHUB_API_KEY')
+
 GEMINI_API_KEY = (os.environ.get('GEMINI_API_KEY')
                   or os.environ.get('GOOGLE_API_KEY'))
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.5-flash')

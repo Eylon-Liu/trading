@@ -123,8 +123,48 @@ def layout() -> html.Div:
                         'a missing one only costs breadth.',
                className='mb-3'),
 
+        C.card('🏦 Market cap coverage', html.Div(id='data-mcap'),
+               className='mb-3'),
+
         C.card('🤖 AI analysis layer', html.Div(id='data-ai'),
                className='mb-3'),
+    ])
+
+
+def _mcap_block() -> html.Div:
+    """How many names have a market cap, and where it came from."""
+    from data import marketdata as MD
+    from data.universe import PRESETS
+
+    st = MD.status()
+    try:
+        tickers = PRESETS['spy'].resolve()
+        missing = MD.gaps(tickers)
+        covered = len(tickers) - len(missing)
+    except Exception:                              # noqa: BLE001
+        tickers, missing, covered = [], [], 0
+
+    return html.Div([
+        C.metric_row([
+            (covered, 'from SEC filings', TH.POS, 'auditable'),
+            (len(missing), 'need external fill',
+             TH.WARN if missing else TH.MUTED, 'multi-class filers'),
+        ]),
+        html.Div([
+            dbc.Badge('ENABLED' if st['enabled'] else 'SEC ONLY',
+                      color='success' if st['enabled'] else 'secondary',
+                      className='me-2'),
+            html.Span(st['reason'], style={'fontSize': '0.84rem'}),
+        ], className='my-2'),
+        html.Div(f"Not covered by SEC: {', '.join(sorted(missing)[:14])}"
+                 f"{'…' if len(missing) > 14 else ''}"
+                 if missing else 'Every name has a filed share count.',
+                 style={'color': TH.MUTED, 'fontSize': '0.76rem'}),
+        html.Div('A filed share count always wins. The external source only '
+                 'fills gaps, and its values are stamped with the run date so '
+                 'a historical backtest can never see a quote fetched today.',
+                 style={'color': TH.MUTED, 'fontSize': '0.75rem',
+                        'marginTop': '8px'}),
     ])
 
 
@@ -284,12 +324,12 @@ def _ai_status_block() -> html.Div:
     Output('data-tables', 'children'), Output('data-freshness', 'children'),
     Output('data-members', 'children'), Output('data-cache', 'children'),
     Output('data-ai', 'children'), Output('data-sync', 'children'),
-    Output('data-validity', 'children'),
+    Output('data-validity', 'children'), Output('data-mcap', 'children'),
     Input('tabs', 'active_tab'),
 )
 def _refresh(active_tab):
     if active_tab != 'tab-data':
-        return (no_update,) * 7
+        return (no_update,) * 8
 
     # ── row counts ────────────────────────────────────────────────
     try:
@@ -377,4 +417,5 @@ def _refresh(active_tab):
         cache = C.note(f'{exc}', 'error')
 
     return (tables, freshness, membership, cache,
-            _ai_status_block(), _sync_status_block(), _validity_block())
+            _ai_status_block(), _sync_status_block(), _validity_block(),
+            _mcap_block())
