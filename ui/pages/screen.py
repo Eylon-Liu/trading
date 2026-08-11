@@ -21,6 +21,7 @@ from data.universe import PRESETS, UniverseSpec
 from nlp import llm as LLM
 from quant import engine as EN
 from quant import factor_docs as FD
+from quant import custom as CU
 from quant import strategies as ST
 from quant import tradeplan as TP
 from ui import components as C
@@ -138,7 +139,7 @@ def layout() -> html.Div:
     Input('horizon-toggle', 'value'),
 )
 def _strategies_for_horizon(horizon):
-    opts = ST.options(horizon)
+    opts = CU.options(horizon)
     default = opts[0]['value'] if opts else None
     blurb = ST.HORIZONS.get(horizon, {}).get('blurb', '')
     return opts, default, blurb

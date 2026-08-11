@@ -18,6 +18,7 @@ from dash import Input, Output, State, callback, dcc, html, no_update
 from data.universe import PRESETS, UniverseSpec
 from nlp import llm as LLM
 from quant import backtest as BT
+from quant import custom as CU
 from quant import strategies as ST
 from ui import components as C
 from ui import theme as TH
@@ -31,7 +32,7 @@ def layout() -> html.Div:
             dbc.Row([
                 dbc.Col([
                     C.label('Strategy'),
-                    dcc.Dropdown(id='bt-strategy', options=ST.options(),
+                    dcc.Dropdown(id='bt-strategy', options=CU.options(),
                                  value='quality_value', clearable=False),
                 ], lg=3, md=6, className='mb-3'),
                 dbc.Col([

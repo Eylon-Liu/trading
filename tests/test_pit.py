@@ -214,3 +214,56 @@ def test_safe_div_handles_zero_and_nan():
     assert np.isnan(F._safe_div(1, 0))
     assert np.isnan(F._safe_div(np.nan, 5))
     assert F._safe_div(10, 4) == pytest.approx(2.5)
+
+
+# ─────────────────────────────────────────────
+# SNAPSHOT DEDUPLICATION
+# ─────────────────────────────────────────────
+
+def test_membership_change_detection(monkeypatch):
+    """Only a genuine constituent change is worth a new snapshot.
+
+    An index reconstitutes a few times a year. Writing a snapshot per pull
+    would add ~500 identical rows a day — around 180k rows a year that say
+    nothing — and resolution would not improve, since members_asof already
+    takes the most recent snapshot at or before a date.
+    """
+    import pandas as pd
+
+    from data import members as M
+
+    calls = {'n': 0}
+
+    def fake_read_sql(sql, params=None, **kw):
+        calls['n'] += 1
+        if 'MAX(as_of)' in sql:
+            return pd.DataFrame([{'d': '2026-01-01'}])
+        return pd.DataFrame({'ticker': ['AAPL', 'MSFT', 'NVDA']})
+
+    monkeypatch.setattr(M.db, 'read_sql', fake_read_sql)
+    from datetime import date
+
+    same = M._membership_changed('SPY', 'wiki_revision', date(2026, 2, 1),
+                                 ['NVDA', 'AAPL', 'MSFT'])
+    assert same is False, 'reordered but identical set must not count as a change'
+
+    added = M._membership_changed('SPY', 'wiki_revision', date(2026, 2, 1),
+                                  ['AAPL', 'MSFT', 'NVDA', 'TSLA'])
+    assert added is True
+
+    removed = M._membership_changed('SPY', 'wiki_revision', date(2026, 2, 1),
+                                    ['AAPL', 'MSFT'])
+    assert removed is True
+
+
+def test_first_snapshot_is_always_stored(monkeypatch):
+    """With no prior observation there is nothing to compare against."""
+    import pandas as pd
+
+    from data import members as M
+    from datetime import date
+
+    monkeypatch.setattr(M.db, 'read_sql',
+                        lambda sql, params=None, **kw: pd.DataFrame([{'d': None}]))
+    assert M._membership_changed('SPY', 'wiki_revision', date(2026, 2, 1),
+                                 ['AAPL']) is True

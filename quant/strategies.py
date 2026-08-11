@@ -319,9 +319,30 @@ ALL_STRATEGIES: dict[str, Strategy] = {**LONG_TERM, **MID_TERM}
 # ─────────────────────────────────────────────
 
 def get(key: str) -> Strategy:
-    if key not in ALL_STRATEGIES:
-        raise KeyError(f'unknown strategy {key!r}; have {sorted(ALL_STRATEGIES)}')
-    return ALL_STRATEGIES[key]
+    """
+    Resolve a strategy key, built-in or user-defined.
+
+    Custom strategies live in the database, and quant.custom imports this
+    module — so the import is deferred into the function body to break the
+    cycle. Doing it here rather than at every call site means the engine, the
+    backtester, the CLI and the report builder all gained custom-strategy
+    support without changing a line.
+    """
+    if key in ALL_STRATEGIES:
+        return ALL_STRATEGIES[key]
+
+    try:
+        from quant import custom
+        extra = custom.load_all()
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('custom strategies unavailable: %s', exc)
+        extra = {}
+
+    if key in extra:
+        return extra[key]
+
+    known = sorted(ALL_STRATEGIES) + sorted(extra)
+    raise KeyError(f'unknown strategy {key!r}; have {known}')
 
 
 def by_horizon(horizon: str) -> dict[str, Strategy]:

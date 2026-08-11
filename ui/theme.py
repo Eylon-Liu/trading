@@ -94,9 +94,12 @@ TABLE_CELL = {
 # Explicit widths for the columns that appear across pages. Anything not
 # listed and numeric gets a right-aligned default; anything else flexes.
 COLUMN_WIDTHS = {
-    'rank': '52px', 'ticker': '72px', 'sector': '130px',
-    'score': '74px', 'composite': '74px', 'signal': '156px',
-    'why': '160px', 'reasons': '160px',
+    # `signal` holds the longest label in the app — "🟢 Strong Buy —
+    # accumulate" measures 201px at the table's font, so the column is sized
+    # from that rather than guessed, and no signal is ever clipped mid-word.
+    'rank': '50px', 'ticker': '70px', 'sector': '126px',
+    'score': '72px', 'composite': '72px', 'signal': '210px',
+    'why': '150px', 'reasons': '150px',
     'entry_type': '96px', 'stop_basis': '104px',
     'insider': '150px', 'role': '140px', 'side': '64px',
     'txn_date': '96px', 'entry_date': '96px', 'exit_date': '96px',
@@ -109,8 +112,15 @@ TABLE_CONDITIONAL = [
      'backgroundColor': 'rgba(56,239,125,0.07)'},
     {'if': {'filter_query': '{signal} contains "Avoid" || {signal} contains "Trim"'},
      'backgroundColor': 'rgba(255,107,107,0.07)'},
+    # Selection states must set the text colour too. Setting only the
+    # background left the clicked row rendering pale text on a pale fill —
+    # the one row you had just chosen became the only unreadable one.
     {'if': {'state': 'active'},
-     'backgroundColor': 'rgba(17,153,142,0.20)', 'border': f'1px solid {ACCENT}'},
+     'backgroundColor': '#1d3f4a', 'color': '#ffffff',
+     'border': f'1px solid {ACCENT}'},
+    {'if': {'state': 'selected'},
+     'backgroundColor': '#1d3f4a', 'color': '#ffffff',
+     'border': f'1px solid {ACCENT}'},
 ]
 
 
@@ -265,6 +275,34 @@ button.dash-dropdown svg, button.dash-dropdown svg * {{
 .dash-spreadsheet-container .dash-spreadsheet-inner th {{ border-color:
     rgba(255,255,255,0.05) !important; }}
 .dash-table-container .previous-next-container {{ color:{MUTED}; }}
+
+/* No drag-to-resize here. Dash 4.4.1's DataTable exposes no resize prop, and
+   CSS `resize` on the header cannot work either: the component renders
+   synchronized header and body tables and takes the column width from the
+   body cells, so a resized header snaps straight back. Rather than show a
+   handle that does nothing, columns are sized from measured text widths in
+   COLUMN_WIDTHS above and long prose lives in a hover tooltip. */
+
+/* Backstop for Dash's own focus/selection classes: whatever fill it applies,
+   the text must stay legible against it. */
+.dash-spreadsheet-inner td.focused,
+.dash-spreadsheet-inner td.cell--selected,
+.dash-spreadsheet-inner td.dash-cell.focused {{
+    background-color:#1d3f4a !important;
+    color:#ffffff !important; }}
+.dash-spreadsheet-inner td.focused *,
+.dash-spreadsheet-inner td.cell--selected * {{ color:#ffffff !important; }}
+
+/* Tooltips carrying the full "why" text. */
+.dash-table-tooltip {{
+    background:{PANEL_ALT} !important;
+    color:{TEXT} !important;
+    border:1px solid {ACCENT} !important;
+    border-radius:6px !important;
+    box-shadow:0 8px 24px rgba(0,0,0,0.5) !important;
+    font-size:0.8rem !important;
+    max-width:420px !important; }}
+.dash-table-tooltip * {{ color:{TEXT} !important; }}
 
 /* Radio / checkbox labels — Dash renders bare <label> elements that inherit
    Bootstrap's light-theme body color, i.e. near-black on a dark page. */

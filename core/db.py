@@ -290,6 +290,24 @@ reports = Table(
     Column('created_at', DateTime),
 )
 
+# User-defined strategies, stored as rows rather than code so they survive a
+# restart. `based_on` records the preset a copy came from — provenance only;
+# the copy holds its own weights and the two never track each other.
+custom_strategies = Table(
+    'custom_strategies', metadata,
+    Column('key', String, primary_key=True),
+    Column('name', String),
+    Column('horizon', String, index=True),
+    Column('description', Text),
+    Column('thesis', Text),
+    Column('based_on', String),
+    Column('weights_json', Text),
+    Column('filters_json', Text),
+    Column('neutralize', String),
+    Column('setup', String),
+    Column('updated_at', DateTime),
+)
+
 ingest_log = Table(
     'ingest_log', metadata,
     Column('source', String, primary_key=True),
@@ -350,6 +368,13 @@ def connect():
 # ─────────────────────────────────────────────
 # WRITE HELPERS
 # ─────────────────────────────────────────────
+
+def execute(sql: str, params: dict | None = None) -> int:
+    """Run a statement and return the affected row count."""
+    with connect() as conn:
+        result = conn.execute(text(sql), params or {})
+        return result.rowcount or 0
+
 
 def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
     """

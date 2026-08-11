@@ -7,14 +7,15 @@ from dash import dcc, html
 
 from ui import components as C
 from ui import theme as TH
-from ui.pages import (compare, data, intel, methodology, reports, research,
-                      screen)
+from ui.pages import (builder, compare, data, intel, methodology, reports,
+                      research, screen)
 
 TABS = [
     ('tab-screen', '🎯 Screen', screen),
     ('tab-compare', '🔄 Compare', compare),
     ('tab-research', '🔬 Research', research),
     ('tab-intel', '🔎 Intel', intel),
+    ('tab-builder', '🧪 Builder', builder),
     ('tab-methodology', '📐 Methodology', methodology),
     ('tab-reports', '📄 Reports', reports),
     ('tab-data', '🗄️ Data', data),

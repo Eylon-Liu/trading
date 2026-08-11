@@ -338,6 +338,30 @@ def membership_changes(index_symbol: str) -> pd.DataFrame:
 # BACKFILL & READ
 # ─────────────────────────────────────────────
 
+def _membership_changed(index_symbol: str, source: str, as_of: date,
+                        tickers: list[str]) -> bool:
+    """
+    True when `tickers` differs from the newest stored snapshot before `as_of`.
+
+    Also true when there is no prior snapshot — the first observation is always
+    worth keeping.
+    """
+    prior = db.read_sql("""
+        SELECT MAX(as_of) AS d FROM index_members
+        WHERE index_symbol = :i AND source = :s AND as_of < :t
+    """, {'i': index_symbol, 's': source, 't': as_of.isoformat()})
+
+    if prior.empty or pd.isna(prior.iloc[0]['d']):
+        return True
+
+    previous = db.read_sql("""
+        SELECT ticker FROM index_members
+        WHERE index_symbol = :i AND source = :s AND as_of = :d
+    """, {'i': index_symbol, 's': source, 'd': prior.iloc[0]['d']})
+
+    return set(previous['ticker']) != set(tickers)
+
+
 def backfill(index_symbol: str, start: date, end: date | None = None,
              freq: str = 'ME') -> int:
     """
@@ -353,16 +377,33 @@ def backfill(index_symbol: str, start: date, end: date | None = None,
         stamps = stamps.append(pd.DatetimeIndex([pd.Timestamp(end)]))
 
     written = 0
+    skipped = 0
     for ts in stamps:
         as_of = ts.date()
         tickers = members_from_wiki(index_symbol, as_of)
         if not tickers:
             continue
+
+        # Only snapshot when the constituent set actually changed. An index
+        # reconstitutes a few times a year, so a daily pull would otherwise
+        # write ~500 identical rows a day — roughly 180k rows a year saying
+        # nothing. Resolution is unaffected: members_asof takes the most
+        # recent snapshot at or before a date, and the most recent *change* is
+        # exactly the state on that date.
+        if not _membership_changed(index_symbol, 'wiki_revision', as_of, tickers):
+            skipped += 1
+            continue
+
         written += db.upsert(db.index_members, [{
             'index_symbol': index_symbol, 'ticker': t, 'as_of': as_of,
             'source': 'wiki_revision', 'confidence': 0.9, 'weight': None,
         } for t in tickers])
-        log.info('%s @ %s -> %d members', index_symbol, as_of, len(tickers))
+        log.info('%s @ %s -> %d members (changed)', index_symbol, as_of,
+                 len(tickers))
+
+    if skipped:
+        log.info('%s: %d snapshot(s) unchanged, not stored', index_symbol,
+                 skipped)
 
     nport = nport_holdings(index_symbol)
     if not nport.empty:

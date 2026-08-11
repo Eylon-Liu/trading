@@ -23,6 +23,7 @@ from dash import Input, Output, State, callback, dcc, html, no_update
 from data.universe import PRESETS, UniverseSpec
 from nlp import llm as LLM
 from quant import compare as CMP
+from quant import custom as CU
 from quant import strategies as ST
 from ui import components as C
 from ui import theme as TH
@@ -62,7 +63,7 @@ def layout() -> html.Div:
 
                 dbc.Col([
                     C.label('Strategy'),
-                    dcc.Dropdown(id='cmp-strategy-a', options=ST.options(),
+                    dcc.Dropdown(id='cmp-strategy-a', options=CU.options(),
                                  value='compounder', clearable=False),
                 ], lg=3, md=6, className='mb-2'),
 
@@ -125,7 +126,7 @@ def _mode_controls(mode):
                              for k in CMP.LOOKBACKS],
                     value='3M', clearable=False))
     return (BLURBS['cross'], C.label('Second strategy'),
-            dcc.Dropdown(id='cmp-second', options=ST.options(),
+            dcc.Dropdown(id='cmp-second', options=CU.options(),
                          value='deep_value', clearable=False))
 
 
