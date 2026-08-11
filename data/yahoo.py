@@ -240,12 +240,39 @@ def adjusted_ohlc(tickers: list[str], start: date | str | None = None,
     return high, low, adj
 
 
-def latest_prices(tickers: list[str], as_of: date | str) -> pd.Series:
-    """Last close at or before `as_of` — never peeks past it."""
-    px = price_history(tickers, end=as_of)
-    if px.empty:
+def last_close(prices: pd.DataFrame) -> pd.Series:
+    """
+    Pure: last observed close per ticker from a price frame.
+
+    No I/O — hand it a frame and it returns a series. Separating this from the
+    read makes it testable without a database and lets the caller decide how
+    much history to load.
+    """
+    if prices is None or prices.empty:
         return pd.Series(dtype=float)
-    return px.ffill().iloc[-1]
+    return prices.ffill().iloc[-1]
+
+
+# Enough sessions to survive a long weekend, a holiday, and a halted ticker.
+_LAST_CLOSE_LOOKBACK_DAYS = 30
+
+
+def latest_prices(tickers: list[str], as_of: date | str,
+                  lookback_days: int = _LAST_CLOSE_LOOKBACK_DAYS) -> pd.Series:
+    """
+    Last close at or before `as_of` — never peeks past it.
+
+    Bounded to a short window. Without a start date this read pulled every bar
+    ever stored — at S&P 500 scale roughly 1.2 million rows — to use only the
+    final one, which cost about 2.3 seconds on every universe resolution.
+    """
+    start = pd.to_datetime(as_of) - timedelta(days=lookback_days)
+    px = price_history(tickers, start=start, end=as_of)
+    if px.empty:
+        # A ticker halted for longer than the window, or a sparse history.
+        # Fall back to the unbounded read rather than reporting no price.
+        px = price_history(tickers, end=as_of)
+    return last_close(px)
 
 
 def dollar_adv(tickers: list[str], as_of: date | str,

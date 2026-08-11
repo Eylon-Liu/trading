@@ -140,7 +140,8 @@ SMTP_ENV = """\
 SMTP_SERVER=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=you@gmail.com
-SMTP_PASS=abcdefghijklmnop        # 16-char App Password, NOT your login
+SMTP_PASS=your-16-char-app-password    # App Password, NOT your login password
+                                       # (paste it with or without spaces)
 """
 
 PROVIDERS = [

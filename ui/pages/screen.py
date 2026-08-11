@@ -482,14 +482,18 @@ def _render_explanation(data, meta):
                   'marginTop': '12px'}),
     ])
 
-    scores = pd.DataFrame(data).set_index('ticker', drop=False)
-    ai_body = C.ai_panel(
-        lambda: LLM.explain_screen(
-            strategy_name=strategy.name, horizon=strategy.horizon,
-            thesis=strategy.thesis, scores=scores,
-            universe_desc=meta['spec'],
-            as_of=pd.to_datetime(meta['as_of']).date()),
-        title='', card=False)
+    # The AI read is requested, not automatic. Generated on every screen it
+    # added ~13s to a run that otherwise completes in under two — and the
+    # results were already on screen the whole time, so the wait looked like
+    # the engine being slow. It is also a billable call per run.
+    ai_body = html.Div([
+        C.note('A short written read of these results: what the screen '
+               'selected for, where it is concentrated, and what to check '
+               'before acting. Takes about ten seconds.', 'info'),
+        html.Div(C.gradient_button('🤖  Generate AI analysis', 'ai-button'),
+                 className='text-center my-3'),
+        C.loading(html.Div(id='ai-output'), 'ai-loading'),
+    ])
 
     # Both were full-width cards stacked under the table, so reaching the AI
     # read meant scrolling past every formula. Collapsed and side by side,
@@ -502,3 +506,27 @@ def _render_explanation(data, meta):
                                 f'{len(rows)} factors, with formulas',
                           item_id='how'),
     ], start_collapsed=True, always_open=True, className='mb-3')
+
+
+@callback(
+    Output('ai-output', 'children'),
+    Input('ai-button', 'n_clicks'),
+    State('screen-store', 'data'), State('screen-meta', 'data'),
+    prevent_initial_call=True,
+)
+def _generate_ai(n_clicks, data, meta):
+    if not n_clicks or not data or not meta:
+        return no_update
+    try:
+        strategy = ST.get(meta['strategy'])
+    except KeyError:
+        return C.note('That strategy no longer exists.', 'warn')
+
+    scores = pd.DataFrame(data).set_index('ticker', drop=False)
+    return C.ai_panel(
+        lambda: LLM.explain_screen(
+            strategy_name=strategy.name, horizon=strategy.horizon,
+            thesis=strategy.thesis, scores=scores,
+            universe_desc=meta['spec'],
+            as_of=pd.to_datetime(meta['as_of']).date()),
+        title='', card=False)

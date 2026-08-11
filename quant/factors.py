@@ -320,31 +320,63 @@ def alt_factors(tickers: list[str], as_of: date | str) -> pd.DataFrame:
     return out
 
 
-def _attention_zscore(tickers: list[str], as_of: date) -> pd.Series | None:
-    """Recent pageviews versus the trailing year, as a z-score."""
-    if not tickers:
+def attention_zscore(views: pd.DataFrame, recent_days: int = 14,
+                     min_history: int = 60) -> pd.Series | None:
+    """
+    Pure: recent pageviews versus their own trailing baseline, as a z-score.
+
+    Takes a tidy (ticker, date, wiki_views) frame and returns one score per
+    ticker. No database access, so it can be tested against a fixture and
+    reasoned about without knowing where the rows came from.
+
+    Vectorised rather than looped: the previous version iterated groups and
+    re-sorted inside each one, which is the slow way to do a groupby.
+    """
+    if views is None or views.empty:
         return None
+
+    # Reset the index first: callers may hand over a concatenated or filtered
+    # frame whose index repeats, and positional alignment below would then
+    # raise or, worse, silently mismatch rows.
+    df = views.sort_values(['ticker', 'date']).reset_index(drop=True)
+    grouped = df.groupby('ticker')['wiki_views']
+
+    # Rank within ticker so the tail can be selected without a Python loop.
+    df['_order'] = grouped.cumcount(ascending=False)   # 0 = most recent
+    df['_count'] = grouped.transform('size')
+
+    eligible = df[df['_count'] >= min_history]
+    if eligible.empty:
+        return None
+
+    is_recent = eligible['_order'] < recent_days
+    recent_mean = eligible[is_recent].groupby('ticker')['wiki_views'].mean()
+    base = eligible[~is_recent].groupby('ticker')['wiki_views']
+    base_mean, base_sd = base.mean(), base.std()
+
+    z = (recent_mean - base_mean) / base_sd.where(base_sd > 0)
+    z = z.replace([np.inf, -np.inf], np.nan).dropna()
+    return z if len(z) else None
+
+
+def _read_attention(tickers: list[str], as_of: date,
+                    lookback_days: int = 400) -> pd.DataFrame:
+    """I/O only: pageview rows in the window ending at `as_of`."""
+    if not tickers:
+        return pd.DataFrame()
     ph = ','.join(f':t{i}' for i in range(len(tickers)))
     params: dict = {f't{i}': t for i, t in enumerate(tickers)}
-    params.update({'lo': str(as_of - timedelta(days=400)), 'hi': str(as_of)})
-
-    df = db.read_sql(
+    params.update({'lo': str(as_of - timedelta(days=lookback_days)),
+                   'hi': str(as_of)})
+    return db.read_sql(
         f'SELECT ticker, date, wiki_views FROM attention '
         f'WHERE ticker IN ({ph}) AND date BETWEEN :lo AND :hi',
         params, parse_dates=['date'])
-    if df.empty:
-        return None
 
-    scores = {}
-    for t, grp in df.groupby('ticker'):
-        s = grp.sort_values('date')['wiki_views']
-        if len(s) < 60:
-            continue
-        base, recent = s.iloc[:-14], s.iloc[-14:]
-        sd = base.std()
-        if sd and np.isfinite(sd) and sd > 0:
-            scores[t] = float((recent.mean() - base.mean()) / sd)
-    return pd.Series(scores) if scores else None
+
+def _attention_zscore(tickers: list[str], as_of: date) -> pd.Series | None:
+    """Read, then compute — the two steps kept separate and each testable."""
+    return attention_zscore(_read_attention(tickers, as_of))
 
 
 # ─────────────────────────────────────────────

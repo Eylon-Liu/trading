@@ -91,13 +91,35 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def _explain_smtp_error(exc: Exception) -> None:
+    msg = str(exc)
+    print(f'\n❌  {type(exc).__name__}: {msg[:200]}')
+    if 'Username and Password not accepted' in msg or '535' in msg:
+        print('    Google rejects normal account passwords here. Create an App '
+              'Password at https://myaccount.google.com/apppasswords, and make '
+              'sure 2-Step Verification is on.')
+    elif 'Connection refused' in msg or 'timed out' in msg or 'Name or service' in msg:
+        print(f'    Could not reach {config.SMTP_SERVER}:{config.SMTP_PORT}. '
+              f'Check the server and port, or whether a firewall blocks it.')
+
+
 def cmd_test_email(args) -> int:
-    """Send a one-line test message, and explain clearly when it fails."""
+    """
+    Verify SMTP settings.
+
+    By default this authenticates and disconnects without sending anything —
+    enough to prove the credentials work, without putting mail in someone's
+    inbox as a side effect of a config check. Pass --send to actually deliver
+    a short test message.
+    """
+    import smtplib
+
     from reports import email as mailer
 
     print(f'SMTP_SERVER : {config.SMTP_SERVER}:{config.SMTP_PORT}')
     print(f'SMTP_USER   : {config.SMTP_USER or "(not set)"}')
-    print(f'SMTP_PASS   : {"set" if config.SMTP_PASS else "(not set)"}')
+    print(f'SMTP_PASS   : '
+          f'{f"set, {len(config.SMTP_PASS)} chars" if config.SMTP_PASS else "(not set)"}')
 
     if not (config.SMTP_USER and config.SMTP_PASS):
         print('\n❌  Credentials missing. Add SMTP_USER and SMTP_PASS to .env.')
@@ -105,25 +127,35 @@ def cmd_test_email(args) -> int:
         print('    https://myaccount.google.com/apppasswords')
         return 1
 
+    # ── authentication check, no message ─────────────────────────
+    try:
+        with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(config.SMTP_USER, config.SMTP_PASS)
+    except Exception as exc:                       # noqa: BLE001
+        _explain_smtp_error(exc)
+        return 1
+
+    print('\n✅  Authenticated successfully — reports can be emailed.')
+
+    if not args.send:
+        print('    No message was sent. Add --send to deliver a test email.')
+        return 0
+
+    if not args.to:
+        print('    --send needs --to <address>.')
+        return 1
+
     body = ('<h2>Quant Research Terminal</h2>'
             '<p>SMTP is configured correctly. Scheduled reports will send.</p>')
     try:
         mailer.send_report(body, args.to, subject='Test — Quant Research Terminal')
-    except mailer.SMTPNotConfigured as exc:
-        print(f'\n❌  {exc}')
-        return 1
     except Exception as exc:                       # noqa: BLE001
-        msg = str(exc)
-        print(f'\n❌  Send failed: {type(exc).__name__}: {msg[:200]}')
-        if 'Username and Password not accepted' in msg or '535' in msg:
-            print('    Google rejects normal account passwords. Create an App '
-                  'Password at https://myaccount.google.com/apppasswords')
-        elif 'Connection refused' in msg or 'timed out' in msg:
-            print(f'    Could not reach {config.SMTP_SERVER}:{config.SMTP_PORT}. '
-                  f'Check the server/port, or whether a firewall blocks it.')
+        _explain_smtp_error(exc)
         return 1
 
-    print(f'\n✅  Test email sent to {args.to}. Check the inbox (and spam).')
+    print(f'📧  Test email sent to {args.to}. Check the inbox, and spam.')
     return 0
 
 
@@ -310,7 +342,9 @@ def build_parser() -> argparse.ArgumentParser:
         .set_defaults(func=cmd_freshness)
 
     te = sub.add_parser('test-email', help='verify SMTP settings')
-    te.add_argument('--to', required=True, help='recipient address')
+    te.add_argument('--to', help='recipient address (only needed with --send)')
+    te.add_argument('--send', action='store_true',
+                    help='actually deliver a test message (default: auth only)')
     te.set_defaults(func=cmd_test_email)
     return p
 

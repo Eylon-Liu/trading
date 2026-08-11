@@ -34,6 +34,14 @@ PATTERNS: list[tuple[str, re.Pattern]] = [
     ('AWS access key', re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b')),
     ('GitHub token', re.compile(r'\bgh[pousr]_[A-Za-z0-9]{36,}')),
     ('Slack token', re.compile(r'\bxox[abprs]-[A-Za-z0-9\-]{10,}')),
+    # Google App Passwords are 16 lowercase letters, usually pasted in four
+    # groups of four. The generic rule below misses them because it requires
+    # no whitespace inside the value.
+    ('Google App Password',
+     re.compile(r'(?i)\b(?:SMTP_PASS|smtp_password|app[_-]?password)\b\s*[:=]\s*'
+                r'["\']?(?:[a-z]{4}[ -]?){4}["\']?')),
+    ('SMTP credentials in code',
+     re.compile(r'(?i)\.login\(\s*["\'][^"\']+["\']\s*,\s*["\'][^"\']{8,}["\']')),
     ('Private key block', re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----')),
     ('Generic assigned secret',
      re.compile(r'(?i)\b(?:api[_-]?key|secret|token|password|passwd)\b'

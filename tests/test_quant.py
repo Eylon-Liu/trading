@@ -292,3 +292,93 @@ def test_notes_are_substantive():
             assert len(text) >= floor, (
                 f'{key}.{field_name} is too short ({len(text)} < {floor}): {text!r}')
             assert 'TODO' not in text.upper(), f'{key}.{field_name} has a TODO'
+
+
+# ─────────────────────────────────────────────
+# PURE FUNCTIONS  (no database)
+# ─────────────────────────────────────────────
+
+def _views(spec, days=90):
+    """Tidy pageview frame from {ticker: (baseline, recent)}."""
+    rows = []
+    for t, (base, recent) in spec.items():
+        for i in range(days):
+            rows.append({'ticker': t,
+                         'date': pd.Timestamp('2026-01-01') + pd.Timedelta(days=i),
+                         'wiki_views': (recent if i >= days - 14 else base) + (i % 5)})
+    return pd.DataFrame(rows)
+
+
+def test_attention_zscore_flags_a_spike():
+    from quant.factors import attention_zscore
+    z = attention_zscore(_views({'AAPL': (100, 400), 'MSFT': (100, 100)}))
+    assert z['AAPL'] > 5
+    assert abs(z['MSFT']) < 2
+
+
+def test_attention_zscore_needs_enough_history():
+    """A ticker with a few days of data cannot have a meaningful baseline."""
+    from quant.factors import attention_zscore
+    z = attention_zscore(_views({'AAPL': (100, 400)}, days=90).pipe(
+        lambda d: pd.concat([d, _views({'NEW': (50, 50)}, days=10)])))
+    assert 'NEW' not in (z.index if z is not None else [])
+
+
+def test_attention_zscore_handles_empty_and_flat():
+    from quant.factors import attention_zscore
+    assert attention_zscore(pd.DataFrame()) is None
+    assert attention_zscore(None) is None
+    # Zero variance must not divide by zero.
+    flat = pd.DataFrame({'ticker': ['A'] * 90,
+                         'date': pd.date_range('2026-01-01', periods=90),
+                         'wiki_views': [10.0] * 90})
+    assert attention_zscore(flat) is None
+
+
+def test_last_close_is_pure():
+    """Takes a frame, returns a series — no I/O, forward-filled."""
+    from data.yahoo import last_close
+    px = pd.DataFrame({'AAPL': [1.0, 2.0, None], 'MSFT': [5.0, None, None]},
+                      index=pd.date_range('2026-01-01', periods=3))
+    out = last_close(px)
+    assert out['AAPL'] == 2.0 and out['MSFT'] == 5.0
+    assert last_close(pd.DataFrame()).empty
+
+
+# ─────────────────────────────────────────────
+# 8-K INTERPRETATION
+# ─────────────────────────────────────────────
+
+def test_every_configured_item_code_has_a_meaning():
+    """A code we classify but cannot explain is a table cell with no answer."""
+    import config
+    from nlp import eightk as EK
+    missing = [c for c in config.EIGHTK_ITEMS if EK.get(c) is None]
+    assert missing == [], f'item codes without an interpretation: {missing}'
+
+
+def test_restatement_is_flagged_as_material():
+    """4.02 invalidates the fundamentals every factor is built from."""
+    from nlp import eightk as EK
+    assert EK.significance('4.02') == EK.MATERIAL
+    out = EK.summarize(pd.DataFrame({'item_code': ['4.02']}))
+    assert any('unreliable' in o or 'disowned' in o for o in out['observations'])
+
+
+def test_repeated_management_turnover_is_called_out():
+    from nlp import eightk as EK
+    out = EK.summarize(pd.DataFrame({'item_code': ['5.02'] * 3}))
+    assert any('turnover' in o for o in out['observations'])
+
+
+def test_routine_filings_produce_a_routine_reading():
+    from nlp import eightk as EK
+    out = EK.summarize(pd.DataFrame({'item_code': ['5.07', '8.01', '7.01']}))
+    assert out['material'] == 0
+    assert any('Nothing structurally unusual' in o for o in out['observations'])
+
+
+def test_summarize_handles_empty():
+    from nlp import eightk as EK
+    out = EK.summarize(pd.DataFrame())
+    assert out['total'] == 0 and out['observations'] == []

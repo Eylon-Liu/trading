@@ -212,7 +212,26 @@ def _latest_filed_date(facts: pd.DataFrame, concept: str,
     return df['filed'].max()
 
 
-def share_count(facts: pd.DataFrame, memo: dict | None = None) -> float:
+# A share count more than this far out of date cannot describe the company
+# today. Two annual reports' worth of slack.
+MAX_SHARE_COUNT_AGE_DAYS = 500
+
+
+def _fresh_share_value(facts: pd.DataFrame, concept: str, as_of,
+                       memo: dict | None) -> float:
+    """A share count, but only if it was filed recently enough to be current."""
+    value = latest_stock(facts, concept, memo)
+    if not np.isfinite(value) or value <= 0:
+        return np.nan
+    filed = _latest_filed_date(facts, concept, memo)
+    if filed is None or as_of is None:
+        return value
+    age = (pd.Timestamp(as_of) - pd.Timestamp(filed)).days
+    return value if age <= MAX_SHARE_COUNT_AGE_DAYS else np.nan
+
+
+def share_count(facts: pd.DataFrame, memo: dict | None = None,
+                as_of=None) -> float:
     """
     Shares outstanding, in descending order of what the number actually means.
 
@@ -231,12 +250,12 @@ def share_count(facts: pd.DataFrame, memo: dict | None = None) -> float:
     old figure. Between the two averages, whichever was filed most recently
     wins.
     """
-    exact = latest_stock(facts, 'shares_outstanding', memo)
-    if np.isfinite(exact) and exact > 0:
+    exact = _fresh_share_value(facts, 'shares_outstanding', as_of, memo)
+    if np.isfinite(exact):
         return exact
 
-    diluted = latest_stock(facts, 'shares_diluted', memo)
-    basic = latest_stock(facts, 'shares_basic', memo)
+    diluted = _fresh_share_value(facts, 'shares_diluted', as_of, memo)
+    basic = _fresh_share_value(facts, 'shares_basic', as_of, memo)
 
     if not np.isfinite(diluted):
         return basic
@@ -307,7 +326,7 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         std = latest_stock(facts, 'short_term_debt', memo)
         cur_a = latest_stock(facts, 'current_assets', memo)
         cur_l = latest_stock(facts, 'current_liabilities', memo)
-        shares = share_count(facts, memo)
+        shares = share_count(facts, memo, as_of=as_of)
 
         debt = np.nansum([ltd if np.isfinite(ltd) else 0,
                           std if np.isfinite(std) else 0])

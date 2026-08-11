@@ -19,6 +19,7 @@ from core import db
 from data import news as NEWS
 from data import policy as POL
 from data import sec as SEC
+from nlp import eightk as EK
 from nlp import llm as LLM
 from ui import components as C
 from ui import theme as TH
@@ -118,11 +119,70 @@ def _load_company(n_clicks, ticker, days):
     if not events.empty:
         ev = events.copy()
         ev['filed'] = pd.to_datetime(ev['filed']).dt.date
+        ev['significance'] = ev['item_code'].map(EK.significance)
+        ek = EK.summarize(ev)
+
+        # Only the codes actually present, so the reference stays short.
+        present = [c for c in ev['item_code'].drop_duplicates() if EK.get(c)]
+        present.sort(key=lambda c: -EK.WEIGHT_ORDER[EK.significance(c)])
+        explain = [
+            dbc.AccordionItem([
+                html.Div([html.B('What it is: ', style={'color': TH.MUTED}),
+                          html.Span(EK.get(c).means)],
+                         style={'fontSize': '0.88rem', 'lineHeight': '1.7',
+                                'marginBottom': '8px'}),
+                html.Div([html.B('How to read it: ', style={'color': TH.ACCENT}),
+                          html.Span(EK.get(c).read)],
+                         style={'fontSize': '0.88rem', 'lineHeight': '1.7',
+                                'marginBottom': '8px'}),
+                html.Div([html.B('Check: ', style={'color': TH.WARN}),
+                          html.Span(EK.get(c).check)],
+                         style={'fontSize': '0.88rem', 'lineHeight': '1.7'}),
+            ], title=f'{c} — {EK.get(c).means[:58]}…'
+                     f'   [{EK.get(c).significance}]',
+                item_id=f'ek-{c}')
+            for c in present
+        ]
+
         panels.append(C.card('📁 8-K corporate events', [
-            C.note('Taken straight from SEC item codes — the filer classified '
-                   'these, so no text interpretation is involved.', 'info'),
-            C.data_table(ev[['filed', 'item_code', 'category', 'subtype']]
-                         .head(20), page_size=10),
+            C.metric_row([
+                (ek['material'], 'material',
+                 TH.NEG if ek['material'] else TH.MUTED),
+                (ek['notable'], 'notable',
+                 TH.WARN if ek['notable'] else TH.MUTED),
+                (ek['routine'], 'routine', TH.MUTED),
+                (ek['total'], 'filings', TH.TEXT),
+            ]),
+            C.note(ek['headline'], 'info'),
+
+            html.Div([
+                html.B('What this pattern says',
+                       style={'color': TH.ACCENT, 'fontSize': '0.86rem'}),
+                html.Ul([html.Li(o, style={'marginBottom': '6px'})
+                         for o in ek['observations']],
+                        style={'fontSize': '0.88rem', 'lineHeight': '1.7',
+                               'paddingLeft': '18px', 'marginTop': '6px'}),
+            ], className='mb-3'),
+
+            C.data_table(
+                ev[['filed', 'item_code', 'significance', 'subtype']].head(20),
+                page_size=10,
+                extra_conditional=[
+                    {'if': {'filter_query': '{significance} = "material"',
+                            'column_id': 'significance'},
+                     'color': TH.NEG, 'fontWeight': '700'},
+                    {'if': {'filter_query': '{significance} = "notable"',
+                            'column_id': 'significance'},
+                     'color': TH.WARN},
+                ]),
+
+            html.Div('Item codes are assigned by the filer, so the '
+                     'classification needs no text parsing. Everything below '
+                     'is interpretation — expand a code for what it means.',
+                     style={'color': TH.MUTED, 'fontSize': '0.75rem',
+                            'margin': '10px 0 6px'}),
+            dbc.Accordion(explain, start_collapsed=True, always_open=True,
+                          flush=True),
         ], className='mb-3'))
 
     # ── insider activity ──────────────────────────────────────────

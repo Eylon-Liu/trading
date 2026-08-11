@@ -399,8 +399,13 @@ def llm_available() -> bool:
 
 SMTP_SERVER = os.environ.get('SMTP_SERVER', 'smtp.gmail.com')
 SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
-SMTP_USER = os.environ.get('SMTP_USER')
-SMTP_PASS = os.environ.get('SMTP_PASS')
+SMTP_USER = (os.environ.get('SMTP_USER') or '').strip() or None
+
+# Google presents an App Password as four groups of four ("abcd efgh ijkl
+# mnop"). The spaces are display only — SMTP AUTH expects the 16 characters —
+# so they are stripped here rather than leaving the user to discover that a
+# copy-paste straight from Google fails authentication.
+SMTP_PASS = (os.environ.get('SMTP_PASS') or '').replace(' ', '').strip() or None
 FRED_API_KEY = os.environ.get('FRED_API_KEY')
 
 
