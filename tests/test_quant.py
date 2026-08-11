@@ -382,3 +382,117 @@ def test_summarize_handles_empty():
     from nlp import eightk as EK
     out = EK.summarize(pd.DataFrame())
     assert out['total'] == 0 and out['observations'] == []
+
+
+# ─────────────────────────────────────────────
+# DATA VALIDITY
+# ─────────────────────────────────────────────
+
+def _facts(rows):
+    """Fact frame with the columns quarterly_flows expects."""
+    df = pd.DataFrame(rows)
+    for c in ('period_start', 'period_end', 'filed'):
+        df[c] = pd.to_datetime(df[c])
+    for c in ('fy', 'fp'):
+        if c not in df.columns:
+            df[c] = None
+    return df
+
+
+def test_equity_ratios_are_dropped_when_equity_is_negligible():
+    """Buybacks can erase book equity without the business being distressed.
+
+    GoDaddy carried $0.01B of equity on $0.91B of earnings — an ROE of
+    13,587%. Arithmetically right, and meaningless.
+    """
+    assert np.isnan(F._meaningful_equity(-1.4e8, 4.0e9))     # negative
+    assert np.isnan(F._meaningful_equity(1e7, 4.0e9))        # 0.25% of assets
+    assert F._meaningful_equity(4.4e11, 5.6e11) == 4.4e11    # healthy
+
+
+def test_invested_capital_is_nan_without_usable_equity():
+    """Otherwise ROIC divides by debt alone; Marriott reached 185."""
+    assert np.isnan(F._invested_capital(np.nan, 5e9))
+    assert F._invested_capital(1e10, 5e9) == 1.5e10
+
+
+def test_one_tag_is_chosen_per_concept_not_pooled():
+    """A filer reporting a total and a component tags both.
+
+    Camden Property files ~$5M of contract revenue alongside ~$390M of lease
+    income; pooling them produced a net margin of 2,565%.
+    """
+    facts = _facts([
+        {'concept': 'revenue', 'tag': 'OperatingLeaseLeaseIncome',
+         'period_start': '2026-01-01', 'period_end': '2026-03-31',
+         'filed': '2026-05-01', 'val': 390e6},
+        {'concept': 'revenue', 'tag': 'RevenueFromContractWithCustomerExcludingAssessedTax',
+         'period_start': '2026-01-01', 'period_end': '2026-03-31',
+         'filed': '2026-05-01', 'val': 5e6},
+    ])
+    memo = {}
+    out = F._concept_frame(facts, 'revenue', memo)
+    assert out['tag'].nunique() == 1
+    assert out.iloc[0]['val'] == 390e6, 'the larger current line must win'
+
+
+def test_retired_tags_lose_to_current_ones():
+    """Microsoft's obsolete `Revenues` history outnumbered its current line."""
+    facts = _facts([
+        {'concept': 'revenue', 'tag': 'Revenues',
+         'period_start': '2015-01-01', 'period_end': '2015-03-31',
+         'filed': '2015-05-01', 'val': 900e9},
+        {'concept': 'revenue', 'tag': 'RevenueFromContractWithCustomerExcludingAssessedTax',
+         'period_start': '2026-01-01', 'period_end': '2026-03-31',
+         'filed': '2026-05-01', 'val': 70e9},
+    ])
+    out = F._concept_frame(facts, 'revenue', {})
+    assert out.iloc[0]['tag'].startswith('RevenueFromContract')
+
+
+def test_share_count_rejected_when_eps_contradicts_it():
+    """Berkshire's cover page reports Class A only — a thousandth of the base.
+
+    Multiplied by a Class B price that gave a market cap under $1B against a
+    real ~$1.1T, and an earnings yield of 9,894%. An independent count derived
+    from net income / diluted EPS disagrees by three orders of magnitude, so
+    the reported figure is refused.
+    """
+    from datetime import date as _d
+
+    rows = [{'concept': 'shares_outstanding', 'tag': 'dei',
+             'period_start': '2026-06-30', 'period_end': '2026-06-30',
+             'filed': '2026-07-30', 'val': 1.6e6}]
+    # Four quarters, so TTM resolves rather than refusing to extrapolate.
+    for i, (s_, e_, f_) in enumerate([
+            ('2025-07-01', '2025-09-30', '2025-10-30'),
+            ('2025-10-01', '2025-12-31', '2026-01-30'),
+            ('2026-01-01', '2026-03-31', '2026-04-30'),
+            ('2026-04-01', '2026-06-30', '2026-07-30')]):
+        rows.append({'concept': 'net_income', 'tag': 'NetIncomeLoss',
+                     'period_start': s_, 'period_end': e_, 'filed': f_,
+                     'val': 5e9})
+        rows.append({'concept': 'eps_diluted', 'tag': 'EarningsPerShareDiluted',
+                     'period_start': s_, 'period_end': e_, 'filed': f_,
+                     'val': 3.25})
+
+    facts = _facts(rows)
+    # 20e9 / 13.0 => ~1.54e9 implied shares vs 1.6e6 reported: a 1000x gap.
+    assert np.isfinite(F.implied_share_count(facts, {}))
+    assert np.isnan(F.share_count(facts, {}, as_of=_d(2026, 8, 1)))
+
+    # The same count passes when the two agree.
+    ok = _facts([r for r in rows if r['concept'] != 'shares_outstanding'] +
+                [{'concept': 'shares_outstanding', 'tag': 'dei',
+                  'period_start': '2026-06-30', 'period_end': '2026-06-30',
+                  'filed': '2026-07-30', 'val': 1.54e9}])
+    assert np.isfinite(F.share_count(ok, {}, as_of=_d(2026, 8, 1)))
+
+
+def test_validate_flags_impossible_ratios():
+    from quant import validate as V
+    factors = pd.DataFrame({'EARNINGS_YIELD': [0.05, 899.0]},
+                           index=['AAPL', 'ERIE'])
+    found = V.check_factor_bounds(factors)
+    assert found and found[0].count == 1
+    assert 'ERIE' in [t for t, _v in found[0].examples]

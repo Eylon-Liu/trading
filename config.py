@@ -206,6 +206,17 @@ SEC_TAG_MAP = {
         'RevenueFromContractWithCustomerExcludingAssessedTax',
         'RevenueFromContractWithCustomerIncludingAssessedTax',
         'Revenues', 'SalesRevenueNet', 'SalesRevenueGoodsNet',
+        # Banks and REITs report revenue under none of the tags above. Without
+        # these, Regions Financial showed $0.10B of revenue against $2.23B of
+        # net income — a net margin of 2,146% — and Camden Property $0.01B.
+        'RevenuesNetOfInterestExpense',
+        'InterestAndDividendIncomeOperating',
+        'RealEstateRevenueNet',
+        'OperatingLeasesIncomeStatementLeaseRevenue',
+        # ASC 842. REITs moved rental income here in 2019, which is why Camden
+        # Property's current contract-with-customer tag holds only $5M of
+        # ancillary revenue against ~$390M of actual rent.
+        'OperatingLeaseLeaseIncome',
     ],
     'net_income': ['NetIncomeLoss', 'ProfitLoss'],
     'operating_income': ['OperatingIncomeLoss'],

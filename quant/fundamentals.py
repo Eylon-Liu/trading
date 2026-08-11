@@ -79,9 +79,45 @@ def _concept_frame(facts: pd.DataFrame, concept: str,
 
     groups = memo.get(_GROUPS_KEY)
     if groups is None:
-        groups = dict(tuple(facts.groupby('concept', sort=False)))
+        groups = {c: _single_tag(g)
+                  for c, g in facts.groupby('concept', sort=False)}
         memo[_GROUPS_KEY] = groups
     return groups.get(concept, facts.iloc[:0])
+
+
+def _single_tag(group: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep one XBRL tag per concept rather than pooling several.
+
+    A concept maps to a list of tags because filers differ, but a single filer
+    may report more than one of them at different scales. Camden Property
+    files both `Revenues` — a small fragment — and `RealEstateRevenueNet`,
+    its actual rental income. Pooling them let whichever was filed last win
+    per period, mixing the two and producing a net margin of 2,565%.
+
+    Two rules, in order, because neither alone is enough:
+
+    1. Keep only tags the filer still uses — within a year of its newest
+       filing for this concept. Ranking by count alone picked retired tags,
+       giving Microsoft a 134% net margin from an obsolete `Revenues` line.
+    2. Among those, take the largest. A filer that reports both a total and a
+       component tags both; the component is smaller by construction. Camden
+       Property files `Revenues` as a fragment alongside
+       `RealEstateRevenueNet`, its actual rental income, and picking by
+       recency alone chose the fragment — a net margin of 2,486%.
+    """
+    if 'tag' not in group.columns or group['tag'].nunique() <= 1:
+        return group
+
+    stats = group.groupby('tag').agg(newest=('filed', 'max'),
+                                     scale=('val', lambda s: s.abs().median()))
+    cutoff = stats['newest'].max() - pd.Timedelta(days=365)
+    current = stats[stats['newest'] >= cutoff]
+    if current.empty:
+        current = stats
+
+    best = current['scale'].idxmax()
+    return group[group['tag'] == best]
 
 
 def _latest_filed(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
@@ -230,8 +266,32 @@ def _fresh_share_value(facts: pd.DataFrame, concept: str, as_of,
     return value if age <= MAX_SHARE_COUNT_AGE_DAYS else np.nan
 
 
+# A reported share count is accepted only if an independent figure derived
+# from EPS agrees within this band. Measured agreement on healthy filers is
+# 0.95-1.00x, so 25% is loose enough for rounding and share-class rounding
+# while still catching an order-of-magnitude error.
+SHARE_CROSSCHECK_BAND = (0.75, 1.33)
+
+
+def implied_share_count(facts: pd.DataFrame, memo: dict | None = None) -> float:
+    """
+    Shares implied by net income / diluted EPS.
+
+    An independent read on the same quantity, built from two us-gaap facts the
+    filer had to keep consistent with each other. Useful precisely because it
+    fails differently from the cover-page count: a wrong share class or a
+    units error moves one and not the other.
+    """
+    ni = ttm(facts, 'net_income', memo=memo)
+    eps = ttm(facts, 'eps_diluted', memo=memo)
+    if not (np.isfinite(ni) and np.isfinite(eps)) or eps == 0:
+        return np.nan
+    implied = ni / eps
+    return implied if np.isfinite(implied) and implied > 0 else np.nan
+
+
 def share_count(facts: pd.DataFrame, memo: dict | None = None,
-                as_of=None) -> float:
+                as_of=None, crosscheck: bool = True) -> float:
     """
     Shares outstanding, in descending order of what the number actually means.
 
@@ -250,23 +310,40 @@ def share_count(facts: pd.DataFrame, memo: dict | None = None,
     old figure. Between the two averages, whichever was filed most recently
     wins.
     """
+    chosen = np.nan
     exact = _fresh_share_value(facts, 'shares_outstanding', as_of, memo)
     if np.isfinite(exact):
-        return exact
+        chosen = exact
+    else:
+        diluted = _fresh_share_value(facts, 'shares_diluted', as_of, memo)
+        basic = _fresh_share_value(facts, 'shares_basic', as_of, memo)
+        if not np.isfinite(diluted):
+            chosen = basic
+        elif not np.isfinite(basic):
+            chosen = diluted
+        else:
+            d_filed = _latest_filed_date(facts, 'shares_diluted', memo)
+            b_filed = _latest_filed_date(facts, 'shares_basic', memo)
+            chosen = (basic if (d_filed is not None and b_filed is not None
+                                and b_filed > d_filed) else diluted)
 
-    diluted = _fresh_share_value(facts, 'shares_diluted', as_of, memo)
-    basic = _fresh_share_value(facts, 'shares_basic', as_of, memo)
+    if not crosscheck or not np.isfinite(chosen):
+        return chosen
 
-    if not np.isfinite(diluted):
-        return basic
-    if not np.isfinite(basic):
-        return diluted
-
-    d_filed = _latest_filed_date(facts, 'shares_diluted', memo)
-    b_filed = _latest_filed_date(facts, 'shares_basic', memo)
-    if d_filed is not None and b_filed is not None and b_filed > d_filed:
-        return basic
-    return diluted
+    # Reject a count that an independent derivation contradicts. Berkshire's
+    # cover page reports Class A only, which is roughly a thousandth of the
+    # economic share base — multiplied by a Class B price it produced a market
+    # cap of under a billion against a real trillion, and an earnings yield of
+    # 9,894%. Better to score nothing than to score that.
+    implied = implied_share_count(facts, memo)
+    if np.isfinite(implied):
+        ratio = chosen / implied
+        lo, hi = SHARE_CROSSCHECK_BAND
+        if not (lo <= ratio <= hi):
+            log.debug('share count rejected: reported %.4g vs EPS-implied '
+                      '%.4g (%.2fx)', chosen, implied, ratio)
+            return np.nan
+    return chosen
 
 
 def value_n_periods_ago(facts: pd.DataFrame, concept: str, years: int,
@@ -287,6 +364,39 @@ def value_n_periods_ago(facts: pd.DataFrame, concept: str, years: int,
     target = df['period_end'].max() - pd.DateOffset(years=years)
     prior = df[df['period_end'] <= target]
     return float(prior.iloc[-1]['val']) if not prior.empty else np.nan
+
+
+# Book equity below this share of assets makes any equity-denominated ratio
+# meaningless rather than merely large.
+MIN_EQUITY_TO_ASSETS = 0.01
+
+
+def _invested_capital(equity: float, debt: float) -> float:
+    """Equity + debt, or NaN when equity is not usable."""
+    if not np.isfinite(equity):
+        return np.nan
+    return equity + (debt if np.isfinite(debt) else 0.0)
+
+
+def _meaningful_equity(equity: float, assets: float) -> float:
+    """
+    Equity, or NaN when it is too small or negative to divide by.
+
+    Sustained buybacks can drive book equity to nearly nothing without the
+    business being distressed: GoDaddy carries $0.01B of equity on $0.91B of
+    earnings, which produces an ROE of 13,587% and a debt-to-equity of 561.
+    Those figures are arithmetically correct and tell a reader nothing, and
+    once winsorized they look merely excellent — which is worse, because the
+    name then ranks on a quality score it has not earned.
+
+    NaN drops the factor for that name and the coverage floor decides whether
+    enough remains to score it at all.
+    """
+    if not np.isfinite(equity) or equity <= 0:
+        return np.nan
+    if np.isfinite(assets) and assets > 0 and equity / assets < MIN_EQUITY_TO_ASSETS:
+        return np.nan
+    return equity
 
 
 def build_fundamentals(tickers: list[str], as_of: date | str,
@@ -348,13 +458,17 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
             'gross_margin': _safe_div(gp, rev),
             'operating_margin': _safe_div(op_inc, rev),
             'net_margin': _safe_div(ni, rev),
-            'roe': _safe_div(ni, equity),
+            'roe': _safe_div(ni, _meaningful_equity(equity, assets)),
             'roa': _safe_div(ni, assets),
-            'roic': _safe_div(op_inc, _nan_sum(equity, debt)),
+            # Invested capital is equity plus debt. With equity unusable
+            # the sum collapses to debt alone, which is not invested
+            # capital and inflates the ratio — Marriott reached 185.
+            'roic': _safe_div(op_inc, _invested_capital(
+                _meaningful_equity(equity, assets), debt)),
             'gross_profitability': _safe_div(gp, assets),
             'asset_turnover': _safe_div(rev, assets),
             # balance-sheet quality
-            'debt_to_equity': _safe_div(debt, equity),
+            'debt_to_equity': _safe_div(debt, _meaningful_equity(equity, assets)),
             'current_ratio': _safe_div(cur_a, cur_l),
             'accruals': _safe_div(ni - ocf if np.isfinite(ni) and np.isfinite(ocf)
                                   else np.nan, assets),

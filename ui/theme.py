@@ -241,6 +241,25 @@ button.dash-dropdown svg, button.dash-dropdown svg * {{
     color:{MUTED} !important; font-size:10px !important; }}
 .rc-slider-mark-text-active, .dash-slider-mark-within-selection {{
     color:{TEXT} !important; }}
+/* Dropdown menus scroll internally rather than growing to fit their options.
+   The strategy list is 20 entries and rendered ~800px tall, so on a short
+   window it ran off the bottom of the screen and the control looked empty —
+   only the search box was visible. */
+[role="listbox"], .dash-dropdown-menu, .dash-dropdown-options {{
+    max-height:340px !important;
+    overflow-y:auto !important;
+    z-index:1200 !important;
+    background:{PANEL_ALT} !important;
+    border:1px solid #3d4166 !important;
+    border-radius:7px !important;
+    box-shadow:0 12px 32px rgba(0,0,0,0.55) !important; }}
+[role="option"] {{ color:{TEXT} !important; font-size:0.85rem; }}
+[role="option"]:hover, [role="option"][data-highlighted] {{
+    background:rgba(17,153,142,0.22) !important; }}
+[role="listbox"]::-webkit-scrollbar {{ width:9px; }}
+[role="listbox"]::-webkit-scrollbar-thumb {{
+    background:#3d4166; border-radius:5px; }}
+
 /* Dash 4.x renders a numeric entry box beside each slider; unstyled it is a
    bare white rectangle on the dark panel. */
 .dash-input-container, .dash-range-slider-input, .dash-slider-input {{

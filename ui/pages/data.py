@@ -117,8 +117,67 @@ def layout() -> html.Div:
                         'never re-fetched.',
                className='mb-3'),
 
+        C.card('🔬 Data validity', html.Div(id='data-validity'),
+               subtitle='Looks for values that are present and wrong, not just '
+                        'missing — a wrong number ranks a company on a fiction, '
+                        'a missing one only costs breadth.',
+               className='mb-3'),
+
         C.card('🤖 AI analysis layer', html.Div(id='data-ai'),
                className='mb-3'),
+    ])
+
+
+def _validity_block() -> html.Div:
+    """Run the integrity checks over the store and the current factor frame."""
+    try:
+        from datetime import date as _date
+
+        from data.universe import PRESETS
+        from quant import factors as FA
+        from quant import validate as V
+
+        tickers = PRESETS['dia'].resolve()
+        factors = FA.build_all(tickers, _date.today()) if tickers else None
+        findings = V.run_all(factors)
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('validity run failed: %s', exc)
+        return C.note(f'Could not run the checks: {exc}', 'error')
+
+    errors = [f for f in findings if f.severity == 'error']
+    warnings_ = [f for f in findings if f.severity == 'warning']
+
+    header = C.metric_row([
+        (len(errors), 'errors', TH.NEG if errors else TH.POS),
+        (len(warnings_), 'warnings', TH.WARN if warnings_ else TH.MUTED),
+        ('pass' if not errors else 'fail', 'verdict',
+         TH.POS if not errors else TH.NEG),
+    ])
+
+    if not findings:
+        body = C.note('Every check passed: no impossible ratios, no '
+                      'infinities, no future-dated bars, no facts filed '
+                      'before the period they describe.', 'info')
+    else:
+        from quant import validate as V
+        body = C.data_table(V.to_frame(findings), page_size=12,
+                            extra_conditional=[
+            {'if': {'filter_query': '{severity} = "error"',
+                    'column_id': 'severity'},
+             'color': TH.NEG, 'fontWeight': '700'},
+            {'if': {'filter_query': '{severity} = "warning"',
+                    'column_id': 'severity'}, 'color': TH.WARN},
+        ])
+
+    return html.Div([
+        header,
+        html.Hr(style={'borderColor': TH.BORDER}),
+        body,
+        html.Div('Checks report rather than repair. Silently patching data is '
+                 'how a store stops being trustworthy — a name that cannot be '
+                 'measured is excluded from ranking instead of estimated.',
+                 style={'color': TH.MUTED, 'fontSize': '0.75rem',
+                        'marginTop': '10px'}),
     ])
 
 
@@ -225,11 +284,12 @@ def _ai_status_block() -> html.Div:
     Output('data-tables', 'children'), Output('data-freshness', 'children'),
     Output('data-members', 'children'), Output('data-cache', 'children'),
     Output('data-ai', 'children'), Output('data-sync', 'children'),
+    Output('data-validity', 'children'),
     Input('tabs', 'active_tab'),
 )
 def _refresh(active_tab):
     if active_tab != 'tab-data':
-        return (no_update,) * 6
+        return (no_update,) * 7
 
     # ── row counts ────────────────────────────────────────────────
     try:
@@ -317,4 +377,4 @@ def _refresh(active_tab):
         cache = C.note(f'{exc}', 'error')
 
     return (tables, freshness, membership, cache,
-            _ai_status_block(), _sync_status_block())
+            _ai_status_block(), _sync_status_block(), _validity_block())
