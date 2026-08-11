@@ -11,6 +11,7 @@ import pytest
 from data.classify import sector_from_sic
 from quant import backtest as BT
 from quant import factors as FA
+from quant import fundamentals as F
 from quant import tradeplan as TP
 
 
@@ -204,3 +205,61 @@ def test_narrow_ranges_take_priority_over_broad_ones():
     """
     assert sector_from_sic(2840) != 'Materials'
     assert sector_from_sic(3021) != 'Materials'
+
+
+# ─────────────────────────────────────────────
+# SHARE COUNT / TAG DRIFT
+# ─────────────────────────────────────────────
+
+def _share_facts(rows):
+    """Minimal fact frame for the share-count helpers."""
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    for c in ('period_start', 'period_end', 'filed'):
+        df[c] = pd.to_datetime(df[c])
+    return df
+
+
+def test_share_count_prefers_diluted_when_both_current():
+    facts = _share_facts([
+        {'concept': 'shares_diluted', 'period_start': '2026-01-01',
+         'period_end': '2026-03-31', 'filed': '2026-04-30', 'val': 1000.0},
+        {'concept': 'shares_basic', 'period_start': '2026-01-01',
+         'period_end': '2026-03-31', 'filed': '2026-04-30', 'val': 990.0},
+    ])
+    assert F.share_count(facts) == 1000.0
+
+
+def test_share_count_falls_back_when_the_diluted_tag_goes_stale():
+    """Exxon stopped filing the diluted tag in 2014.
+
+    Taking diluted unconditionally pinned its share count — and so its market
+    cap and every yield factor — to a twelve-year-old figure.
+    """
+    facts = _share_facts([
+        {'concept': 'shares_diluted', 'period_start': '2013-01-01',
+         'period_end': '2013-12-31', 'filed': '2014-02-26', 'val': 4419.0},
+        {'concept': 'shares_basic', 'period_start': '2026-04-01',
+         'period_end': '2026-06-30', 'filed': '2026-08-03', 'val': 4174.0},
+    ])
+    assert F.share_count(facts) == 4174.0
+
+
+def test_share_count_handles_a_missing_tag_either_way():
+    only_basic = _share_facts([
+        {'concept': 'shares_basic', 'period_start': '2026-01-01',
+         'period_end': '2026-03-31', 'filed': '2026-04-30', 'val': 500.0}])
+    assert F.share_count(only_basic) == 500.0
+
+    only_diluted = _share_facts([
+        {'concept': 'shares_diluted', 'period_start': '2026-01-01',
+         'period_end': '2026-03-31', 'filed': '2026-04-30', 'val': 500.0}])
+    assert F.share_count(only_diluted) == 500.0
+
+
+def test_share_count_is_nan_when_neither_tag_exists():
+    import numpy as np
+    facts = _share_facts([
+        {'concept': 'revenue', 'period_start': '2026-01-01',
+         'period_end': '2026-03-31', 'filed': '2026-04-30', 'val': 1.0}])
+    assert np.isnan(F.share_count(facts))

@@ -203,6 +203,45 @@ def latest_stock(facts: pd.DataFrame, concept: str,
     return float(df.sort_values('period_end').iloc[-1]['val'])
 
 
+def _latest_filed_date(facts: pd.DataFrame, concept: str,
+                       memo: dict | None = None):
+    """When the newest fact for a concept was filed, or None."""
+    df = _concept_frame(facts, concept, memo)
+    if df.empty:
+        return None
+    return df['filed'].max()
+
+
+def share_count(facts: pd.DataFrame, memo: dict | None = None) -> float:
+    """
+    Shares outstanding, preferring diluted but falling back to basic.
+
+    Filers switch XBRL tags. Exxon stopped reporting
+    WeightedAverageNumberOfDilutedSharesOutstanding after 2013 and reports only
+    the basic count; taking diluted unconditionally pinned its share count to a
+    2013 figure and, through it, market cap and every yield factor derived from
+    market cap. Whichever tag was filed most recently is the one that reflects
+    the company today.
+
+    Both are weighted averages for EPS rather than a period-end count, so this
+    is an estimate — but an estimate from this year beats an exact figure from
+    twelve years ago.
+    """
+    diluted = latest_stock(facts, 'shares_diluted', memo)
+    basic = latest_stock(facts, 'shares_basic', memo)
+
+    if not np.isfinite(diluted):
+        return basic
+    if not np.isfinite(basic):
+        return diluted
+
+    d_filed = _latest_filed_date(facts, 'shares_diluted', memo)
+    b_filed = _latest_filed_date(facts, 'shares_basic', memo)
+    if d_filed is not None and b_filed is not None and b_filed > d_filed:
+        return basic
+    return diluted
+
+
 def value_n_periods_ago(facts: pd.DataFrame, concept: str, years: int,
                         memo: dict | None = None) -> float:
     """Value roughly `years` back — for growth and CAGR calculations."""
@@ -260,7 +299,7 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         std = latest_stock(facts, 'short_term_debt', memo)
         cur_a = latest_stock(facts, 'current_assets', memo)
         cur_l = latest_stock(facts, 'current_liabilities', memo)
-        shares = latest_stock(facts, 'shares_diluted', memo)
+        shares = share_count(facts, memo)
 
         debt = np.nansum([ltd if np.isfinite(ltd) else 0,
                           std if np.isfinite(std) else 0])
