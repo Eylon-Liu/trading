@@ -228,10 +228,15 @@ def adjusted_ohlc(tickers: list[str], start: date | str | None = None,
 
     Returns (high, low, close), each a wide date x ticker frame.
     """
-    close = price_history(tickers, start, end, field='close')
-    adj = price_history(tickers, start, end, field='adj_close')
-    high = price_history(tickers, start, end, field='high')
-    low = price_history(tickers, start, end, field='low')
+    raw = _ohlc_raw(tickers, start, end)
+    if raw.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+
+    close = raw.pivot_table(index='date', columns='ticker', values='close', aggfunc='last')
+    adj = raw.pivot_table(index='date', columns='ticker', values='adj_close', aggfunc='last')
+    high = raw.pivot_table(index='date', columns='ticker', values='high', aggfunc='last')
+    low = raw.pivot_table(index='date', columns='ticker', values='low', aggfunc='last')
 
     if close.empty or adj.empty:
         return high, low, adj
@@ -246,6 +251,25 @@ def adjusted_ohlc(tickers: list[str], start: date | str | None = None,
         low = low[low.columns.intersection(common)].mul(ratio, fill_value=np.nan)
 
     return high, low, adj
+
+
+def _ohlc_raw(tickers: list[str], start=None, end=None) -> pd.DataFrame:
+    """Single SQL read for high, low, close, adj_close — replaces 4 queries."""
+    if not tickers:
+        return pd.DataFrame()
+    placeholders = ','.join(f':t{i}' for i in range(len(tickers)))
+    params: dict = {f't{i}': t for i, t in enumerate(tickers)}
+    clauses = [f'ticker IN ({placeholders})']
+    if start:
+        clauses.append('date >= :start')
+        params['start'] = str(pd.to_datetime(start).date())
+    if end:
+        clauses.append('date <= :end')
+        params['end'] = str(pd.to_datetime(end).date())
+    return db.read_sql(
+        f'SELECT ticker, date, high, low, close, adj_close FROM prices '
+        f'WHERE {" AND ".join(clauses)} ORDER BY date',
+        params, parse_dates=['date'])
 
 
 def last_close(prices: pd.DataFrame) -> pd.Series:

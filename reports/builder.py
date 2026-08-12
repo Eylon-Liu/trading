@@ -21,6 +21,8 @@ import config
 from core import db
 from data import news as NEWS
 from data import policy as POL
+from data.universe import PRESETS, UniverseSpec
+from quant import engine as EN
 from quant import research as RS
 from quant import strategies as ST
 from quant import tradeplan as TP
@@ -49,10 +51,17 @@ def _run_scores(run_id: str) -> pd.DataFrame:
 
 
 def gather(strategy: str, as_of: date, compare_days: int = 1) -> dict:
-    """Assemble everything a report needs."""
+    """Assemble everything a report needs, running the screen if needed."""
     current = _latest_run(strategy, as_of)
     if current is None:
-        return {'error': f'no stored run for {strategy} on or before {as_of}'}
+        log.info('no stored run for %s — running screen now', strategy)
+        spec = PRESETS.get('spy', UniverseSpec(preset='SPY'))
+        result = EN.run(spec, strategy, as_of=as_of, persist=True)
+        if result.scores.empty:
+            return {'error': f'screen for {strategy} produced no results'}
+        current = _latest_run(strategy, as_of)
+        if current is None:
+            return {'error': f'screen ran but no stored run found for {strategy}'}
 
     prior = _latest_run(strategy, as_of - timedelta(days=compare_days))
     now = _run_scores(current['run_id'])

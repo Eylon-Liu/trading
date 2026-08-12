@@ -263,8 +263,7 @@ def fundamental_factors(tickers: list[str], as_of: date | str) -> pd.DataFrame:
         out['TRAILING_PE'] = prof.get('trailing_pe').reindex(fund.index) \
             if 'trailing_pe' in prof else np.nan
 
-    out['PIOTROSKI_F'] = F.piotroski_f(
-        tickers, as_of, facts_all=facts_all).reindex(fund.index)
+    out['PIOTROSKI_F'] = fund['piotroski_f']
     out['DATA_AS_OF'] = fund['last_filed']
     return out
 
