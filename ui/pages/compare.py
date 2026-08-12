@@ -42,7 +42,7 @@ def layout() -> html.Div:
                     {'label': '  Across strategies — two strategies, one date',
                      'value': 'cross'},
                 ],
-                value='cross', inline=True,
+                value='time', inline=True,
                 inputStyle={'marginRight': '6px'},
                 labelStyle={'marginRight': '26px', 'fontSize': '0.86rem'},
                 className='mb-3'),

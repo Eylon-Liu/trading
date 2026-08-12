@@ -51,12 +51,15 @@ def data_version() -> str:
                    (SELECT COUNT(*) FROM prices)               AS np,
                    (SELECT MAX(date) FROM prices)              AS mp,
                    (SELECT COUNT(*) FROM insider_txns)         AS ni,
-                   (SELECT COUNT(*) FROM securities)           AS ns
+                   (SELECT COUNT(*) FROM securities)           AS ns,
+                   (SELECT COUNT(*) FROM profile_snapshots)    AS nps,
+                   (SELECT MAX(snapshot_date) FROM profile_snapshots) AS mps
         """)
         if row.empty:
             return 'unknown'
         r = row.iloc[0]
-        return f"{r['nf']}:{r['mf']}:{r['np']}:{r['mp']}:{r['ni']}:{r['ns']}"
+        return (f"{r['nf']}:{r['mf']}:{r['np']}:{r['mp']}"
+                f":{r['ni']}:{r['ns']}:{r['nps']}:{r['mps']}")
     except Exception as exc:                       # noqa: BLE001
         # Without a version we cannot prove freshness, so make the key unique
         # and effectively bypass the cache rather than risk a stale hit.

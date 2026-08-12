@@ -90,6 +90,8 @@ def score_universe(raw: pd.DataFrame, strategy: ST.Strategy
     factor_scores = pd.DataFrame(scored)
     weights = {k: v for k, v in strategy.weights.items() if k in factor_scores}
     composite, coverage = T.composite_score(factor_scores, weights)
+    if strategy.invert:
+        composite = -composite
 
     out = pd.DataFrame({
         'composite': composite,
@@ -145,7 +147,8 @@ def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
     if f.get('rsi_min') and 'RSI_14' in raw:
         keep &= raw['RSI_14'].fillna(50) >= f['rsi_min']
     if f.get('min_market_cap') and 'MARKET_CAP' in raw:
-        keep &= raw['MARKET_CAP'].fillna(0) >= f['min_market_cap']
+        mcap = pd.to_numeric(raw['MARKET_CAP'], errors='coerce')
+        keep &= mcap.isna() | (mcap >= f['min_market_cap'])
 
     return raw.index[keep]
 
@@ -156,57 +159,41 @@ def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
 
 def _long_term_signal(row: pd.Series) -> tuple[str, float, str]:
     """
-    Grade a long-term holding on business quality and valuation.
+    Grade a long-term holding from its composite rank plus context the
+    composite does not contain: trend confirmation and insider activity.
 
-    Deliberately ignores short-term price action: a good business does not
-    stop being one because it is below its 50-day average.
+    Raw factor values (ROIC, Piotroski, D/E, etc.) are already weighted into
+    the composite, so re-scoring them here would double-count and can promote
+    a mediocre-composite name into "Buy."
     """
     score, reasons = 0.0, []
     comp = row.get('composite', np.nan)
 
     if np.isfinite(comp):
         if comp > 1.0:
-            score += 3; reasons.append('Top-decile factor score')
+            score += 3; reasons.append('Top-decile composite')
         elif comp > 0.5:
-            score += 2; reasons.append('Strong factor score')
+            score += 2; reasons.append('Strong composite')
         elif comp > 0:
-            score += 1; reasons.append('Above-average factor score')
+            score += 1; reasons.append('Above-average composite')
         elif comp > -0.5:
-            score -= 1; reasons.append('Below-average factor score')
+            score -= 1; reasons.append('Below-average composite')
         else:
-            score -= 2; reasons.append('Weak factor score')
+            score -= 2; reasons.append('Weak composite')
 
-    roic = row.get('ROIC')
-    if roic is not None and np.isfinite(roic):
-        if roic > 0.15:
-            score += 1.5; reasons.append(f'High ROIC ({roic*100:.0f}%)')
-        elif roic < 0:
-            score -= 1.5; reasons.append('Negative return on capital')
+    ma200 = row.get('PCT_VS_MA200')
+    if ma200 is not None and np.isfinite(ma200):
+        if ma200 > 0:
+            score += 1; reasons.append(f'Uptrend (+{ma200*100:.0f}% vs 200d)')
+        elif ma200 < -0.10:
+            score -= 1; reasons.append('Well below 200-day MA')
 
-    pf = row.get('PIOTROSKI_F')
-    if pf is not None and np.isfinite(pf):
-        if pf >= 7:
-            score += 1; reasons.append(f'Piotroski {pf:.0f}/9')
-        elif pf <= 3:
-            score -= 1.5; reasons.append(f'Weak Piotroski {pf:.0f}/9')
-
-    de = row.get('DEBT_TO_EQUITY')
-    if de is not None and np.isfinite(de):
-        if de > 2.5:
-            score -= 1.5; reasons.append(f'High leverage (D/E {de:.1f})')
-        elif de < 0.5:
-            score += 0.5; reasons.append('Conservative balance sheet')
-
-    acc = row.get('ACCRUALS')
-    if acc is not None and np.isfinite(acc) and acc > 0.1:
-        score -= 1; reasons.append('Earnings outpacing cash flow')
-
-    ey = row.get('EARNINGS_YIELD')
-    if ey is not None and np.isfinite(ey):
-        if ey > 0.08:
-            score += 1; reasons.append(f'Cheap ({ey*100:.1f}% earnings yield)')
-        elif 0 < ey < 0.02:
-            score -= 0.5; reasons.append('Richly valued')
+    ins = row.get('INSIDER_NET_BUY')
+    if ins is not None and np.isfinite(ins):
+        if ins > 0.3:
+            score += 1; reasons.append('Insiders net buyers')
+        elif ins < -0.3:
+            score -= 0.5; reasons.append('Insider selling')
 
     labels = [(5, '🟢 Strong Buy — accumulate'), (3, '🟢 Buy'),
               (1, '🟡 Hold / add on weakness'), (-1, '⚪ Neutral'),
@@ -221,9 +208,12 @@ def _long_term_signal(row: pd.Series) -> tuple[str, float, str]:
 
 def _mid_term_signal(row: pd.Series) -> tuple[str, float, str]:
     """
-    Grade a mid-term trade on setup quality and timing.
+    Grade a mid-term trade from its composite rank plus regime indicators
+    the composite does not contain: RSI timing, volatility regime, and
+    insider conviction.
 
-    Trend and momentum dominate; fundamentals only act as a sanity filter.
+    Trend/momentum factors (MA200, MOM) are already in the composite, so
+    they are not re-scored here.
     """
     score, reasons = 0.0, []
     comp = row.get('composite', np.nan)
@@ -235,19 +225,10 @@ def _mid_term_signal(row: pd.Series) -> tuple[str, float, str]:
             score += 2; reasons.append('Strong setup')
         elif comp > 0:
             score += 1; reasons.append('Positive setup')
+        elif comp > -0.3:
+            score -= 0.5; reasons.append('Marginal setup')
         else:
             score -= 2; reasons.append('Weak setup')
-
-    ma200 = row.get('PCT_VS_MA200')
-    if ma200 is not None and np.isfinite(ma200):
-        if ma200 > 0:
-            score += 1.5; reasons.append(f'Uptrend (+{ma200*100:.0f}% vs 200d)')
-        else:
-            score -= 2; reasons.append('Below 200-day MA — trend against')
-
-    ma50 = row.get('PCT_VS_MA50')
-    if ma50 is not None and np.isfinite(ma50) and ma50 > 0:
-        score += 0.5; reasons.append('Above 50-day MA')
 
     rsi = row.get('RSI_14')
     if rsi is not None and np.isfinite(rsi):

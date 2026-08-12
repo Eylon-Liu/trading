@@ -258,20 +258,23 @@ _LAST_CLOSE_LOOKBACK_DAYS = 30
 
 
 def latest_prices(tickers: list[str], as_of: date | str,
-                  lookback_days: int = _LAST_CLOSE_LOOKBACK_DAYS) -> pd.Series:
+                  lookback_days: int = _LAST_CLOSE_LOOKBACK_DAYS,
+                  field: str = 'adj_close') -> pd.Series:
     """
     Last close at or before `as_of` — never peeks past it.
 
     Bounded to a short window. Without a start date this read pulled every bar
     ever stored — at S&P 500 scale roughly 1.2 million rows — to use only the
     final one, which cost about 2.3 seconds on every universe resolution.
+
+    Use `field='close'` for market-cap estimation from SEC share counts — those
+    counts are the actual filing-date figure, not split-adjusted, so multiplying
+    by adj_close produces a result that is wrong by the split ratio.
     """
     start = pd.to_datetime(as_of) - timedelta(days=lookback_days)
-    px = price_history(tickers, start=start, end=as_of)
+    px = price_history(tickers, start=start, end=as_of, field=field)
     if px.empty:
-        # A ticker halted for longer than the window, or a sparse history.
-        # Fall back to the unbounded read rather than reporting no price.
-        px = price_history(tickers, end=as_of)
+        px = price_history(tickers, end=as_of, field=field)
     return last_close(px)
 
 

@@ -99,7 +99,7 @@ COLUMN_WIDTHS = {
     # from that rather than guessed, and no signal is ever clipped mid-word.
     'rank': '50px', 'ticker': '70px', 'sector': '126px',
     'score': '72px', 'composite': '72px', 'signal': '210px',
-    'why': '150px', 'reasons': '150px',
+    'why': '200px', 'reasons': '200px',
     'entry_type': '96px', 'stop_basis': '104px',
     'insider': '150px', 'role': '140px', 'side': '64px',
     'txn_date': '96px', 'entry_date': '96px', 'exit_date': '96px',

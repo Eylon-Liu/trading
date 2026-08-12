@@ -41,10 +41,11 @@ python cli.py ingest --index SPY
 
 def layout() -> html.Div:
     return html.Div([
-        # The only place in the app that reaches the network. Every other tab
-        # reads SQLite, so a screen or a backtest can never stall on a
-        # rate-limited provider — and its speed no longer depends on what the
-        # network is doing.
+        C.card('🗄️ Data health', [
+            html.Div(id='data-health',
+                     style={'minHeight': '40px'}),
+        ], className='mb-3'),
+
         C.card('⬇️ Pull new data', [
             dbc.Row([
                 dbc.Col([
@@ -77,57 +78,59 @@ def layout() -> html.Div:
                                       'marginTop': '12px'}),
                       'pull-loading'),
             html.Div(id='pull-report'),
-
-            C.note('Only sources outside their refresh window are fetched, so '
-                   'pressing this when everything is current costs nothing. '
-                   'Screens, backtests and reports read stored data and never '
-                   'fetch on their own.', 'info'),
         ], className='mb-3'),
 
-        dbc.Row([
-            dbc.Col(C.card('🗄️ Stored data', html.Div(id='data-tables')),
-                    lg=6, className='mb-3'),
-            dbc.Col(C.card('🕐 Ingest freshness', html.Div(id='data-freshness')),
-                    lg=6, className='mb-3'),
-        ]),
-        dbc.Row([
-            dbc.Col(C.card('🔍 Index membership sources',
-                           html.Div(id='data-members')), lg=7, className='mb-3'),
-            dbc.Col(C.card('💾 HTTP cache', html.Div(id='data-cache')),
-                    lg=5, className='mb-3'),
-        ]),
-        C.card('🚀 Populating data', [
-            html.P('All ingest runs from the command line, which is what makes '
-                   'scheduling possible. Data is stored locally in SQLite and '
-                   'refreshed incrementally — a second run over the same '
-                   'tickers issues no network calls.',
-                   style={'fontSize': '0.84rem'}),
-            html.Pre(INGEST_HELP,
-                     style={'background': TH.PANEL_ALT, 'padding': '14px',
-                            'borderRadius': '8px', 'fontSize': '0.74rem',
-                            'color': TH.TEXT, 'overflowX': 'auto'}),
-            html.Div(f'Database: {config.DATABASE_URL}',
-                     style={'color': TH.MUTED, 'fontSize': '0.72rem'}),
-        ], className='mb-3'),
+        dbc.Button('📋 Details', id='data-details-btn', size='sm',
+                   color='dark', className='mb-3',
+                   style={'border': f'1px solid {TH.BORDER}',
+                          'fontSize': '0.78rem'}),
+        dbc.Collapse([
+            dbc.Row([
+                dbc.Col(C.card('🗄️ Stored data', html.Div(id='data-tables')),
+                        lg=6, className='mb-3'),
+                dbc.Col(C.card('🕐 Ingest freshness',
+                               html.Div(id='data-freshness')),
+                        lg=6, className='mb-3'),
+            ]),
+            dbc.Row([
+                dbc.Col(C.card('🔍 Index membership sources',
+                               html.Div(id='data-members')),
+                        lg=7, className='mb-3'),
+                dbc.Col(C.card('💾 HTTP cache', html.Div(id='data-cache')),
+                        lg=5, className='mb-3'),
+            ]),
+            C.card('🔄 Source freshness',
+                   html.Div(id='data-sync'),
+                   subtitle='Every run syncs first, then reads. A source inside '
+                            'its refresh window is served from the database and '
+                            'never re-fetched.',
+                   className='mb-3'),
 
-        C.card('🔄 Source freshness',
-               html.Div(id='data-sync'),
-               subtitle='Every run syncs first, then reads. A source inside '
-                        'its refresh window is served from the database and '
-                        'never re-fetched.',
-               className='mb-3'),
+            C.card('🔬 Data validity', html.Div(id='data-validity'),
+                   subtitle='Looks for values that are present and wrong, not '
+                            'just missing — a wrong number ranks a company on '
+                            'a fiction, a missing one only costs breadth.',
+                   className='mb-3'),
 
-        C.card('🔬 Data validity', html.Div(id='data-validity'),
-               subtitle='Looks for values that are present and wrong, not just '
-                        'missing — a wrong number ranks a company on a fiction, '
-                        'a missing one only costs breadth.',
-               className='mb-3'),
+            C.card('🏦 Market cap coverage', html.Div(id='data-mcap'),
+                   className='mb-3'),
 
-        C.card('🏦 Market cap coverage', html.Div(id='data-mcap'),
-               className='mb-3'),
+            C.card('🤖 AI analysis layer', html.Div(id='data-ai'),
+                   className='mb-3'),
 
-        C.card('🤖 AI analysis layer', html.Div(id='data-ai'),
-               className='mb-3'),
+            C.card('🚀 Populating data', [
+                html.P('All ingest runs from the command line, which is what '
+                       'makes scheduling possible. Data is stored locally in '
+                       'SQLite and refreshed incrementally.',
+                       style={'fontSize': '0.84rem'}),
+                html.Pre(INGEST_HELP,
+                         style={'background': TH.PANEL_ALT, 'padding': '14px',
+                                'borderRadius': '8px', 'fontSize': '0.74rem',
+                                'color': TH.TEXT, 'overflowX': 'auto'}),
+                html.Div(f'Database: {config.DATABASE_URL}',
+                         style={'color': TH.MUTED, 'fontSize': '0.72rem'}),
+            ], className='mb-3'),
+        ], id='data-details', is_open=False),
     ])
 
 
@@ -218,6 +221,48 @@ def _validity_block() -> html.Div:
                  'measured is excluded from ranking instead of estimated.',
                  style={'color': TH.MUTED, 'fontSize': '0.75rem',
                         'marginTop': '10px'}),
+    ])
+
+
+@callback(
+    Output('data-details', 'is_open'),
+    Input('data-details-btn', 'n_clicks'),
+    State('data-details', 'is_open'),
+    prevent_initial_call=True,
+)
+def _toggle_details(n, is_open):
+    return not is_open
+
+
+@callback(
+    Output('data-health', 'children'),
+    Input('tabs', 'active_tab'),
+)
+def _health_badge(active_tab):
+    if active_tab != 'tab-data':
+        return no_update
+    try:
+        fresh = SY.freshness()
+        n_fresh = int((fresh['status'] == 'fresh').sum())
+        n_stale = int((fresh['status'] == 'stale').sum())
+        n_never = int((fresh['status'] == 'never fetched').sum())
+        total = n_fresh + n_stale + n_never
+
+        if n_never > 0:
+            color, verdict = TH.WARN, 'Not initialised'
+        elif n_stale > 0:
+            color, verdict = TH.WARN, 'Stale — pull recommended'
+        else:
+            color, verdict = TH.POS, 'All sources fresh'
+
+        last = SY.last_session()
+    except Exception:                                # noqa: BLE001
+        return C.note('Could not read freshness.', 'warn')
+
+    return C.metric_row([
+        (verdict, 'status', color),
+        (f'{n_fresh}/{total}', 'sources fresh', TH.POS if n_fresh == total else TH.MUTED),
+        (str(last), 'last pull', TH.TEXT),
     ])
 
 

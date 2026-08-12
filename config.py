@@ -346,28 +346,6 @@ POLICY_THEMES = {
 
 
 # ─────────────────────────────────────────────
-# SIGNALS
-# ─────────────────────────────────────────────
-
-SIGNAL_LABELS = [
-    (5, '🟢 Strong Buy'),
-    (3, '🟢 Buy'),
-    (1, '🟡 Hold / Accumulate'),
-    (-1, '⚪ Neutral'),
-    (-3, '🟠 Reduce'),
-    (float('-inf'), '🔴 Sell / Avoid'),
-]
-
-
-def signal_label(score: float) -> str:
-    """Map a raw signal score onto its display label."""
-    for threshold, label in SIGNAL_LABELS:
-        if score >= threshold:
-            return label
-    return SIGNAL_LABELS[-1][1]
-
-
-# ─────────────────────────────────────────────
 # NEWS / LLM
 # ─────────────────────────────────────────────
 

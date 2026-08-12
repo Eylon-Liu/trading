@@ -203,15 +203,18 @@ def fundamental_factors(tickers: list[str], as_of: date | str) -> pd.DataFrame:
         return pd.DataFrame()
 
     prof = yahoo.profile_asof(tickers, as_of)
-    px = yahoo.latest_prices(tickers, as_of)
 
     mcap = pd.Series(np.nan, index=fund.index, dtype=float)
     if not prof.empty and 'market_cap' in prof:
         mcap = prof['market_cap'].reindex(fund.index)
 
     # Reconstruct market cap where the snapshot is missing (any historical
-    # date before the app started running).
-    est = fund['shares_diluted'].reindex(fund.index) * px.reindex(fund.index)
+    # date before the app started running). Must use unadjusted close, not
+    # adj_close: SEC share counts are the actual count at filing time, not
+    # split-adjusted. Multiplying by adj_close produces a result that is
+    # wrong by the split ratio — a 20x error for AMZN pre-2022.
+    px_close = yahoo.latest_prices(tickers, as_of, field='close')
+    est = fund['shares_diluted'].reindex(fund.index) * px_close.reindex(fund.index)
     mcap = mcap.fillna(est)
 
     ev = mcap + fund['debt'].fillna(0) - fund['cash'].fillna(0)
@@ -235,6 +238,7 @@ def fundamental_factors(tickers: list[str], as_of: date | str) -> pd.DataFrame:
     out['ACCRUALS'] = fund['accruals']          # lower is better
     out['DEBT_TO_EQUITY'] = fund['debt_to_equity']
     out['CURRENT_RATIO'] = fund['current_ratio']
+    out['ROA'] = fund['roa']
     out['ASSET_TURNOVER'] = fund['asset_turnover']
 
     # ── growth ────────────────────────────────────────────────────

@@ -12,12 +12,12 @@ from ui.pages import (builder, compare, data, intel, methodology, reports,
 
 TABS = [
     ('tab-screen', '🎯 Screen', screen),
-    ('tab-compare', '🔄 Compare', compare),
-    ('tab-research', '🔬 Research', research),
     ('tab-intel', '🔎 Intel', intel),
+    ('tab-compare', '🔄 Compare', compare),
+    ('tab-reports', '📄 Reports', reports),
+    ('tab-research', '📈 Backtest', research),
     ('tab-builder', '🧪 Builder', builder),
     ('tab-methodology', '📐 Methodology', methodology),
-    ('tab-reports', '📄 Reports', reports),
     ('tab-data', '🗄️ Data', data),
 ]
 

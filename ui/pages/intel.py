@@ -63,13 +63,23 @@ def layout() -> html.Div:
 @callback(
     Output('intel-ticker', 'options'),
     Input('tabs', 'active_tab'),
+    Input('intel-ticker', 'search_value'),
 )
-def _ticker_options(active_tab):
+def _ticker_options(active_tab, search):
     df = db.read_sql('SELECT ticker, name FROM securities ORDER BY ticker')
     if df.empty:
         return []
-    return [{'label': f'{r["ticker"]} — {(r["name"] or "")[:34]}',
+    opts = [{'label': f'{r["ticker"]} — {(r["name"] or "")[:34]}',
              'value': r['ticker']} for _i, r in df.iterrows()]
+    if not search:
+        return opts
+    q = search.upper().strip()
+    if not q:
+        return opts
+    exact  = [o for o in opts if o['value'] == q]
+    prefix = [o for o in opts if o['value'].startswith(q) and o['value'] != q]
+    rest   = [o for o in opts if not o['value'].startswith(q)]
+    return exact + prefix + rest
 
 
 @callback(

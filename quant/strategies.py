@@ -21,7 +21,10 @@ code.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # HORIZONS
@@ -58,6 +61,7 @@ class Strategy:
     neutralize: str = 'sector_z'                  # sector_z | neutralize | rank | z
     setup: str = 'momentum'                       # informs the trade plan
     thesis: str = ''
+    invert: bool = False                          # rank worst-first (avoid lists)
 
     @property
     def factors(self) -> list[str]:
@@ -296,17 +300,18 @@ MID_TERM = {
         setup='momentum',
     ),
     'quality_breakdown': Strategy(
-        key='quality_breakdown', name='Deteriorating Quality (Avoid List)', horizon='mid',
+        key='quality_breakdown', name='Deteriorating Quality', horizon='mid',
         description='Names whose fundamentals and trend are both breaking down.',
-        thesis='Ranks the *worst* candidates — a screen for what to trim or avoid '
-               'rather than what to buy. Read the bottom of the list as the '
-               'names to review in an existing portfolio.',
+        thesis='Surfaces the weakest candidates — rank 1 is the name with the '
+               'worst combination of rising accruals, rising leverage, falling '
+               'trend, insider selling and management churn.',
         weights={
-            'ACCRUALS': 1.2, 'DEBT_TO_EQUITY': 1.0, 'PIOTROSKI_F': 1.2,
+            'ACCRUALS': 1.2, 'DEBT_TO_EQUITY': 1.0,
             'EVENT_MANAGEMENT': 0.8, 'EVENT_RESTRUCTURING': 0.8,
-            'PCT_VS_MA200': 1.0, 'INSIDER_NET_BUY': 0.6,
+            'PIOTROSKI_F': 1.2, 'PCT_VS_MA200': 1.0, 'INSIDER_NET_BUY': 0.6,
         },
         setup='momentum',
+        invert=True,
     ),
 }
 

@@ -238,9 +238,9 @@ def _render_results(data, meta):
     display = pd.DataFrame({
         'rank': df.get('rank'),
         'ticker': df.get('ticker'),
-        'sector': df.get('sector'),
-        'score': df.get('composite', pd.Series(dtype=float)).round(3),
         'signal': df.get('signal'),
+        'score': df.get('composite', pd.Series(dtype=float)).round(3),
+        'sector': df.get('sector'),
     })
 
     if horizon == 'long':
@@ -262,7 +262,7 @@ def _render_results(data, meta):
     # to three or four lines and sets the row height for every column.
     reasons = df.get('reasons', pd.Series('', index=df.index)).fillna('')
     display['why'] = reasons.map(
-        lambda s: (s[:52] + '…') if isinstance(s, str) and len(s) > 53 else s)
+        lambda s: (s[:80] + '…') if isinstance(s, str) and len(s) > 81 else s)
     display = display.dropna(axis=1, how='all')
 
     counts = df['signal'].value_counts() if 'signal' in df else pd.Series(dtype=int)
