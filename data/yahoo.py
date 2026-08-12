@@ -179,10 +179,18 @@ def _f(v) -> float | None:
 # PRICE READS  (all point-in-time gated)
 # ─────────────────────────────────────────────
 
+_PRICE_COLUMNS = frozenset({
+    'open', 'high', 'low', 'close', 'adj_close', 'volume',
+})
+
+
 def price_history(tickers: list[str], start: date | str | None = None,
                   end: date | str | None = None,
                   field: str = 'adj_close') -> pd.DataFrame:
     """Wide frame of `field`, indexed by date with one column per ticker."""
+    if field not in _PRICE_COLUMNS:
+        raise ValueError(f'unknown price column {field!r}; '
+                         f'expected one of {sorted(_PRICE_COLUMNS)}')
     if not tickers:
         return pd.DataFrame()
 

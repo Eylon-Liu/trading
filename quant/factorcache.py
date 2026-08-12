@@ -36,6 +36,11 @@ log = logging.getLogger(__name__)
 CACHE_DIR = config.CACHE_DIR / 'factors'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Bump when factor computation logic changes (new factors, formula fixes,
+# direction changes). The data_version fingerprint only moves when new data
+# is ingested; without this, a code change serves stale cached results.
+CODE_VERSION = 3
+
 # Entries are self-invalidating via the data version, so this only bounds
 # unbounded growth from many one-off as-of dates.
 MAX_AGE_SECONDS = 14 * 24 * 3600
@@ -70,6 +75,7 @@ def data_version() -> str:
 def key(tickers: list[str], as_of: date | str, version: str | None = None) -> str:
     """Stable hash over the universe, the as-of date and the data version."""
     payload = '|'.join([
+        str(CODE_VERSION),
         str(pd.to_datetime(as_of).date()),
         version if version is not None else data_version(),
         ','.join(sorted(tickers)),

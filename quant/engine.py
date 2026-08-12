@@ -16,6 +16,7 @@ it, which is what makes the -1M / -1Y comparison possible at all.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -401,8 +402,7 @@ def _persist(run_id: str, as_of: date, spec: UniverseSpec,
         'run_id': run_id, 'as_of': as_of, 'strategy': strategy.key,
         'universe_spec_json': spec.to_json(),
         'universe_tickers': ','.join(universe),
-        'params_json': pd.io.json.ujson_dumps(strategy.weights)
-        if hasattr(pd.io.json, 'ujson_dumps') else str(strategy.weights),
+        'params_json': json.dumps(strategy.weights),
         'universe_n': len(universe), 'created_at': datetime.utcnow(),
     }])
 

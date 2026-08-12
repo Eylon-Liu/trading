@@ -93,6 +93,13 @@ class UniverseSpec:
             candidates = members.members_asof(self.preset, as_of)
             if not candidates:
                 candidates = members.latest_members(self.preset)
+                if candidates and as_of < date.today():
+                    log.warning(
+                        'No PIT membership for %s at %s — falling back to '
+                        'current constituents (%d names). Historical screens '
+                        'may have survivorship bias. Run '
+                        '"cli.py backfill-members %s" to fix.',
+                        self.preset, as_of, len(candidates), self.preset)
         else:
             candidates = db.read_sql(
                 'SELECT ticker FROM securities ORDER BY ticker')['ticker'].tolist()

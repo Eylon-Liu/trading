@@ -374,8 +374,6 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
                                 detail=f'bars current to {last_session()}')
         emit(f'{src.label}: {len(due)} of {len(tickers)} tickers stale')
         rows = yahoo.update_prices(due + [config.BENCHMARK_TICKER])
-        for t in due:
-            db.record_ingest(name, t, rows=0)
         return SourceResult(name, 'fetched', rows=rows, stale_keys=len(due),
                             total_keys=len(tickers))
 
@@ -400,11 +398,5 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
 
     emit(f'{src.label}: {len(due)} of {len(tickers)} tickers stale')
     rows = fn(due)
-    # Sources that log per ticker themselves (insiders, news) will overwrite
-    # these with their own row counts; recording here guarantees that a ticker
-    # which legitimately returned nothing still counts as checked, instead of
-    # being retried on every single run.
-    for t in due:
-        db.record_ingest(name, t, rows=0)
     return SourceResult(name, 'fetched', rows=rows or 0, stale_keys=len(due),
                         total_keys=len(tickers))

@@ -171,7 +171,7 @@ def update_news(tickers: list[str]) -> int:
                 continue
             if rows:
                 written += db.upsert(db.news, rows)
-                db.record_ingest('news', t, rows=len(rows))
+            db.record_ingest('news', t, rows=len(rows) if rows else 0)
 
     log.info('news: %d articles across %d tickers', written, len(tickers))
     return written
