@@ -28,15 +28,19 @@ log = logging.getLogger(__name__)
 
 GEMINI_ENDPOINT = ('https://generativelanguage.googleapis.com/v1beta/'
                    'models/{model}:generateContent')
-TIMEOUT = 180.0
+TIMEOUT = 120.0
 
 # Gemini counts *thinking* tokens against maxOutputTokens, which Claude does
 # not. Measured on gemini-3.5-flash: a one-sentence answer burned 323-459
 # thinking tokens before emitting 27 visible ones, and a 40-token cap returned
 # a single character. So every budget is floored well above the prose we want,
 # or the model thinks itself out of an answer.
-GEMINI_MIN_BUDGET = 4000
-GEMINI_THINKING_RESERVE = 3000
+GEMINI_MIN_BUDGET = 3000
+GEMINI_THINKING_RESERVE = 2000
+
+# Fallback model when primary hits rate limit (429). Flash Lite has a
+# separate, higher quota and is cheaper — good enough for commentary.
+GEMINI_FALLBACK_MODEL = 'gemini-3.5-flash-lite'
 
 
 # ─────────────────────────────────────────────
@@ -127,16 +131,29 @@ def _complete_gemini(user_prompt: str, system: str,
     """
     One Gemini generateContent call.
 
-    The key travels in the `x-goog-api-key` header rather than the `?key=`
-    query parameter the docs lead with — query strings end up in proxy logs
-    and browser history, and a credential does not belong there.
+    On a 429 (rate limit), retries once with the fallback model (Flash Lite)
+    which has a separate, higher quota.
     """
+    result = _gemini_call(user_prompt, system, max_tokens, config.GEMINI_MODEL)
+    if result is _RATE_LIMITED:
+        log.info('Retrying with fallback model %s', GEMINI_FALLBACK_MODEL)
+        result = _gemini_call(user_prompt, system, max_tokens,
+                              GEMINI_FALLBACK_MODEL)
+    return result if result is not _RATE_LIMITED else None
+
+
+_RATE_LIMITED = object()
+
+
+def _gemini_call(user_prompt: str, system: str,
+                 max_tokens: int, model: str) -> str | object | None:
+    """Single Gemini call; returns _RATE_LIMITED sentinel on 429."""
     budget = max(max_tokens + GEMINI_THINKING_RESERVE, GEMINI_MIN_BUDGET)
     body = {
         'system_instruction': {'parts': [{'text': system}]},
         'contents': [{'role': 'user', 'parts': [{'text': user_prompt}]}],
         'generationConfig': {
-            'temperature': 0.2,          # commentary on fixed numbers; low variance
+            'temperature': 0.2,
             'maxOutputTokens': budget,
             'thinkingConfig': {'thinkingLevel': config.GEMINI_THINKING_LEVEL},
         },
@@ -144,18 +161,20 @@ def _complete_gemini(user_prompt: str, system: str,
 
     try:
         resp = requests.post(
-            GEMINI_ENDPOINT.format(model=config.GEMINI_MODEL),
+            GEMINI_ENDPOINT.format(model=model),
             headers={'x-goog-api-key': config.GEMINI_API_KEY,
                      'Content-Type': 'application/json'},
             json=body, timeout=TIMEOUT)
     except requests.exceptions.Timeout:
-        log.warning('Gemini timed out after %ss — falling back to local analysis',
-                    TIMEOUT)
+        log.warning('Gemini timed out after %ss', TIMEOUT)
         return None
     except requests.exceptions.RequestException as exc:
-        log.warning('Could not reach Gemini (%s) — falling back to local analysis',
-                    exc.__class__.__name__)
+        log.warning('Could not reach Gemini (%s)', exc.__class__.__name__)
         return None
+
+    if resp.status_code == 429:
+        log.warning('Gemini %s rate limited', model)
+        return _RATE_LIMITED
 
     if resp.status_code != 200:
         _log_gemini_error(resp)
@@ -167,8 +186,6 @@ def _complete_gemini(user_prompt: str, system: str,
         log.warning('Gemini returned non-JSON (HTTP %s)', resp.status_code)
         return None
 
-    # A prompt-level safety block carries no candidates at all, so this has to
-    # be checked before indexing into them.
     blocked = (data.get('promptFeedback') or {}).get('blockReason')
     if blocked:
         log.warning('Gemini blocked the prompt (reason=%s)', blocked)
@@ -183,7 +200,6 @@ def _complete_gemini(user_prompt: str, system: str,
     finish = cand.get('finishReason')
     parts = (cand.get('content') or {}).get('parts') or []
 
-    # Reasoning parts are flagged `thought` and are not for the reader.
     text = ''.join(p.get('text', '') for p in parts if not p.get('thought')).strip()
 
     if finish in ('SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'RECITATION'):
@@ -191,13 +207,9 @@ def _complete_gemini(user_prompt: str, system: str,
         return None
 
     if finish == 'MAX_TOKENS' and len(text) < 200:
-        # Thinking consumed the budget before the answer started. Returning the
-        # fragment would put a truncated half-sentence in front of the user, so
-        # fall back to the local engine instead.
         thoughts = (data.get('usageMetadata') or {}).get('thoughtsTokenCount')
         log.warning('Gemini hit maxOutputTokens with %d chars of output '
-                    '(thinking used %s tokens) — raise GEMINI_MAX_TOKENS',
-                    len(text), thoughts)
+                    '(thinking used %s tokens)', len(text), thoughts)
         return None
 
     return text or None

@@ -501,7 +501,8 @@ def _confirmation_scorecard(ticker: str, summary: dict, events: pd.DataFrame,
     elif n_upgrades and n_downgrades:
         checks.append(f'Analyst disagreement ({n_upgrades} upgrade, {n_downgrades} downgrade) — read the reasoning')
 
-    # Insider activity
+    # Insider activity — buys are voluntary and meaningful; sells need
+    # holdings context because most are routine compensation events.
     if not insiders.empty:
         signal = insiders[insiders['txn_code'].isin(['P', 'S'])].copy()
         if not signal.empty:
@@ -512,10 +513,31 @@ def _confirmation_scorecard(ticker: str, summary: dict, events: pd.DataFrame,
                 supports.append(f'Cluster insider buying ({n_buyers} buyers, ${buys/1e6:.1f}M)')
             elif buys > sells:
                 supports.append(f'Insiders net buyers (${buys/1e6:.1f}M bought)')
-            elif sells > buys * 2:
-                concerns.append(f'Heavy insider selling (${sells/1e6:.1f}M)')
             elif sells > buys:
-                checks.append(f'Insiders net sellers — check if routine or conviction')
+                # Check if we have holdings context to qualify the selling
+                has_pct = 'post_txn_shares' in signal.columns
+                big_sales = pd.DataFrame()
+                if has_pct:
+                    sell_rows = signal[signal['shares'] < 0].copy()
+                    sell_rows['pct'] = sell_rows.apply(
+                        lambda r: abs(r['shares']) /
+                        (r['post_txn_shares'] + abs(r['shares'])) * 100
+                        if pd.notna(r.get('post_txn_shares'))
+                        and r['post_txn_shares'] + abs(r['shares']) > 0
+                        else np.nan, axis=1)
+                    big_sales = sell_rows[sell_rows['pct'] > 20]
+                if not big_sales.empty:
+                    concerns.append(
+                        f'Insider selling with large position reductions '
+                        f'(>20% of holdings, ${sells/1e6:.1f}M)')
+                elif sells > buys * 3:
+                    checks.append(
+                        f'Heavy insider selling (${sells/1e6:.1f}M) — '
+                        f'check % of holdings in insider panel to assess conviction')
+                else:
+                    checks.append(
+                        f'Insiders net sellers — likely routine '
+                        f'(check insider panel for position context)')
 
     # Filing pattern
     if not events.empty:
@@ -593,6 +615,127 @@ def _confirmation_scorecard(ticker: str, summary: dict, events: pd.DataFrame,
 
     return C.card(f'📋 Confirmation scorecard — {ticker}', panels,
                   className='mb-3')
+
+
+# ─────────────────────────────────────────────
+# INSIDER INTERPRETATION
+# ─────────────────────────────────────────────
+
+def _insider_interpretation(signal: pd.DataFrame, buys: float, sells: float,
+                            n_buyers: int, n_sellers: int) -> html.Div:
+    """Context-aware read of insider transactions."""
+    notes = []
+    colour = TH.MUTED
+
+    sellers = signal[signal['side'] == 'SELL']
+    buyers = signal[signal['side'] == 'BUY']
+
+    # Check if we have holdings data to assess % sold
+    has_pct = 'pct_of_holdings' in signal.columns
+    if has_pct and not sellers.empty:
+        big_sales = sellers[sellers['pct_of_holdings'] > 20]
+        small_sales = sellers[sellers['pct_of_holdings'] <= 5]
+        if not big_sales.empty:
+            names = big_sales['insider'].unique()[:3]
+            notes.append(f'Large position reduction (>20% of holdings) by '
+                         f'{", ".join(names)} — may signal conviction')
+            colour = TH.WARN
+        elif len(small_sales) == len(sellers.dropna(subset=['pct_of_holdings'])):
+            notes.append('All sales are small (<5% of holdings) — '
+                         'likely routine diversification or tax management')
+
+    # Cluster detection: multiple C-suite selling in same week
+    if not sellers.empty and n_sellers >= 2:
+        csuite_roles = {'CEO', 'CFO', 'COO', 'CTO', 'President', 'Chief'}
+        csuite_sellers = sellers[sellers['role'].str.contains(
+            '|'.join(csuite_roles), case=False, na=False)]
+        if len(csuite_sellers['insider'].unique()) >= 2:
+            dates = pd.to_datetime(sellers['txn_date'])
+            span = (dates.max() - dates.min()).days
+            if span <= 14:
+                notes.append(f'{len(csuite_sellers["insider"].unique())} '
+                             f'C-suite officers sold within {span} days — '
+                             f'clustered selling is a stronger signal')
+                colour = TH.NEG
+
+    # Buys are rarer and more meaningful
+    if n_buyers >= 2 and buys > 100_000:
+        notes.append(f'Cluster buying by {n_buyers} insiders '
+                     f'(${buys/1e6:.1f}M) — open-market purchases are '
+                     f'voluntary and historically predictive')
+        colour = TH.POS
+    elif n_buyers == 1 and buys > 500_000:
+        buyer = buyers.iloc[0]['insider'] if not buyers.empty else 'insider'
+        notes.append(f'{buyer} bought ${buys/1e6:.1f}M — '
+                     f'single large purchase suggests conviction')
+        colour = TH.POS
+
+    # No buys, only sells — add context
+    if n_buyers == 0 and n_sellers > 0 and not notes:
+        notes.append('All transactions are sales — common for '
+                     'executives with equity compensation. '
+                     'Check "% held" column for position context')
+
+    if not notes:
+        notes.append('Mixed activity with no clear directional pattern')
+
+    return html.Div([
+        html.Div([
+            html.Span('Reading: ', style={'color': TH.ACCENT,
+                                           'fontWeight': '700',
+                                           'fontSize': '0.84rem'}),
+            html.Span(' · '.join(notes),
+                      style={'fontSize': '0.84rem', 'color': colour}),
+        ], style={'margin': '8px 0'}),
+    ])
+
+
+# ─────────────────────────────────────────────
+# AI BRIEFING CACHE
+# ─────────────────────────────────────────────
+
+def _article_hash(articles: pd.DataFrame) -> str:
+    """Short hash of article IDs to detect when new articles arrive."""
+    import hashlib
+    ids = sorted(articles.index.astype(str).tolist()[:30])
+    return hashlib.md5('|'.join(ids).encode()).hexdigest()[:12]
+
+
+def _cached_briefing(ticker: str, articles: pd.DataFrame,
+                     summary: dict) -> str | None:
+    """Return cached AI briefing if fresh, otherwise generate and cache."""
+    brief_type = 'news_synthesis'
+    current_hash = _article_hash(articles)
+
+    try:
+        cached = db.read_sql(
+            'SELECT content, article_hash, generated_at FROM company_briefs '
+            'WHERE ticker = :t AND brief_type = :bt',
+            {'t': ticker, 'bt': brief_type})
+        if not cached.empty:
+            row = cached.iloc[0]
+            if row['article_hash'] == current_hash:
+                return row['content']
+    except Exception:  # noqa: BLE001
+        pass
+
+    company = _company_name(ticker)
+    text = LLM.synthesize_news(ticker, company, articles, summary)
+
+    if text:
+        try:
+            import config
+            db.upsert(db.company_briefs, [{
+                'ticker': ticker,
+                'brief_type': brief_type,
+                'content': text,
+                'generated_at': config.utc_now(),
+                'article_hash': current_hash,
+            }])
+        except Exception:  # noqa: BLE001
+            pass
+
+    return text
 
 
 # ─────────────────────────────────────────────
@@ -766,21 +909,46 @@ def _load_company(n_clicks, ticker, days):
             signal['txn_date'] = pd.to_datetime(signal['txn_date']).dt.date
             signal['side'] = signal['shares'].apply(
                 lambda s: 'BUY' if (s or 0) > 0 else 'SELL')
+            signal['shares_raw'] = signal['shares']
             signal['shares'] = signal['shares'].abs().round(0)
             signal['value'] = signal['value'].round(0)
+
+            # Holdings context: % of position sold/bought
+            has_holdings = 'post_txn_shares' in signal.columns
+            if has_holdings:
+                signal['pct_of_holdings'] = signal.apply(
+                    lambda r: (abs(r['shares_raw']) /
+                               (r['post_txn_shares'] + abs(r['shares_raw'])) * 100)
+                    if pd.notna(r.get('post_txn_shares'))
+                    and r['post_txn_shares'] + abs(r['shares_raw']) > 0
+                    else np.nan, axis=1)
+
             buys = signal[signal['side'] == 'BUY']['value'].sum()
             sells = signal[signal['side'] == 'SELL']['value'].sum()
+            n_buyers = signal[signal['side'] == 'BUY']['insider'].nunique()
+            n_sellers = signal[signal['side'] == 'SELL']['insider'].nunique()
+
+            # Interpret the insider activity
+            interpretation = _insider_interpretation(signal, buys, sells,
+                                                     n_buyers, n_sellers)
+
+            show_cols = ['txn_date', 'insider', 'role', 'side',
+                         'shares', 'price', 'value']
+            if has_holdings and signal['pct_of_holdings'].notna().any():
+                signal['% held'] = signal['pct_of_holdings'].apply(
+                    lambda v: f'{v:.0f}%' if pd.notna(v) else '—')
+                show_cols.append('% held')
+
             panels.append(C.card('👤 Insider activity (Form 4, open market)', [
                 C.metric_row([
                     (f'${buys/1e6:.1f}M', 'bought', TH.POS),
                     (f'${sells/1e6:.1f}M', 'sold', TH.NEG),
-                    (signal[signal['side'] == 'BUY']['insider'].nunique(),
-                     'distinct buyers', TH.TEXT),
+                    (n_buyers, 'distinct buyers', TH.TEXT),
+                    (n_sellers, 'distinct sellers', TH.TEXT),
                 ]),
+                interpretation,
                 html.Hr(style={'borderColor': TH.BORDER}),
-                C.data_table(signal[['txn_date', 'insider', 'role', 'side',
-                                     'shares', 'price', 'value']].head(20),
-                             page_size=10),
+                C.data_table(signal[show_cols].head(20), page_size=10),
             ], className='mb-3'))
         if not other.empty and len(other) >= 2:
             other = other.copy()
@@ -789,12 +957,17 @@ def _load_company(n_clicks, ticker, days):
             other['shares'] = other['shares'].abs().round(0)
             other['value'] = other['value'].fillna(0).round(0)
             n_awards = len(other[other['txn_code'] == 'A'])
+            n_exercises = len(other[other['txn_code'] == 'M'])
             label = (f'📋 Other insider transactions ({n_awards} award'
                      f'{"s" if n_awards != 1 else ""}, '
-                     f'{len(other) - n_awards} other)')
+                     f'{n_exercises} exercise'
+                     f'{"s" if n_exercises != 1 else ""}, '
+                     f'{len(other) - n_awards - n_exercises} other)')
             panels.append(C.card(label, [
                 C.note('Awards (A), option exercises (M), and tax withholdings (F) '
-                       'are routine compensation events — not conviction signals.',
+                       'are routine compensation events — not conviction signals. '
+                       'Most insider selling follows a vest→exercise→sell cycle and '
+                       'does not indicate bearish conviction.',
                        'info'),
                 C.data_table(other[['txn_date', 'insider', 'role', 'type',
                                     'shares', 'value']].head(15),
@@ -828,9 +1001,8 @@ def _load_company(n_clicks, ticker, days):
 
     # ── AI synthesis across the whole coverage set ────────────────
     if not articles.empty:
-        company = _company_name(ticker)
         panels.append(C.ai_panel(
-            lambda: LLM.synthesize_news(ticker, company, articles, summary),
+            lambda: _cached_briefing(ticker, articles, summary),
             title=f'🤖 AI briefing — {ticker}',
             footnote=None, className='mb-3'))
 

@@ -158,6 +158,7 @@ insider_txns = Table(
     Column('shares', Float),
     Column('price', Float),
     Column('value', Float),
+    Column('post_txn_shares', Float),
     Index('ix_insider_pit', 'ticker', 'filed'),
 )
 
@@ -329,6 +330,15 @@ ingest_log = Table(
     Column('last_success', DateTime),
     Column('last_error', Text),
     Column('rows', Integer),
+)
+
+company_briefs = Table(
+    'company_briefs', metadata,
+    Column('ticker', String, primary_key=True),
+    Column('brief_type', String, primary_key=True),
+    Column('content', Text),
+    Column('generated_at', DateTime),
+    Column('article_hash', String),
 )
 
 

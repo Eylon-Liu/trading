@@ -405,6 +405,8 @@ def _parse_form4(raw: bytes, ticker: str, cik: str, acc: str,
         shares = _num(txn.findtext('.//transactionShares/value'))
         price = _num(txn.findtext('.//transactionPricePerShare/value'))
         acq_disp = txn.findtext('.//transactionAcquiredDisposedCode/value')
+        post_txn = _num(txn.findtext(
+            './/postTransactionAmounts/sharesOwnedFollowingTransaction/value'))
 
         if shares is not None and acq_disp == 'D':
             shares = -abs(shares)
@@ -415,6 +417,7 @@ def _parse_form4(raw: bytes, ticker: str, cik: str, acc: str,
             'cik': cik, 'filed': filed, 'role': ', '.join(roles)[:120] or None,
             'shares': shares, 'price': price,
             'value': (abs(shares) * price) if (shares is not None and price) else None,
+            'post_txn_shares': post_txn,
         })
     return rows
 

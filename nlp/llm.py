@@ -31,11 +31,12 @@ from datetime import date
 
 import pandas as pd
 
+import config
 from nlp import providers
 
 log = logging.getLogger(__name__)
 
-MAX_TOKENS = 8000
+MAX_TOKENS = 4000
 
 # Re-exported so callers keep importing one module.
 available = providers.available
@@ -47,22 +48,9 @@ status = providers.status
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are a sell-side-quality equity research analyst embedded in a quantitative \
-screening tool. You are given figures that a point-in-time factor engine has \
-already computed from SEC filings and market data.
-
-Interpret those figures. Do not recompute them, do not introduce numbers that \
-are not in the input, and do not draw on remembered facts about these companies \
-— the whole value of this pipeline is that every number is auditable back to a \
-filing, and a figure you supply from memory breaks that.
-
-Where the data is thin or a metric is missing, say so plainly rather than \
-filling the gap. Distinguish what the numbers show from what they merely \
-suggest. Write for a professional investor: direct, specific, no hedging \
-filler and no restating the input back.
-
-This is research commentary, not investment advice, and the reader knows that \
-— do not append disclaimers; the application already displays one."""
+Equity research analyst in a quant screening tool. Interpret computed figures \
+from SEC filings and market data. Do not recompute or introduce outside numbers. \
+Be direct and specific. No disclaimers, no filler, no restating the input."""
 
 
 def _complete(user_prompt: str, system: str = SYSTEM_PROMPT,
@@ -87,12 +75,11 @@ def synthesize_news(ticker: str, company: str, articles: pd.DataFrame,
         return None
 
     lines = []
-    for _i, r in articles.head(20).iterrows():
+    for _i, r in articles.head(config.LLM_MAX_ARTICLES).iterrows():
         when = pd.to_datetime(r['published']).strftime('%Y-%m-%d')
-        events = f" [events: {r['events']}]" if r.get('events') else ''
+        events = f" [{r['events']}]" if r.get('events') else ''
         lines.append(
-            f"- {when} ({r.get('source', '?')}) {r['title']}"
-            f"{events} [local sentiment: {r.get('sentiment', 0):+.2f}]")
+            f"- {when} {r['title'][:120]}{events}")
 
     extracted = ''
     if direction:
@@ -102,28 +89,25 @@ def synthesize_news(ticker: str, company: str, articles: pd.DataFrame,
             f"  analyst actions: {direction.get('analyst_actions') or 'none'}\n"
             f"  event counts: {direction.get('top_events') or {}}\n")
 
-    prompt = f"""Recent coverage of {company} ({ticker}), newest first:
+    prompt = f"""Coverage of {company} ({ticker}):
 
 {chr(10).join(lines)}
 {extracted}
-Write a briefing with exactly these four sections, using `## ` headings:
+Briefing in four sections (keep each to 2-4 sentences):
 
 ## What changed
-The developments that would alter how someone values this company. Skip
-routine coverage and price commentary.
+Developments that alter valuation. Skip routine coverage.
 
 ## Forward direction
-What management or the filings imply about the next few quarters — guidance,
-capital allocation, strategy, leadership. Say "no clear signal" if there isn't one.
+What management/filings imply about next quarters. Say "no clear signal" if none.
 
 ## Risks
-Concrete risks visible in this coverage, not generic market risk.
+Concrete risks in this coverage, not generic market risk.
 
 ## Read
-Two or three sentences: is the news flow constructive, deteriorating, or noise?
-Note explicitly if the coverage is too thin to judge."""
+Is the news flow constructive, deteriorating, or noise?"""
 
-    return _complete(prompt)
+    return _complete(prompt, max_tokens=2000)
 
 
 # ─────────────────────────────────────────────
@@ -182,7 +166,7 @@ would be taking by owning the whole list.
 The two or three things these factor values cannot tell you, which a human
 would need to verify. Be specific to these names."""
 
-    return _complete(prompt)
+    return _complete(prompt, max_tokens=2000)
 
 
 def explain_backtest(strategy_name: str, metrics: dict) -> str | None:
@@ -221,7 +205,7 @@ regardless of how good the returns look.
 What this test cannot establish. Consider universe breadth, the number of
 rebalances, and survivorship or cost assumptions."""
 
-    return _complete(prompt, max_tokens=4000)
+    return _complete(prompt, max_tokens=2000)
 
 
 def compare_runs_narrative(strategy_name: str, then: date, now: date,
@@ -243,7 +227,7 @@ In under 200 words: what does this rotation suggest about which factors are
 being rewarded, and is this normal churn or a regime shift? Say if the
 movement is too small to read anything into."""
 
-    return _complete(prompt, max_tokens=2000)
+    return _complete(prompt, max_tokens=1500)
 
 
 def policy_impact(documents: pd.DataFrame, sectors: list[str]) -> str | None:
@@ -253,19 +237,15 @@ def policy_impact(documents: pd.DataFrame, sectors: list[str]) -> str | None:
 
     lines = [
         f"- [{pd.to_datetime(r['published']).date()}] {r['doc_type']}: "
-        f"{r['title'][:150]} (agencies: {(r.get('agencies') or '')[:70]}; "
-        f"themes: {r.get('themes') or 'none'})"
-        for _i, r in documents.head(20).iterrows()
+        f"{r['title'][:120]} ({r.get('themes') or 'none'})"
+        for _i, r in documents.head(15).iterrows()
     ]
 
-    prompt = f"""Recent US federal rules and executive actions, mapped to these
-sectors: {', '.join(sectors) or 'all'}.
+    prompt = f"""Federal rules/actions for sectors: {', '.join(sectors) or 'all'}.
 
 {chr(10).join(lines)}
 
-In under 250 words: which of these plausibly affects listed equities, in which
-direction, and over what horizon? Ignore items that are procedural or
-immaterial to public markets — most of them will be. Name the sector for each
-item you flag."""
+In under 200 words: which plausibly affect equities, in which direction?
+Skip procedural items. Name the sector for each."""
 
-    return _complete(prompt, max_tokens=3000)
+    return _complete(prompt, max_tokens=1500)
