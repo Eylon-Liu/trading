@@ -52,8 +52,9 @@ def layout() -> html.Div:
                     C.label('Universe to refresh'),
                     dcc.Dropdown(
                         id='pull-index',
-                        options=[{'label': f'{k} — {v}', 'value': k}
-                                 for k, v in config.INDEX_OPTIONS.items()],
+                        options=[{'label': '🗄️ All stored tickers', 'value': 'ALL'}]
+                                + [{'label': f'{k} — {v}', 'value': k}
+                                   for k, v in config.INDEX_OPTIONS.items()],
                         value='DIA', clearable=False),
                 ], lg=4, md=6, className='mb-2'),
                 dbc.Col([
@@ -73,12 +74,61 @@ def layout() -> html.Div:
                 ], lg=4, md=12, className='mb-2 d-flex align-items-end'),
             ], className='align-items-end'),
 
+            dbc.Row([
+                dbc.Col([
+                    dbc.Button('🔄 Refresh all index memberships',
+                               id='sync-members-button', size='sm',
+                               color='dark', className='mt-2',
+                               style={'border': f'1px solid {TH.BORDER}',
+                                      'fontSize': '0.78rem'}),
+                    html.Span(' Checks SPY / QQQ / DIA / IWM for '
+                              'constituent changes in one click.',
+                              style={'color': TH.MUTED, 'fontSize': '0.72rem',
+                                     'marginLeft': '8px'}),
+                ]),
+            ]),
             C.loading(html.Div(id='pull-status',
                                style={'fontSize': '0.85rem', 'minHeight': '26px',
                                       'marginTop': '12px'}),
                       'pull-loading'),
             html.Div(id='pull-report'),
         ], className='mb-3'),
+
+        C.card('🔬 Sanity checks', [
+            dbc.Row([
+                dbc.Col([
+                    C.label('Universe to validate'),
+                    dcc.Dropdown(
+                        id='validate-universe',
+                        options=[
+                            {'label': '🗄️ All stored tickers', 'value': 'ALL'},
+                            {'label': 'DIA — Dow 30 (fast)', 'value': 'DIA'},
+                            {'label': 'SPY — S&P 500 (thorough)', 'value': 'SPY'},
+                            {'label': 'QQQ — Nasdaq 100', 'value': 'QQQ'},
+                        ],
+                        value='ALL', clearable=False),
+                ], lg=4, md=6, className='mb-2'),
+                dbc.Col([
+                    C.label('Include survivorship check'),
+                    dcc.Checklist(
+                        id='validate-survivorship',
+                        options=[{'label': '  Test historical membership (slower)',
+                                  'value': 'yes'}],
+                        value=[],
+                        inputStyle={'marginRight': '6px'},
+                        labelStyle={'fontSize': '0.83rem'}),
+                ], lg=4, md=6, className='mb-2'),
+                dbc.Col([
+                    C.gradient_button('🔬  Run sanity checks', 'validate-button'),
+                ], lg=4, md=12, className='mb-2 d-flex align-items-end'),
+            ], className='align-items-end'),
+            C.loading(html.Div(id='validate-results',
+                               style={'minHeight': '26px', 'marginTop': '12px'}),
+                      'validate-loading'),
+        ], subtitle='Builds the factor frame for the chosen universe and runs '
+                    'every integrity check — bounds, infinities, coverage, '
+                    'market-cap agreement, stale shares, split discontinuities.',
+           className='mb-3'),
 
         dbc.Button('📋 Details', id='data-details-btn', size='sm',
                    color='dark', className='mb-3',
@@ -172,29 +222,75 @@ def _mcap_block() -> html.Div:
 
 
 def _validity_block() -> html.Div:
-    """Run the integrity checks over the store and the current factor frame."""
+    """Placeholder directing users to the manual sanity-checks button."""
+    return C.note(
+        'Use the \U0001f52c Run sanity checks button above to validate '
+        'data integrity on demand.',
+        'info',
+    )
+
+
+@callback(
+    Output('validate-results', 'children'),
+    Input('validate-button', 'n_clicks'),
+    State('validate-universe', 'value'),
+    State('validate-survivorship', 'value'),
+    prevent_initial_call=True,
+)
+def _run_validation(n_clicks, universe, survivorship):
+    if not n_clicks:
+        return no_update
+
+    import time
+    from quant import factors as FA
+    from quant import validate as V
+
+    t0 = time.perf_counter()
     try:
-        from datetime import date as _date
+        if universe == 'ALL':
+            tickers = db.read_sql(
+                'SELECT ticker FROM securities ORDER BY ticker'
+            )['ticker'].tolist()
+            universe_label = 'all stored'
+        else:
+            from data.universe import PRESETS
+            preset = universe.lower()
+            tickers = PRESETS.get(preset, PRESETS['dia']).resolve()
+            universe_label = universe
+    except Exception as exc:                         # noqa: BLE001
+        return C.note(f'Could not resolve universe: {exc}', 'error')
 
-        from data.universe import PRESETS
-        from quant import factors as FA
-        from quant import validate as V
+    if not tickers:
+        return C.note(f'No tickers found for {universe}.', 'error')
 
-        tickers = PRESETS['dia'].resolve()
-        factors = FA.build_all(tickers, _date.today()) if tickers else None
-        findings = V.run_all(factors)
-    except Exception as exc:                       # noqa: BLE001
-        log.debug('validity run failed: %s', exc)
-        return C.note(f'Could not run the checks: {exc}', 'error')
+    try:
+        factors = FA.build_all(tickers, date.today())
+    except Exception as exc:                         # noqa: BLE001
+        log.exception('validation factor build failed')
+        return C.note(f'Factor build failed: {exc}', 'error')
 
+    findings = V.run_all(factors)
+
+    if survivorship and 'yes' in survivorship and universe != 'ALL':
+        for yr_back in (1, 3, 5):
+            try:
+                as_of = date(date.today().year - yr_back, date.today().month,
+                             date.today().day)
+                findings += V.check_survivorship(universe, as_of)
+            except Exception as exc:                 # noqa: BLE001
+                log.debug('survivorship %dY failed: %s', yr_back, exc)
+
+    elapsed = time.perf_counter() - t0
     errors = [f for f in findings if f.severity == 'error']
     warnings_ = [f for f in findings if f.severity == 'warning']
+    infos = [f for f in findings if f.severity == 'info']
 
     header = C.metric_row([
         (len(errors), 'errors', TH.NEG if errors else TH.POS),
         (len(warnings_), 'warnings', TH.WARN if warnings_ else TH.MUTED),
-        ('pass' if not errors else 'fail', 'verdict',
-         TH.POS if not errors else TH.NEG),
+        (len(infos), 'info', TH.MUTED),
+        (f'{elapsed:.1f}s', 'elapsed', TH.TEXT),
+        (f'{len(tickers)}', 'tickers checked', TH.TEXT),
     ])
 
     if not findings:
@@ -202,7 +298,6 @@ def _validity_block() -> html.Div:
                       'infinities, no future-dated bars, no facts filed '
                       'before the period they describe.', 'info')
     else:
-        from quant import validate as V
         body = C.data_table(V.to_frame(findings), page_size=12,
                             extra_conditional=[
             {'if': {'filter_query': '{severity} = "error"',
@@ -212,13 +307,22 @@ def _validity_block() -> html.Div:
                     'column_id': 'severity'}, 'color': TH.WARN},
         ])
 
+    verdict = 'pass' if not errors else 'FAIL'
+    verdict_color = TH.POS if not errors else TH.NEG
+
     return html.Div([
         header,
+        html.Div([
+            dbc.Badge(verdict, color='success' if not errors else 'danger',
+                      className='me-2',
+                      style={'fontSize': '0.82rem', 'padding': '6px 12px'}),
+            html.Span(f'Checked {len(tickers)} tickers ({universe_label})',
+                      style={'color': TH.MUTED, 'fontSize': '0.82rem'}),
+        ], className='my-2'),
         html.Hr(style={'borderColor': TH.BORDER}),
         body,
         html.Div('Checks report rather than repair. Silently patching data is '
-                 'how a store stops being trustworthy — a name that cannot be '
-                 'measured is excluded from ranking instead of estimated.',
+                 'how a store stops being trustworthy.',
                  style={'color': TH.MUTED, 'fontSize': '0.75rem',
                         'marginTop': '10px'}),
     ])
@@ -249,20 +353,31 @@ def _health_badge(active_tab):
         total = n_fresh + n_stale + n_never
 
         if n_never > 0:
-            color, verdict = TH.WARN, 'Not initialised'
+            never_names = list(fresh.loc[fresh['status'] == 'never fetched', 'source'])
+            suffix = f' ({", ".join(never_names)})'
+            if n_fresh > 0:
+                color, verdict = TH.WARN, f'{n_never} source never fetched'
+            else:
+                color, verdict = TH.WARN, 'Not initialised'
         elif n_stale > 0:
             color, verdict = TH.WARN, 'Stale — pull recommended'
         else:
             color, verdict = TH.POS, 'All sources fresh'
+            suffix = ''
 
         last = SY.last_session()
+        last_pulled = fresh['last refreshed'].replace('never', pd.NaT)
+        last_pulled = pd.to_datetime(last_pulled, errors='coerce')
+        newest_pull = last_pulled.max()
+        pull_str = (config.local_fmt(newest_pull)
+                    if pd.notna(newest_pull) else 'never')
     except Exception:                                # noqa: BLE001
         return C.note('Could not read freshness.', 'warn')
 
     return C.metric_row([
-        (verdict, 'status', color),
+        (verdict + (suffix if n_never > 0 else ''), 'status', color),
         (f'{n_fresh}/{total}', 'sources fresh', TH.POS if n_fresh == total else TH.MUTED),
-        (str(last), 'last pull', TH.TEXT),
+        (pull_str, 'last pulled', TH.TEXT),
     ])
 
 
@@ -280,13 +395,21 @@ def _pull(n_clicks, index, scope):
         return no_update, no_update, no_update, no_update
 
     try:
-        tickers = members.latest_members(index)
-        if not tickers:
-            return (f'❌ Could not resolve members for {index}. Run '
-                    f'"python cli.py ingest --index {index}" once to seed it.',
-                    None, no_update, no_update)
-
-        report = SY.sync(tickers, index=index, force=(scope == 'force'))
+        if index == 'ALL':
+            tickers = db.read_sql(
+                'SELECT ticker FROM securities ORDER BY ticker'
+            )['ticker'].tolist()
+            if not tickers:
+                return ('❌ No tickers stored yet. Pull an index first to seed '
+                        'the database.', None, no_update, no_update)
+            report = SY.sync(tickers, index=None, force=(scope == 'force'))
+        else:
+            tickers = members.latest_members(index)
+            if not tickers:
+                return (f'❌ Could not resolve members for {index}. Run '
+                        f'"python cli.py ingest --index {index}" once to seed it.',
+                        None, no_update, no_update)
+            report = SY.sync(tickers, index=index, force=(scope == 'force'))
     except Exception as exc:                       # noqa: BLE001
         log.exception('pull failed')
         return (f'❌ {type(exc).__name__}: {str(exc)[:220]}',
@@ -311,6 +434,29 @@ def _pull(n_clicks, index, scope):
         tables = no_update
 
     return msg, detail, _sync_status_block(), tables
+
+
+@callback(
+    Output('pull-status', 'children', allow_duplicate=True),
+    Output('pull-report', 'children', allow_duplicate=True),
+    Input('sync-members-button', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def _sync_all_members(n_clicks):
+    if not n_clicks:
+        return no_update, no_update
+
+    results = []
+    for idx in config.INDEX_OPTIONS:
+        try:
+            rows = members.backfill(idx, date.today())
+            results.append(f'{idx}: {rows} rows')
+        except Exception as exc:                     # noqa: BLE001
+            results.append(f'{idx}: failed ({exc})')
+            log.debug('membership sync %s failed: %s', idx, exc)
+
+    return (f'✅ Membership refresh complete — {", ".join(results)}',
+            None)
 
 
 def _sync_status_block() -> html.Div:
@@ -398,7 +544,8 @@ def _refresh(active_tab):
         if fresh.empty:
             freshness = C.placeholder('Nothing ingested yet.')
         else:
-            fresh['newest'] = pd.to_datetime(fresh['newest']).dt.strftime('%m-%d %H:%M')
+            fresh['newest'] = pd.to_datetime(fresh['newest']).apply(
+                lambda dt: config.local_fmt(dt, '%m-%d %H:%M'))
             freshness = C.data_table(fresh, page_size=14, extra_conditional=[
                 {'if': {'filter_query': '{errors} > 0', 'column_id': 'errors'},
                  'color': TH.NEG, 'fontWeight': '700'}])

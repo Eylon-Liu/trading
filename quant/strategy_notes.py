@@ -4,8 +4,8 @@ What each strategy is good at, what it is bad at, and how it fails.
 Kept apart from strategies.py for the same reason factor_docs.py is: that file
 defines *what is computed*, this one explains *when to believe it*. A weight
 vector cannot tell you that a value screen buys melting ice cubes in a
-momentum regime, and a name like "Quality at a Reasonable Price" does not
-distinguish itself from "Quality Compounder" without help.
+momentum regime, and a name like "Buffett Quality" does not distinguish itself
+from "Quality Momentum" without help.
 
 Every entry carries a `differentiator` for exactly that reason — several
 strategies here are cousins, and the honest answer to "why would I pick this
@@ -36,97 +36,60 @@ NOTES: dict[str, StrategyNote] = {
 
     # ── LONG TERM ────────────────────────────────────────────────
 
-    'quality_value': StrategyNote(
-        differentiator='The balanced default: quality and cheapness weighted '
-                       'roughly equally. Quality Compounder drops the value '
-                       'constraint; Deep Value drops the quality one.',
-        benefit='Avoids the two classic traps at once — paying any price for a '
-                'good business, and buying a bad business because it is cheap. '
-                'The most forgiving starting point if you only run one screen.',
-        drawback='Compromise scoring means it rarely tops any single dimension. '
-                 'In a strong momentum market it will look timid, and in a deep '
-                 'value rally it will lag the pure value screens.',
-        risk='Earnings yield uses trailing figures. A cyclical at peak margins '
-             'looks cheap precisely when its earnings are about to fall, and '
-             'the quality factors will not flag it because current returns are '
-             'genuinely high.',
-        best_when='Broad markets with no dominant factor; recovery phases.',
-        worst_when='Narrow momentum-led markets where a handful of expensive '
-                   'names drive the index.',
+    'buffett': StrategyNote(
+        differentiator='The only screen that underwrites the whole business at '
+                       'once — price, cash conversion, balance sheet and '
+                       'returns on capital — rather than tilting at one of '
+                       'them. Style Factors lets you pick a single dimension; '
+                       'this one refuses to.',
+        benefit='Insists that reported profit actually arrived as cash and that '
+                'the balance sheet could survive a shut credit market, which '
+                'together screen out most of the accounting-driven blowups a '
+                'pure value or pure quality list walks into.',
+        drawback='Twelve factors means no single one dominates, so it rarely '
+                 'tops any individual dimension and will look slow next to a '
+                 'concentrated screen in a trending market. Its size filter '
+                 'also excludes the small end where mispricing is largest.',
+        risk='Every input is trailing. A cyclical at peak margins scores well on '
+             'returns, cash conversion and cheapness simultaneously — precisely '
+             'at the top of its cycle, because peak earnings flatter the yield '
+             'and the margin at the same moment. Net debt to equity is the only '
+             'factor here that would flag the leverage such a name usually '
+             'carries into the downturn.',
+        best_when='Broad markets, rising real rates, and periods when balance '
+                  'sheet strength is repriced.',
+        worst_when='Late-stage momentum markets led by a few expensive names, '
+                   'where owning cash-generative businesses at sane multiples '
+                   'is exactly the wrong trade.',
     ),
 
-    'compounder': StrategyNote(
-        differentiator='Quality only — valuation is deliberately ignored. If '
-                       'you want the same businesses but bought on a yield, '
-                       'use Quality at a Reasonable Price.',
-        benefit='Selects for durable, capital-efficient businesses that can '
-                'reinvest internally. Historically the lowest-turnover approach '
-                'here, which makes it the cheapest to run and the easiest to '
-                'hold through drawdowns.',
-        drawback='No valuation discipline at all. It will happily rank a '
-                 'superb business at fifty times earnings first, and your '
-                 'return then depends on multiple expansion continuing.',
-        risk='Quality is measured from the past. ROIC stays high right up until '
-             'a moat breaks, and the screen has no mechanism to see the break '
-             'coming — it will still be recommending the name while the thesis '
-             'is dissolving.',
-        best_when='Long holding periods; investors who will not trade often.',
-        worst_when='Rising rates compressing the multiples of long-duration '
-                   'growth assets.',
-    ),
-
-    'deep_value': StrategyNote(
-        differentiator='Pure cheapness, minimal quality gate. The opposite '
-                       'end of the spectrum from Quality Compounder.',
-        benefit='Buys the largest discount to fundamentals available. When '
-                'value works, this captures the most of it, and the entry '
-                'price gives a genuine margin of safety.',
-        drawback='Value traps are the norm, not the exception. Most statistically '
-                 'cheap companies are cheap because their business is impaired, '
-                 'and the screen cannot distinguish temporary from terminal.',
-        risk='Concentrates by construction in whatever sector the market has '
-             'given up on — often all at once. Sector-relative scoring softens '
-             'this but does not remove it.',
-        best_when='Early recovery from a broad drawdown; value factor rotations.',
-        worst_when='Late-cycle momentum markets; secular decline in the cheap '
-                   'sectors (the classic case being print media, then retail).',
-    ),
-
-    'defensive_value': StrategyNote(
-        differentiator='Deep Value with a solvency and stability gate bolted '
-                       'on. Gives up some discount to avoid the worst traps.',
-        benefit='Keeps most of the value exposure while screening out the '
-                'balance sheets most likely to fail. A reasonable middle for '
-                'anyone who finds Deep Value uncomfortable.',
-        drawback='The quality gate removes exactly the deepest discounts, which '
-                 'is where a meaningful share of value returns historically sat.',
-        risk='Low volatility and low leverage are correlated with expensive, '
-             'bond-like defensives. In a rate shock those fall together and the '
-             '"defensive" label is actively misleading.',
-        best_when='Uncertain markets where balance-sheet strength is rewarded.',
-        worst_when='Sharp risk-on rallies; rapid rate rises.',
-    ),
-
-    'dividend_quality': StrategyNote(
-        differentiator='Income with a sustainability test. Total Shareholder '
-                       'Yield counts buybacks too and is the better choice '
-                       'unless you specifically need cash income.',
-        benefit='Screens for dividends that are actually covered by cash flow, '
-                'rather than for the highest headline yield — which is usually '
-                'a cut waiting to happen.',
-        drawback='Structurally excludes almost every high-growth business, '
-                 'since the best reinvestment opportunities pay nothing out.',
-        risk='A high yield is often the market pricing in a cut. Payout '
-             'coverage helps, but coverage is computed from trailing cash flow '
-             'and will not anticipate a collapse in it.',
-        best_when='Income mandates; falling-rate environments.',
-        worst_when='Rising rates, when bonds compete directly; growth-led markets.',
+    'style_factors': StrategyNote(
+        differentiator='The only configurable strategy: you choose the factor '
+                       'standing in for Value, Growth and Momentum, and the '
+                       'three are weighted equally. Every other screen fixes '
+                       'both the factors and their weights.',
+        benefit='Makes the proxy choice explicit and testable. "Value" means '
+                'something different depending on whether it is earnings yield '
+                'or book to market, and here you can backtest the difference '
+                'instead of inheriting someone else\'s definition.',
+        drawback='Equal weighting across three styles is a decision, not a '
+                 'neutral default — it dilutes whichever style is working. '
+                 'Three factors is also thin cover: a name missing one of them '
+                 'is scored on two.',
+        risk='The freedom to choose is the freedom to overfit. Trying proxy '
+             'combinations until the backtest looks good will find a winner by '
+             'chance well before it finds one by signal — the growth proxies in '
+             'particular have shown no reliable edge on this universe.',
+        best_when='Investigating which definition of a style actually carries '
+                  'the premium in a given regime.',
+        worst_when='Used as a production screen without having backtested the '
+                   'specific combination selected.',
     ),
 
     'shareholder_yield': StrategyNote(
         differentiator='Counts buybacks alongside dividends, so it sees the '
                        'whole of capital returned rather than only the taxable '
-                       'half that Dividend Quality looks at.',
+                       'half a dividend-only screen would see.',
         benefit='Captures companies returning cash through repurchase, which a '
                 'dividend screen misses entirely despite it being economically '
                 'the same act.',
@@ -140,41 +103,10 @@ NOTES: dict[str, StrategyNote] = {
         worst_when='Credit stress, when buybacks are cut first.',
     ),
 
-    'piotroski': StrategyNote(
-        differentiator='A single nine-point accounting checklist rather than a '
-                       'weighted blend. The most mechanical and the easiest to '
-                       'verify by hand.',
-        benefit='Well documented in the literature, hard to overfit, and each '
-                'of the nine tests is individually explicable to someone who '
-                'does not trust the model.',
-        drawback='Binary tests throw away magnitude. A company improving ROA by '
-                 'a basis point scores exactly the same as one doubling it.',
-        risk='Designed to be applied to already-cheap stocks. Run on its own '
-             'across a broad universe it mostly identifies companies in a '
-             'cyclical upswing, which is a different and weaker signal.',
-        best_when='Paired with a value screen, which is its original use.',
-        worst_when='Used alone on an expensive universe.',
-    ),
-
-    'garp': StrategyNote(
-        differentiator='Growth with a valuation ceiling. Quality Compounder '
-                       'cares about returns on capital; this cares about the '
-                       'growth rate and what you pay for it.',
-        benefit='Finds businesses compounding revenue and earnings without '
-                'paying an unbounded multiple for the privilege.',
-        drawback='Growth is measured from trailing filings and is heavily '
-                 'mean-reverting. High past growth is a weak predictor of '
-                 'future growth, which undercuts the premise.',
-        risk='Vulnerable to the classic growth de-rating: the company keeps '
-             'growing, the multiple halves, and the position still loses money.',
-        best_when='Mid-cycle expansion with stable rates.',
-        worst_when='Rate shocks; any regime where multiples compress faster '
-                   'than earnings grow.',
-    ),
-
     'quality_momentum': StrategyNote(
-        differentiator='Quality Compounder plus a price-trend requirement — '
-                       'the market must already agree with you.',
+        differentiator='The only long-term screen where price action leads. '
+                       'Buffett Quality asks what a business is worth; this '
+                       'one requires the market to already agree with you.',
         benefit='Momentum acts as a timing filter on a quality list, which '
                 'historically avoids the long dead periods where a good '
                 'business goes nowhere for years.',
@@ -186,23 +118,6 @@ NOTES: dict[str, StrategyNote] = {
              'the earnings that made it quality.',
         best_when='Sustained trending markets.',
         worst_when='Sharp reversals and choppy, range-bound markets.',
-    ),
-
-    'low_volatility': StrategyNote(
-        differentiator='Selects on realised risk rather than on any business '
-                       'characteristic. The only long screen here that does '
-                       'not look at profitability.',
-        benefit='Smaller drawdowns and a smoother path, which in practice is '
-                'what determines whether an investor actually holds through a '
-                'bad year.',
-        drawback='Gives up meaningful upside in strong markets, and the whole '
-                 'approach became crowded after a decade of popularity, which '
-                 'compressed the premium.',
-        risk='Low-volatility screens concentrate hard in utilities, staples and '
-             'REITs — long-duration, bond-like assets that all fall together '
-             'when rates rise. The diversification is an illusion.',
-        best_when='High-volatility or falling markets.',
-        worst_when='Rate rises; strong risk-on rallies.',
     ),
 
     'insider_conviction': StrategyNote(
@@ -219,21 +134,6 @@ NOTES: dict[str, StrategyNote] = {
              'they are dominated by scheduled diversification.',
         best_when='After broad selloffs, when insider buying clusters.',
         worst_when='Quiet markets, and during blackout windows around results.',
-    ),
-
-    'multifactor': StrategyNote(
-        differentiator='Blends value, quality, momentum and low risk together '
-                       'rather than committing to one. The most diversified '
-                       'long screen here.',
-        benefit='No single factor drawdown sinks it, and factor timing is a '
-                'game few win — holding several removes the need to.',
-        drawback='Blending dilutes. It will never top a leaderboard, and in a '
-                 'year when one factor does all the work it will noticeably lag.',
-        risk='Factors that look independent become correlated in a crisis, so '
-             'the diversification is weakest exactly when it is needed. Wide '
-             'coverage requirements also make it sensitive to missing data.',
-        best_when='As a default when you have no view on factor regime.',
-        worst_when='Strongly single-factor-led markets.',
     ),
 
     # ── MID TERM ─────────────────────────────────────────────────

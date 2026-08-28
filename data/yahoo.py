@@ -31,6 +31,91 @@ CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}'
 # PRICES
 # ─────────────────────────────────────────────
 
+def _parse_splits(payload: dict, ticker: str) -> list[dict]:
+    """
+    Split events from a chart response.
+
+    The chart call already asks for `events=div,split`; the result was being
+    discarded. Without it a share count filed before a split is multiplied by a
+    price quoted after one, which is how a company that split 10-for-1 came to
+    show a tenth of its real market cap at every earlier date.
+    """
+    try:
+        events = payload['chart']['result'][0].get('events') or {}
+    except (KeyError, IndexError, TypeError):
+        return []
+
+    out = []
+    for ev in (events.get('splits') or {}).values():
+        try:
+            num = float(ev['numerator'])
+            den = float(ev['denominator'])
+            when = pd.to_datetime(int(ev['date']), unit='s', utc=True)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if den <= 0 or num <= 0:
+            continue
+        out.append({'ticker': ticker, 'date': when.tz_convert(None).date(),
+                    'ratio': num / den})
+    return out
+
+
+def update_splits(tickers: list[str], period: str = '10y') -> int:
+    """Fetch and store split history. Returns rows written."""
+    tickers = sorted({t for t in tickers if t})
+    if not tickers:
+        return 0
+
+    rows: list[dict] = []
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(http.fetch_json, CHART_URL.format(ticker=t),
+                        category='prices',
+                        params={'range': period, 'interval': '1d',
+                                'events': 'div,split'}): t
+            for t in tickers
+        }
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                payload = fut.result()
+            except Exception as exc:              # noqa: BLE001
+                log.debug('split fetch failed for %s: %s', t, exc)
+                continue
+            if payload:
+                rows.extend(_parse_splits(payload, t))
+
+    if not rows:
+        return 0
+    written = db.upsert(db.splits, rows)
+    log.info('splits: %d events across %d tickers',
+             written, len({r['ticker'] for r in rows}))
+    return written
+
+
+def split_factors(tickers: list[str], as_of: date | str | None = None
+                  ) -> pd.DataFrame:
+    """
+    Cumulative split ratio applying *after* each date, per ticker.
+
+    Returns the raw event rows; callers scale a share count filed on date D by
+    the product of every ratio dated after D, which restates it onto the same
+    basis the price series already uses.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=['ticker', 'date', 'ratio'])
+    ph = ','.join(f':t{i}' for i in range(len(tickers)))
+    params: dict = {f't{i}': t for i, t in enumerate(tickers)}
+    clause = ''
+    if as_of is not None:
+        params['d'] = str(pd.to_datetime(as_of).date())
+        clause = 'AND date <= :d'
+    return db.read_sql(
+        f'SELECT ticker, date, ratio FROM splits '
+        f'WHERE ticker IN ({ph}) {clause} ORDER BY ticker, date',
+        params, parse_dates=['date'])
+
+
 def _parse_chart(payload: dict, ticker: str) -> pd.DataFrame:
     """Turn a chart-API response into an OHLCV frame."""
     try:
@@ -159,6 +244,9 @@ def update_prices(tickers: list[str], period: str = '10y',
                 'close': _f(r['close']), 'adj_close': _f(r['adj_close']),
                 'volume': _f(r['volume']),
             } for _i, r in df.iterrows()]
+            rows = _validate_bars(rows, t)
+            if not rows:
+                continue
             written += db.upsert(db.prices, rows)
             db.record_ingest('prices', t, rows=len(rows))
 
@@ -173,6 +261,43 @@ def _f(v) -> float | None:
         return f if np.isfinite(f) else None
     except (TypeError, ValueError):
         return None
+
+
+def _validate_bars(rows: list[dict], ticker: str) -> list[dict]:
+    """
+    Drop structurally impossible bars before they reach the database.
+
+    A bar where close > high or close < low cannot be real — it is a provider
+    glitch that, once stored, contaminates every momentum, volatility, and
+    market-cap calculation for that name.
+    """
+    clean = []
+    for r in rows:
+        h, l, c, v = r.get('high'), r.get('low'), r.get('close'), r.get('volume')
+        if c is None:
+            continue
+        if h is not None and c > h * 1.001:
+            log.debug('%s %s: close %.4f > high %.4f — bar dropped',
+                      ticker, r.get('date'), c, h)
+            continue
+        if l is not None and l > 0 and c < l * 0.999:
+            log.debug('%s %s: close %.4f < low %.4f — bar dropped',
+                      ticker, r.get('date'), c, l)
+            continue
+        if v is not None and v < 0:
+            log.debug('%s %s: negative volume %s — bar dropped',
+                      ticker, r.get('date'), v)
+            continue
+        if c <= 0:
+            log.debug('%s %s: non-positive close %.4f — bar dropped',
+                      ticker, r.get('date'), c)
+            continue
+        clean.append(r)
+    dropped = len(rows) - len(clean)
+    if dropped:
+        log.warning('%s: dropped %d/%d bars that failed sanity checks',
+                    ticker, dropped, len(rows))
+    return clean
 
 
 # ─────────────────────────────────────────────
@@ -270,6 +395,47 @@ def _ohlc_raw(tickers: list[str], start=None, end=None) -> pd.DataFrame:
         f'SELECT ticker, date, high, low, close, adj_close FROM prices '
         f'WHERE {" AND ".join(clauses)} ORDER BY date',
         params, parse_dates=['date'])
+
+
+def price_and_ohlc(tickers: list[str], start=None, end=None
+                   ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
+                              pd.DataFrame]:
+    """All price frames from one DB read: (adj_close, adj_high, adj_low, adj_close_for_atr).
+
+    Replaces the pattern of calling ``price_history`` then ``adjusted_ohlc``
+    separately, which issued two overlapping SQL queries for the same tickers
+    and date range.
+    """
+    raw = _ohlc_raw(tickers, start, end)
+    if raw.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty
+
+    adj_close = raw.pivot_table(index='date', columns='ticker',
+                                values='adj_close', aggfunc='last')
+    close = raw.pivot_table(index='date', columns='ticker',
+                            values='close', aggfunc='last')
+    high = raw.pivot_table(index='date', columns='ticker',
+                           values='high', aggfunc='last')
+    low = raw.pivot_table(index='date', columns='ticker',
+                          values='low', aggfunc='last')
+
+    if close.empty or adj_close.empty:
+        return adj_close, high, low, adj_close
+
+    ratio = (adj_close / close.replace(0, np.nan)).replace(
+        [np.inf, -np.inf], np.nan)
+    ratio = ratio.ffill().bfill().fillna(1.0)
+
+    common = ratio.columns
+    if not high.empty:
+        high = high[high.columns.intersection(common)].mul(
+            ratio, fill_value=np.nan)
+    if not low.empty:
+        low = low[low.columns.intersection(common)].mul(
+            ratio, fill_value=np.nan)
+
+    return adj_close, high, low, adj_close
 
 
 def last_close(prices: pd.DataFrame) -> pd.Series:

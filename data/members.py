@@ -238,8 +238,10 @@ def nport_holdings(index_symbol: str, max_filings: int = 40) -> pd.DataFrame:
     if not idxs:
         return pd.DataFrame()
 
+    series_filter = config.INDEX_ETF_SERIES.get(index_symbol)
+
     name_map = _cusip_to_ticker_map()
-    rows, unmatched = [], 0
+    rows, unmatched, skipped_series = [], 0, 0
 
     for i in idxs:
         acc_raw = recent['accessionNumber'][i]
@@ -258,6 +260,14 @@ def nport_holdings(index_symbol: str, max_filings: int = 40) -> pd.DataFrame:
         except etree.XMLSyntaxError as exc:
             log.warning('bad N-PORT XML %s: %s', acc_raw, exc)
             continue
+
+        if series_filter:
+            sname = (root.findtext('.//n:seriesName', namespaces=NPORT_NS)
+                     or root.findtext('.//n:seriesNm', namespaces=NPORT_NS)
+                     or '')
+            if series_filter.lower() not in sname.lower():
+                skipped_series += 1
+                continue
 
         for sec in root.findall('.//n:invstOrSec', NPORT_NS):
             name = (sec.findtext('n:name', namespaces=NPORT_NS) or '').strip()
@@ -284,6 +294,8 @@ def nport_holdings(index_symbol: str, max_filings: int = 40) -> pd.DataFrame:
 
     if unmatched:
         log.info('%s N-PORT: %d holdings unmatched to a ticker', index_symbol, unmatched)
+    if skipped_series:
+        log.info('%s N-PORT: %d filings skipped (different series)', index_symbol, skipped_series)
     return pd.DataFrame(rows)
 
 

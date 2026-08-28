@@ -39,7 +39,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # Bump when factor computation logic changes (new factors, formula fixes,
 # direction changes). The data_version fingerprint only moves when new data
 # is ingested; without this, a code change serves stale cached results.
-CODE_VERSION = 4
+CODE_VERSION = 10
 
 # Entries are self-invalidating via the data version, so this only bounds
 # unbounded growth from many one-off as-of dates.
@@ -48,23 +48,32 @@ MAX_ENTRIES = 400
 
 
 def data_version() -> str:
-    """A fingerprint of the stored data that any ingest will change."""
+    """A fingerprint of the stored data that any ingest will change.
+
+    Includes MAX(rowid) per table so that in-place updates (restatements,
+    data corrections) that don't change row counts or max dates still
+    invalidate the cache.
+    """
     try:
         row = db.read_sql("""
             SELECT (SELECT COUNT(*) FROM sec_facts)            AS nf,
                    (SELECT MAX(filed) FROM sec_facts)          AS mf,
+                   (SELECT MAX(rowid) FROM sec_facts)          AS rf,
                    (SELECT COUNT(*) FROM prices)               AS np,
                    (SELECT MAX(date) FROM prices)              AS mp,
+                   (SELECT MAX(rowid) FROM prices)             AS rp,
                    (SELECT COUNT(*) FROM insider_txns)         AS ni,
                    (SELECT COUNT(*) FROM securities)           AS ns,
                    (SELECT COUNT(*) FROM profile_snapshots)    AS nps,
-                   (SELECT MAX(snapshot_date) FROM profile_snapshots) AS mps
+                   (SELECT MAX(snapshot_date) FROM profile_snapshots) AS mps,
+                   (SELECT MAX(rowid) FROM splits)             AS rs
         """)
         if row.empty:
             return 'unknown'
         r = row.iloc[0]
         return (f"{r['nf']}:{r['mf']}:{r['np']}:{r['mp']}"
-                f":{r['ni']}:{r['ns']}:{r['nps']}:{r['mps']}")
+                f":{r['ni']}:{r['ns']}:{r['nps']}:{r['mps']}"
+                f":{r['rf']}:{r['rp']}:{r['rs']}")
     except Exception as exc:                       # noqa: BLE001
         # Without a version we cannot prove freshness, so make the key unique
         # and effectively bypass the cache rather than risk a stale hit.

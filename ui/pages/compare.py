@@ -64,7 +64,7 @@ def layout() -> html.Div:
                 dbc.Col([
                     C.label('Strategy'),
                     dcc.Dropdown(id='cmp-strategy-a', options=CU.options(),
-                                 value='compounder', clearable=False),
+                                 value='buffett', clearable=False),
                 ], lg=3, md=6, className='mb-2'),
 
                 dbc.Col([
@@ -127,7 +127,7 @@ def _mode_controls(mode):
                     value='3M', clearable=False))
     return (BLURBS['cross'], C.label('Second strategy'),
             dcc.Dropdown(id='cmp-second', options=CU.options(),
-                         value='deep_value', clearable=False))
+                         value='quality_momentum', clearable=False))
 
 
 @callback(

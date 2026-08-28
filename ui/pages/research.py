@@ -33,7 +33,7 @@ def layout() -> html.Div:
                 dbc.Col([
                     C.label('Strategy'),
                     dcc.Dropdown(id='bt-strategy', options=CU.options(),
-                                 value='quality_value', clearable=False),
+                                 value='buffett', clearable=False),
                 ], lg=3, md=6, className='mb-3'),
                 dbc.Col([
                     C.label('Universe'),

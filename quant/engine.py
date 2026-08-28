@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 import numpy as np
@@ -47,6 +47,14 @@ class RunResult:
     plans: pd.DataFrame           # mid-term only; empty for long-term
     universe: list[str]
     sync: SY.SyncReport | None = None     # what the pull phase did
+    # Factors the strategy asked for that the data could not supply. Empty on a
+    # healthy run; non-empty means the ranking is not the configured strategy.
+    warnings: list[str] = field(default_factory=list)
+    _fund_raw: pd.DataFrame | None = field(default=None, repr=False)
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.warnings)
 
     @property
     def horizon(self) -> str:
@@ -60,15 +68,41 @@ class RunResult:
 # SCORING
 # ─────────────────────────────────────────────
 
-def score_universe(raw: pd.DataFrame, strategy: ST.Strategy
-                   ) -> tuple[pd.DataFrame, pd.DataFrame]:
+def score_universe(raw: pd.DataFrame, strategy: ST.Strategy,
+                   as_of: date | str | None = None
+                   ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """
     Turn raw factor values into sector-relative scores and a composite.
 
-    Returns (per-name scores, tidy per-factor detail).
+    Returns (per-name scores, tidy per-factor detail, warnings).
+
+    A factor that is empty across the whole universe does not simply drop out
+    quietly: its weight is redistributed over the survivors, so the strategy
+    that runs is not the strategy that was configured. That is reported rather
+    than logged at debug, because the difference matters most in a backtest,
+    where nobody is watching the log.
     """
     sectors = raw['sector'] if 'sector' in raw else pd.Series('Unknown', index=raw.index)
     size = raw['MARKET_CAP'] if 'MARKET_CAP' in raw else None
+
+    warnings: list[str] = []
+    avail = FA.factor_availability(raw, strategy.weights, as_of)
+    degraded = avail[avail['status'].isin(('missing', 'empty', 'live_only'))]
+    if not degraded.empty:
+        total = sum(strategy.weights.values()) or 1.0
+        lost = float(degraded['weight'].sum())
+        for _i, r in degraded.iterrows():
+            why = ('has no history — live snapshot only'
+                   if r['status'] == 'live_only'
+                   else f"{r['coverage']*100:.0f}% coverage")
+            warnings.append(
+                f"{r['factor']} unavailable ({why}), weight {r['weight']:g} dropped")
+        warnings.append(
+            f'{lost:g} of {total:g} weight ({lost/total*100:.0f}%) was dropped — '
+            f'ranking reflects the remaining factors only')
+        log.warning('%s at %s: %d/%d factors unavailable, %.0f%% of weight lost',
+                    strategy.key, as_of, len(degraded), len(strategy.weights),
+                    lost / total * 100)
 
     scored, detail = {}, []
     for name, weight in strategy.weights.items():
@@ -86,7 +120,8 @@ def score_universe(raw: pd.DataFrame, strategy: ST.Strategy
         detail.append(tidy)
 
     if not scored:
-        return pd.DataFrame(), pd.DataFrame()
+        warnings.append('no factor in this strategy had any data')
+        return pd.DataFrame(), pd.DataFrame(), warnings
 
     factor_scores = pd.DataFrame(scored)
     weights = {k: v for k, v in strategy.weights.items() if k in factor_scores}
@@ -103,7 +138,7 @@ def score_universe(raw: pd.DataFrame, strategy: ST.Strategy
     out = out.sort_values('composite', ascending=False, na_position='last')
 
     detail_df = pd.concat(detail, ignore_index=True) if detail else pd.DataFrame()
-    return out, detail_df
+    return out, detail_df, warnings
 
 
 # ─────────────────────────────────────────────
@@ -279,10 +314,17 @@ def generate_signals(scores: pd.DataFrame, raw: pd.DataFrame,
 # ORCHESTRATION
 # ─────────────────────────────────────────────
 
-def run(spec: UniverseSpec, strategy_key: str, as_of: date | str | None = None,
+def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
+        as_of: date | str | None = None,
         top_n: int | None = None, persist: bool = True,
         plan_params: TP.PlanParams | None = None,
-        sync: bool = False, sync_progress=None) -> RunResult:
+        sync: bool = False, sync_progress=None,
+        _bt_facts: pd.DataFrame | None = None,
+        _bt_data_version: str | None = None,
+        _bt_prev_fund: pd.DataFrame | None = None,
+        _bt_changed_tickers: set[str] | None = None,
+        _bt_splits: pd.DataFrame | None = None,
+        _bt_splits_applied: bool = False) -> RunResult:
     """
     Score a universe from stored data.
 
@@ -331,7 +373,15 @@ def run(spec: UniverseSpec, strategy_key: str, as_of: date | str | None = None,
     log.info('run: %s | %s | %d names | as_of %s',
              strategy.name, spec.describe(), len(universe), as_of)
 
-    raw = FA.build_all(universe, as_of)
+    fund_stash: dict = {}
+    raw = FA.build_all(universe, as_of,
+                       _facts_all=_bt_facts,
+                       _data_version=_bt_data_version,
+                       _prev_fund=_bt_prev_fund,
+                       _changed_tickers=_bt_changed_tickers,
+                       _splits=_bt_splits,
+                       _splits_applied=_bt_splits_applied,
+                       _fund_stash=fund_stash)
     if raw.empty:
         return RunResult(str(uuid.uuid4()), as_of, strategy,
                          pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
@@ -358,11 +408,11 @@ def run(spec: UniverseSpec, strategy_key: str, as_of: date | str | None = None,
     log.info('filters: %d/%d names eligible', len(eligible), len(raw))
 
     raw_eligible = raw.loc[eligible]
-    scores, detail = score_universe(raw_eligible, strategy)
+    scores, detail, warnings = score_universe(raw_eligible, strategy, as_of)
     if scores.empty:
         return RunResult(str(uuid.uuid4()), as_of, strategy,
                          pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
-                         sync_report)
+                         sync_report, warnings)
 
     scores = generate_signals(scores, raw_eligible, strategy.horizon)
     scores = scores.dropna(subset=['composite'])
@@ -391,7 +441,8 @@ def run(spec: UniverseSpec, strategy_key: str, as_of: date | str | None = None,
         _persist(run_id, as_of, spec, strategy, universe, scores, detail)
 
     return RunResult(run_id, as_of, strategy, scores, detail, plans, universe,
-                     sync_report)
+                     sync_report, warnings,
+                     _fund_raw=fund_stash.get('result'))
 
 
 def _persist(run_id: str, as_of: date, spec: UniverseSpec,

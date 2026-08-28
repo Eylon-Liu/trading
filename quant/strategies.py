@@ -73,93 +73,111 @@ class Strategy:
 
 
 # ─────────────────────────────────────────────
+# STYLE PROXIES — the user-selectable factor per investment style
+# ─────────────────────────────────────────────
+
+# Each style can be represented by more than one factor, and which one is
+# "right" is an empirical question rather than a settled one. Rather than pick
+# silently, the options are named here and chosen on the Screen tab.
+#
+# Raw earnings per share is deliberately absent. A $10 EPS is not better than a
+# $2 EPS — it reflects the share count, not the value — so ranking on it across
+# companies is meaningless. EARNINGS_YIELD is the same quantity divided by
+# price, which is what makes it comparable; the "is EPS rising?" question it was
+# reaching for is answered by EPS_CAGR_3Y under Growth, where a rate of change
+# is comparable even though a level is not.
+STYLE_PROXIES: dict[str, list[tuple[str, str]]] = {
+    'value': [
+        ('EARNINGS_YIELD', 'Earnings yield (E/P)'),
+        ('BOOK_TO_MARKET', 'Book to market (equity / market cap)'),
+    ],
+    'growth': [
+        ('REVENUE_GROWTH_1Y', 'Sales growth (1Y)'),
+        ('EQUITY_CAGR_3Y', 'Equity CAGR (3Y)'),
+        ('EPS_CAGR_3Y', 'EPS CAGR (3Y)'),
+    ],
+    'momentum': [
+        ('RETURN_1M', '1-month total return'),
+        ('RETURN_6M', '6-month total return'),
+        ('MOM_6_1', 'Momentum 6-1 (skips last month)'),
+    ],
+}
+
+DEFAULT_STYLE_PROXIES: dict[str, str] = {
+    'value': 'EARNINGS_YIELD',
+    'growth': 'REVENUE_GROWTH_1Y',
+    'momentum': 'RETURN_1M',
+}
+
+STYLE_FACTORS_KEY = 'style_factors'
+
+
+def style_strategy(value: str | None = None, growth: str | None = None,
+                   momentum: str | None = None) -> 'Strategy':
+    """
+    Build the style-factor strategy from a choice of proxy per style.
+
+    Returns a `Strategy` rather than registering one, so a screen, a backtest
+    and a report can each run a different combination concurrently without any
+    shared state. `get()` accepts the object directly.
+    """
+    chosen = {
+        'value': value or DEFAULT_STYLE_PROXIES['value'],
+        'growth': growth or DEFAULT_STYLE_PROXIES['growth'],
+        'momentum': momentum or DEFAULT_STYLE_PROXIES['momentum'],
+    }
+    for style, factor in chosen.items():
+        valid = [f for f, _ in STYLE_PROXIES[style]]
+        if factor not in valid:
+            raise ValueError(
+                f'{factor!r} is not a {style} proxy; choose one of {valid}')
+
+    base = LONG_TERM[STYLE_FACTORS_KEY]
+    label = ' / '.join(chosen[s] for s in ('value', 'growth', 'momentum'))
+    return Strategy(
+        key=base.key, name=base.name, horizon=base.horizon,
+        description=base.description,
+        thesis=f'{base.thesis} Currently scoring on {label}.',
+        # Equal weight across the three styles: the comparison being made is
+        # between proxies, so a weighting scheme would confound it.
+        weights={f: 1.0 for f in chosen.values()},
+        filters=dict(base.filters), neutralize=base.neutralize,
+    )
+
+
+# ─────────────────────────────────────────────
 # LONG-TERM — screen to own
 # ─────────────────────────────────────────────
 
 LONG_TERM = {
-    'quality_value': Strategy(
-        key='quality_value', name='Quality at a Reasonable Price', horizon='long',
-        description='Profitable, well-capitalised businesses trading on modest yields.',
-        thesis='Own durable earnings power bought below its worth; exit if returns '
-               'on capital decay or leverage rises structurally.',
+    'buffett': Strategy(
+        key='buffett', name='Buffett Quality', horizon='long',
+        description='A durable business, earnings backed by cash, a fortress '
+                    'balance sheet, bought at a sensible price.',
+        thesis='Underwrite the company the way an owner would: does it earn a '
+               'high return on the capital it employs, does the reported profit '
+               'actually arrive as cash, could it survive a closed credit '
+               'market, and is it priced so that being right is rewarded? Exit '
+               'when returns on capital decay structurally or leverage rises to '
+               'fund the dividend.',
+        # EBIT_TO_EV is gone: it correlates 0.80 with EARNINGS_YIELD on live
+        # data, so carrying both spent weight twice on one idea. Gross
+        # profitability is gone too — 51% coverage means half the index was
+        # scored on eleven factors and half on twelve, which is a different
+        # strategy for each half rather than a thin factor.
         weights={
-            'EARNINGS_YIELD': 1.0, 'FCF_YIELD': 1.2, 'EBIT_TO_EV': 0.8,
-            'ROIC': 1.2, 'GROSS_PROFITABILITY': 1.0, 'ROE': 0.8,
-            'ACCRUALS': 0.6, 'DEBT_TO_EQUITY': 0.5,
+            # margin of safety
+            'BOOK_TO_MARKET': 1.2, 'EARNINGS_YIELD': 1.4,
+            # cash flow reality — "cash is a fact, profit is an opinion"
+            'FCF_YIELD': 1.0, 'FCF_CONVERSION': 1.0, 'ACCRUALS': 0.8,
+            # fortress balance sheet
+            'NET_DEBT_TO_EQUITY': 1.0, 'PIOTROSKI_F': 0.6, 'CURRENT_RATIO': 0.4,
+            # moat / durable returns on capital
+            'ROIC': 1.2, 'OPERATING_MARGIN': 0.6,
+            # book value compounding — Buffett's own scorecard
+            'EQUITY_CAGR_3Y': 0.6,
         },
         filters={'min_market_cap': 2e9},
-    ),
-    'deep_value': Strategy(
-        key='deep_value', name='Deep Value', horizon='long',
-        description='Statistically cheap on assets and cash flow, screened for solvency.',
-        thesis='Buy the discount to book and cash generation; exit on re-rating '
-               'or if the balance sheet deteriorates.',
-        weights={
-            'BOOK_TO_MARKET': 1.5, 'EARNINGS_YIELD': 1.0, 'FCF_YIELD': 1.0,
-            'SALES_YIELD': 0.5, 'PIOTROSKI_F': 1.0, 'DEBT_TO_EQUITY': 0.8,
-            'CURRENT_RATIO': 0.5,
-        },
-    ),
-    'piotroski': Strategy(
-        key='piotroski', name='Piotroski F-Score', horizon='long',
-        description='Nine fundamental health tests, all from filed statements.',
-        thesis='Improving fundamentals in cheap names; exit when the score rolls over.',
-        weights={
-            'PIOTROSKI_F': 2.0, 'BOOK_TO_MARKET': 1.0,
-            'ROA': 0.5, 'FCF_YIELD': 0.8, 'ACCRUALS': 0.5,
-        },
-    ),
-    'compounder': Strategy(
-        key='compounder', name='Quality Compounder', horizon='long',
-        description='High and stable returns on capital with reinvestment runway.',
-        thesis='Let capital compound internally; exit if ROIC or growth structurally breaks.',
-        weights={
-            'ROIC': 1.5, 'GROSS_PROFITABILITY': 1.2, 'OPERATING_MARGIN': 0.8,
-            'REVENUE_CAGR_3Y': 1.0, 'EARNINGS_GROWTH_1Y': 0.6,
-            'ACCRUALS': 0.5, 'DEBT_TO_EQUITY': 0.5,
-        },
-        filters={'min_market_cap': 5e9},
-    ),
-    'dividend_quality': Strategy(
-        key='dividend_quality', name='Dividend Quality', horizon='long',
-        description='Sustainable income: yield backed by cash flow, not by leverage.',
-        thesis='Own the cash return; exit on payout stress or a cut.',
-        weights={
-            'DIVIDEND_YIELD': 1.2, 'FCF_YIELD': 1.2, 'PAYOUT_RATIO': 0.8,
-            'ROE': 0.6, 'DEBT_TO_EQUITY': 0.8, 'NET_MARGIN': 0.5,
-            'BUYBACK_YIELD': 0.4,
-        },
-    ),
-    'low_volatility': Strategy(
-        key='low_volatility', name='Low Volatility Defensive', horizon='long',
-        description='The low-risk anomaly: low beta and low idiosyncratic vol, quality-screened.',
-        thesis='Compound through drawdowns; exit if volatility regime-shifts higher.',
-        weights={
-            'VOL_1Y': 1.5, 'BETA': 1.0, 'IDIO_VOL': 0.8, 'MAX_DD_1Y': 0.8,
-            'ROE': 0.6, 'DEBT_TO_EQUITY': 0.6,
-        },
-        neutralize='neutralize',
-    ),
-    'garp': Strategy(
-        key='garp', name='Growth at a Reasonable Price', horizon='long',
-        description='Growth that has not yet been fully paid for.',
-        thesis='Own compounding growth bought at a sane multiple; exit if growth '
-               'decelerates while the multiple stays rich.',
-        weights={
-            'REVENUE_CAGR_3Y': 1.2, 'EARNINGS_GROWTH_1Y': 1.0,
-            'EARNINGS_YIELD': 1.0, 'ROIC': 0.8, 'GROSS_PROFITABILITY': 0.6,
-            'DEBT_TO_EQUITY': 0.4,
-        },
-    ),
-    'multifactor': Strategy(
-        key='multifactor', name='Multi-Factor Composite', horizon='long',
-        description='Balanced value, quality, growth and momentum blend.',
-        thesis='Diversify across factor premia rather than betting on one.',
-        weights={
-            'EARNINGS_YIELD': 1.0, 'BOOK_TO_MARKET': 0.6, 'FCF_YIELD': 0.8,
-            'ROIC': 1.0, 'GROSS_PROFITABILITY': 0.8,
-            'REVENUE_CAGR_3Y': 0.8, 'MOM_12_1': 1.0, 'ACCRUALS': 0.4,
-        },
     ),
     'quality_momentum': Strategy(
         key='quality_momentum', name='Quality Momentum', horizon='long',
@@ -167,34 +185,28 @@ LONG_TERM = {
         thesis='Quality and momentum are historically uncorrelated, so combining '
                'them diversifies the drawdowns of each; exit when profitability '
                'deteriorates or the long-term trend breaks.',
+        # RETURN_6M, MOM_6_1 and PCT_VS_MA200 measure the same move — pairwise
+        # rank correlations of 0.88 and 0.87 on live data. Weighting all three
+        # put two-thirds of the strategy on one signal counted three times,
+        # which is a concentrated momentum bet wearing a diversified label.
+        # One medium-horizon measure, one short, and the quality overlay.
         weights={
-            'GROSS_PROFITABILITY': 1.2, 'ROIC': 1.0, 'ACCRUALS': 0.6,
-            'MOM_12_1': 1.2, 'MOM_VOL_ADJ': 0.8, 'PCT_VS_MA200': 0.6,
-            'DEBT_TO_EQUITY': 0.4,
+            'RETURN_6M': 1.5, 'RETURN_1M': 0.8,
+            'ROIC': 0.8, 'ACCRUALS': 0.6, 'NET_DEBT_TO_EQUITY': 0.4,
         },
         filters={'min_market_cap': 2e9},
     ),
-    'shareholder_yield': Strategy(
-        key='shareholder_yield', name='Total Shareholder Yield', horizon='long',
-        description='All cash returned to owners — dividends plus buybacks.',
-        thesis='Buybacks and dividends are the same act with different tax '
-               'treatment; judging only the dividend misses half the return.',
-        weights={
-            'DIVIDEND_YIELD': 1.0, 'BUYBACK_YIELD': 1.0, 'FCF_YIELD': 1.2,
-            'PAYOUT_RATIO': 0.6, 'ROIC': 0.6, 'DEBT_TO_EQUITY': 0.6,
-        },
-    ),
-    'defensive_value': Strategy(
-        key='defensive_value', name='Defensive Value', horizon='long',
-        description='Cheap, profitable and low-volatility — value without the drama.',
-        thesis='Cheapness alone selects distressed names; adding a quality and '
-               'volatility screen keeps the discount and drops the value traps.',
-        weights={
-            'EARNINGS_YIELD': 1.0, 'FCF_YIELD': 1.0, 'BOOK_TO_MARKET': 0.6,
-            'PIOTROSKI_F': 1.0, 'VOL_1Y': 0.8, 'MAX_DD_1Y': 0.6,
-            'DEBT_TO_EQUITY': 0.8, 'ACCRUALS': 0.5,
-        },
-        neutralize='neutralize',
+    'style_factors': Strategy(
+        key='style_factors', name='Style Factors (Value / Growth / Momentum)',
+        horizon='long',
+        description='Equal-weighted Value, Growth and Momentum, where you choose '
+                    'the factor standing in for each style.',
+        thesis='Rather than assert one definition of each style, expose the '
+               'choice: the proxy for Value, Growth and Momentum is picked on '
+               'the Screen tab and every combination is directly backtestable. '
+               'The three styles are weighted equally so the comparison is '
+               'between proxies, not between weightings.',
+        weights={f: 1.0 for f in DEFAULT_STYLE_PROXIES.values()},
     ),
     'insider_conviction': Strategy(
         key='insider_conviction', name='Insider Conviction', horizon='long',
@@ -203,10 +215,25 @@ LONG_TERM = {
         thesis='Open-market insider purchases are a costly, informed signal; '
                'pairing them with quality avoids buying a falling knife just '
                'because someone bought the dip.',
+        # INSIDER_CLUSTER correlates 0.98 with INSIDER_NET_BUY — they are one
+        # signal, and weighting both put 40% of the strategy on it twice. Only
+        # the net-buy measure is kept, and at a weight the evidence supports:
+        # this is the one screen whose defining data starts in August 2024, so
+        # it has two years of history and cannot be tested further back.
         weights={
-            'INSIDER_NET_BUY': 1.2, 'INSIDER_CLUSTER': 1.0,
+            'INSIDER_NET_BUY': 1.5,
             'ROIC': 1.0, 'FCF_YIELD': 1.0, 'EARNINGS_YIELD': 0.8,
-            'DEBT_TO_EQUITY': 0.5,
+            'NET_DEBT_TO_EQUITY': 0.5,
+        },
+    ),
+    'shareholder_yield': Strategy(
+        key='shareholder_yield', name='Total Shareholder Yield', horizon='long',
+        description='All cash returned to owners — dividends plus buybacks.',
+        thesis='Buybacks and dividends are the same act with different tax '
+               'treatment; judging only the dividend misses half the return.',
+        weights={
+            'DIVIDEND_YIELD': 1.0, 'BUYBACK_YIELD': 1.0, 'FCF_YIELD': 1.2,
+            'PAYOUT_RATIO': 0.6, 'ROIC': 0.6, 'NET_DEBT_TO_EQUITY': 0.6,
         },
     ),
 }
@@ -323,7 +350,7 @@ ALL_STRATEGIES: dict[str, Strategy] = {**LONG_TERM, **MID_TERM}
 # LOOKUP
 # ─────────────────────────────────────────────
 
-def get(key: str) -> Strategy:
+def get(key: str | Strategy) -> Strategy:
     """
     Resolve a strategy key, built-in or user-defined.
 
@@ -332,7 +359,15 @@ def get(key: str) -> Strategy:
     cycle. Doing it here rather than at every call site means the engine, the
     backtester, the CLI and the report builder all gained custom-strategy
     support without changing a line.
+
+    An already-built `Strategy` passes straight through, which is what lets a
+    caller run a parameterised strategy — the style-factor screen, whose
+    weights depend on dropdown choices — through the identical code path as a
+    named one, backtest included.
     """
+    if isinstance(key, Strategy):
+        return key
+
     if key in ALL_STRATEGIES:
         return ALL_STRATEGIES[key]
 
@@ -354,10 +389,26 @@ def by_horizon(horizon: str) -> dict[str, Strategy]:
     return {k: s for k, s in ALL_STRATEGIES.items() if s.horizon == horizon}
 
 
-def options(horizon: str | None = None) -> list[dict]:
-    """Dropdown options for the UI."""
+def options(horizon: str | None = None, grouped: bool = False) -> list[dict]:
+    """Dropdown options for the UI.
+
+    With ``grouped=True``, returns option-groups keyed by horizon label so
+    Dash renders them under section headers.
+    """
     pool = ALL_STRATEGIES if horizon is None else by_horizon(horizon)
-    return [{'label': s.name, 'value': k} for k, s in sorted(pool.items())]
+    if not grouped or horizon is not None:
+        return [{'label': s.name, 'value': k} for k, s in sorted(pool.items())]
+
+    groups = []
+    for hz_key in ('long', 'mid'):
+        bucket = {k: s for k, s in pool.items() if s.horizon == hz_key}
+        if bucket:
+            groups.append({
+                'label': HORIZONS[hz_key]['label'],
+                'value': [{'label': s.name, 'value': k}
+                          for k, s in sorted(bucket.items())],
+            })
+    return groups
 
 
 def summary_table() -> list[dict]:

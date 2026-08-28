@@ -39,8 +39,8 @@ FLOW_CONCEPTS = {
 # Stocks are instantaneous balances.
 STOCK_CONCEPTS = {
     'assets', 'current_assets', 'liabilities', 'current_liabilities',
-    'equity', 'cash', 'long_term_debt', 'short_term_debt', 'inventory',
-    'shares_diluted', 'shares_basic',
+    'equity', 'cash', 'long_term_debt', 'short_term_debt', 'total_debt',
+    'inventory', 'shares_diluted', 'shares_basic',
 }
 
 # Day-count windows for classifying a fact's span.
@@ -65,6 +65,153 @@ def _classify_duration(days: float) -> str:
 _GROUPS_KEY = '\x00concept_groups'
 
 
+_TAG_AUDIT_KEY = '\x00tag_audit'
+
+
+# ─────────────────────────────────────────────
+# BATCH PRE-COMPUTATION
+# ─────────────────────────────────────────────
+
+def _batch_concept_groups(
+    facts_all: pd.DataFrame,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Group facts by (ticker, concept) with single-tag selection, in one pass.
+
+    Returns (groups_by_ticker, audits_by_ticker) where each value is a dict
+    keyed by concept name.
+    """
+    has_tag = 'tag' in facts_all.columns
+
+    # Pre-compute the best tag per (ticker, concept) in bulk rather than
+    # calling _single_tag 10 000 times with per-group groupby('tag').agg().
+    best_tags: dict[tuple, str] = {}
+    if has_tag:
+        tag_stats = (
+            facts_all
+            .assign(_abs_val=facts_all['val'].abs())
+            .groupby(['ticker', 'concept', 'tag'], sort=False)
+            .agg(newest=('filed', 'max'), scale=('_abs_val', 'median'))
+            .reset_index()
+        )
+        for (ticker, concept), ts in tag_stats.groupby(
+                ['ticker', 'concept'], sort=False):
+            if len(ts) <= 1:
+                best_tags[(ticker, concept)] = ts.iloc[0]['tag']
+                continue
+            cutoff = ts['newest'].max() - pd.Timedelta(days=365)
+            current = ts[ts['newest'] >= cutoff]
+            if current.empty:
+                current = ts
+            best_tags[(ticker, concept)] = current.loc[
+                current['scale'].idxmax(), 'tag']
+
+    groups: dict[str, dict] = {}
+    audits: dict[str, dict] = {}
+    for (ticker, concept), g in facts_all.groupby(
+            ['ticker', 'concept'], sort=False):
+        if has_tag and (ticker, concept) in best_tags:
+            best = best_tags[(ticker, concept)]
+            if g['tag'].nunique() > 1:
+                g = g[g['tag'] == best]
+            selected = g
+        else:
+            selected = g
+        groups.setdefault(ticker, {})[concept] = selected
+        if has_tag and not selected.empty:
+            audits.setdefault(ticker, {})[concept] = selected.iloc[0]['tag']
+    return groups, audits
+
+
+def _batch_flow_quarters(
+    concept_groups: dict[str, dict],
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """Compute quarterly flows for all flow concepts across all tickers.
+
+    Uses vectorized pandas operations on the concatenated per-concept data
+    instead of calling ``_quarterly_flows_uncached`` 5 000 times.
+
+    Returns ``{concept: {ticker: quarterly_df}}``.
+    """
+    result: dict[str, dict[str, pd.DataFrame]] = {}
+
+    for concept in FLOW_CONCEPTS:
+        parts = []
+        for ticker, cgroups in concept_groups.items():
+            if concept in cgroups:
+                df = cgroups[concept]
+                if not df.empty:
+                    parts.append(df)
+        if not parts:
+            result[concept] = {}
+            continue
+
+        df = pd.concat(parts, ignore_index=True)
+        df['days'] = (df['period_end'] - df['period_start']).dt.days
+        df['dur'] = df['days'].map(_classify_duration)
+        df = (df.sort_values('filed', kind='stable')
+                .drop_duplicates(
+                    subset=['ticker', 'period_start', 'period_end'],
+                    keep='last'))
+
+        quarters = df[df['dur'] == 'Q'][
+            ['ticker', 'period_start', 'period_end',
+             'filed', 'val', 'fy', 'fp']].copy()
+
+        cumulative = df[df['dur'].isin(['H', '9M', 'A'])].sort_values(
+            ['ticker', 'period_start', 'period_end'])
+        if not cumulative.empty:
+            cumulative = cumulative.copy()
+            g = cumulative.groupby(['ticker', 'period_start'], sort=False)
+            cumulative['prev_end'] = g['period_end'].shift(1)
+            cumulative['prev_val'] = g['val'].shift(1).fillna(0)
+            cumulative['prev_filed'] = g['filed'].shift(1)
+            cumulative['span'] = (
+                cumulative['period_end'] - cumulative['prev_end']).dt.days
+
+            mask = (cumulative['prev_end'].notna()
+                    & cumulative['span'].between(
+                        QUARTER_DAYS[0], QUARTER_DAYS[1]))
+            if mask.any():
+                derived = cumulative[mask].copy()
+                derived['period_start'] = derived['prev_end']
+                derived['val'] = derived['val'] - derived['prev_val']
+                derived['filed'] = derived[['filed', 'prev_filed']].max(axis=1)
+                quarters = pd.concat(
+                    [quarters,
+                     derived[['ticker', 'period_start', 'period_end',
+                              'filed', 'val', 'fy', 'fp']]],
+                    ignore_index=True)
+
+        if quarters.empty:
+            result[concept] = {}
+            continue
+
+        quarters = (
+            quarters.sort_values(['ticker', 'period_end', 'filed'])
+            .drop_duplicates(subset=['ticker', 'period_end'], keep='last')
+            .sort_values(['ticker', 'period_end'])
+            .reset_index(drop=True))
+
+        # Suspect quarter detection: flag derived values that are implausibly
+        # large relative to the same quarter a year ago.
+        if len(quarters) >= 5:
+            prev_val = quarters.groupby('ticker', sort=False)['val'].shift(4)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratio = (quarters['val'] / prev_val).abs()
+            sign_flip = (quarters['val'] > 0) != (prev_val > 0)
+            suspect = (ratio > 10) & sign_flip & prev_val.notna() & (prev_val != 0)
+            if suspect.any():
+                quarters.loc[suspect, 'val'] = np.nan
+
+        cols = ['period_start', 'period_end', 'filed', 'val', 'fy', 'fp']
+        result[concept] = {
+            t: g[cols].reset_index(drop=True)
+            for t, g in quarters.groupby('ticker', sort=False)
+        }
+
+    return result
+
+
 def _concept_frame(facts: pd.DataFrame, concept: str,
                    memo: dict | None = None) -> pd.DataFrame:
     """
@@ -79,9 +226,15 @@ def _concept_frame(facts: pd.DataFrame, concept: str,
 
     groups = memo.get(_GROUPS_KEY)
     if groups is None:
-        groups = {c: _single_tag(g)
-                  for c, g in facts.groupby('concept', sort=False)}
+        audit = {}
+        groups = {}
+        for c, g in facts.groupby('concept', sort=False):
+            selected = _single_tag(g)
+            groups[c] = selected
+            if 'tag' in selected.columns and not selected.empty:
+                audit[c] = selected.iloc[0]['tag']
         memo[_GROUPS_KEY] = groups
+        memo[_TAG_AUDIT_KEY] = audit
     return groups.get(concept, facts.iloc[:0])
 
 
@@ -207,6 +360,24 @@ def _quarterly_flows_uncached(facts: pd.DataFrame, concept: str,
                         .drop_duplicates(subset=['period_end'], keep='last')
                         .sort_values('period_end')
                         .reset_index(drop=True))
+
+    # Flag derived quarters that are implausibly large relative to the same
+    # quarter a year ago — a likely sign of misaligned restatements rather
+    # than real economic change.
+    if len(quarters) >= 5:
+        vals = quarters['val'].to_numpy()
+        for i in range(4, len(quarters)):
+            prev = vals[i - 4]
+            curr = vals[i]
+            if prev == 0 or not np.isfinite(prev) or not np.isfinite(curr):
+                continue
+            ratio = abs(curr / prev)
+            if ratio > 10 and (prev > 0) != (curr > 0):
+                log.debug('suspect derived quarter at idx %d: '
+                          'curr=%.2g prev=%.2g (%.1fx, sign flip) — '
+                          'possible restatement artefact', i, curr, prev, ratio)
+                quarters.loc[quarters.index[i], 'val'] = np.nan
+
     return quarters
 
 
@@ -270,7 +441,7 @@ def _fresh_share_value(facts: pd.DataFrame, concept: str, as_of,
 # from EPS agrees within this band. Measured agreement on healthy filers is
 # 0.95-1.00x, so 25% is loose enough for rounding and share-class rounding
 # while still catching an order-of-magnitude error.
-SHARE_CROSSCHECK_BAND = (0.75, 1.33)
+SHARE_CROSSCHECK_BAND = (0.70, 1.45)
 
 
 def implied_share_count(facts: pd.DataFrame, memo: dict | None = None) -> float:
@@ -370,6 +541,22 @@ def value_n_periods_ago(facts: pd.DataFrame, concept: str, years: int,
 # meaningless rather than merely large.
 MIN_EQUITY_TO_ASSETS = 0.01
 
+# Net income below this share of revenue is too small to divide by: the ratio
+# it produces says more about how close the denominator got to zero than about
+# the business.
+MIN_INCOME_TO_REVENUE = 0.005
+
+
+def _meaningful_income(net_income: float, revenue: float) -> float:
+    """Net income, or NaN when it is too near zero to be a denominator."""
+    if not np.isfinite(_as_float(net_income)):
+        return np.nan
+    if not np.isfinite(_as_float(revenue)) or revenue <= 0:
+        return float(net_income)
+    if abs(float(net_income)) < MIN_INCOME_TO_REVENUE * float(revenue):
+        return np.nan
+    return float(net_income)
+
 
 def _invested_capital(equity: float, debt: float) -> float:
     """Equity + debt, or NaN when equity is not usable."""
@@ -399,8 +586,80 @@ def _meaningful_equity(equity: float, assets: float) -> float:
     return equity
 
 
+# Counts scale up with a forward split; per-share amounts scale down by the
+# same ratio. Both have to move together or the cross-check between them —
+# reported shares against net income / EPS — reads the split as a units error
+# and rejects a perfectly good share count.
+SHARE_CONCEPTS = ('shares_diluted', 'shares_basic', 'shares_outstanding')
+PER_SHARE_CONCEPTS = ('eps_diluted', 'eps_basic')
+
+
+def adjust_shares_for_splits(facts: pd.DataFrame,
+                             splits: pd.DataFrame) -> pd.DataFrame:
+    """
+    Restate filed share counts onto the current split basis.
+
+    Price history is retroactively restated after every split — a 2018 bar is
+    quoted in today's shares. SEC share counts are not: they are whatever was
+    filed at the time. Multiplying the two together understates the market cap
+    of any company that has since split, by exactly the split ratio.
+
+    Lam Research showed a $3.1B market cap in January 2018 against ~$30B
+    actual, because a 165M share count filed then was priced at a close that
+    had been divided by ten for a 2024 split. That produced a 66% earnings
+    yield — a P/E of 1.5 — and made it the top-ranked name in every
+    valuation-driven strategy at every historical date.
+
+    The correction has no look-ahead: shares and price are both moved onto the
+    same basis, and their product — the market capitalisation — is unchanged by
+    the choice of basis. What it removes is a bias *toward* companies that
+    later split, which is a bias toward companies whose price later rose.
+    """
+    if facts.empty or splits is None or splits.empty:
+        return facts
+
+    is_share = facts['concept'].isin(SHARE_CONCEPTS)
+    is_per_share = facts['concept'].isin(PER_SHARE_CONCEPTS)
+    if not (is_share.any() or is_per_share.any()):
+        return facts
+
+    splits_clean = splits[
+        splits['ratio'].apply(lambda r: np.isfinite(r) and r > 0)
+    ].copy()
+    if splits_clean.empty:
+        return facts
+
+    facts = facts.copy()
+    need_adj = is_share | is_per_share
+    adj_rows = facts.loc[need_adj, ['ticker', 'filed']].copy()
+    adj_rows['filed'] = pd.to_datetime(adj_rows['filed'])
+    adj_rows['_idx'] = adj_rows.index
+
+    sp = splits_clean[['ticker', 'date', 'ratio']].copy()
+    sp['date'] = pd.to_datetime(sp['date'])
+
+    merged = adj_rows.merge(sp, on='ticker', how='inner')
+    merged = merged[merged['filed'] < merged['date']]
+
+    if merged.empty:
+        return facts
+
+    cum_factors = merged.groupby('_idx')['ratio'].prod()
+    up_idx = cum_factors.index.intersection(facts.index[is_share])
+    down_idx = cum_factors.index.intersection(facts.index[is_per_share])
+    if not up_idx.empty:
+        facts.loc[up_idx, 'val'] *= cum_factors[up_idx]
+    if not down_idx.empty:
+        facts.loc[down_idx, 'val'] /= cum_factors[down_idx]
+    return facts
+
+
 def build_fundamentals(tickers: list[str], as_of: date | str,
-                       facts_all: pd.DataFrame | None = None) -> pd.DataFrame:
+                       facts_all: pd.DataFrame | None = None,
+                       splits: pd.DataFrame | None = None,
+                       _prev_result: pd.DataFrame | None = None,
+                       _changed_tickers: set[str] | None = None,
+                       _splits_applied: bool = False) -> pd.DataFrame:
     """
     One row per ticker of point-in-time fundamentals, including Piotroski F.
 
@@ -416,45 +675,121 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
     if facts_all.empty:
         return pd.DataFrame()
 
+    if splits is None:
+        from data import yahoo
+        try:
+            splits = yahoo.split_factors(sorted(facts_all['ticker'].unique()))
+        except Exception as exc:                   # noqa: BLE001
+            log.debug('split lookup failed (%s) — share counts left as filed', exc)
+            splits = pd.DataFrame()
+    if not _splits_applied:
+        facts_all = adjust_shares_for_splits(facts_all, splits)
+
+    # Proxy statements (DEF 14A, PRE 14A, etc.) sometimes report financial
+    # figures in thousands while 10-K/10-Q use full-scale dollars. Because
+    # _latest_filed keeps the most recently filed row per period, a proxy filed
+    # after a 10-K silently replaces $3.5B with $3,511 — corrupting every
+    # derived ratio. ANET, PCG, ED, SCHW, STZ were all affected.
+    if 'form' in facts_all.columns:
+        _FINANCIAL_FORMS = {'10-K', '10-Q', '10-K/A', '10-Q/A', '10-KT', '10-QT',
+                            '20-F', '20-F/A'}
+        before = len(facts_all)
+        facts_all = facts_all[facts_all['form'].isin(_FINANCIAL_FORMS)]
+        dropped = before - len(facts_all)
+        if dropped:
+            log.debug('excluded %d non-financial-statement facts (proxy/8-K/etc.)', dropped)
+
+    # The share crosscheck (reported vs EPS-implied) breaks for tickers that
+    # split within the TTM window: the quarterly EPS decomposition crosses a
+    # split boundary, making the TTM EPS — and therefore the implied count —
+    # unreliable. BKNG's 25:1 (Apr 2026) produced a 2.65x ratio and lost its
+    # market cap; DELL's 1.8x (2018) landed at 1.39x, just outside the band.
+    _recent_split_tickers: set[str] = set()
+    if splits is not None and not splits.empty:
+        cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=400)
+        recent = splits[pd.to_datetime(splits['date']) >= cutoff]
+        _recent_split_tickers = set(recent['ticker'].unique())
+
+    # Incremental mode: only recompute tickers with new filings.
+    carry = pd.DataFrame()
+    if _prev_result is not None and _changed_tickers is not None:
+        available = set(facts_all['ticker'].unique())
+        recompute = {t for t in available
+                     if t in _changed_tickers or t not in _prev_result.index}
+        carry_idx = [t for t in available
+                     if t not in recompute and t in _prev_result.index]
+        if carry_idx:
+            carry = _prev_result.loc[carry_idx]
+        if not recompute:
+            return carry if not carry.empty else pd.DataFrame()
+        facts_all = facts_all[facts_all['ticker'].isin(recompute)]
+        log.debug('incremental build_fundamentals: %d recompute, %d carry',
+                  len(recompute), len(carry_idx))
+
+    # Batch pre-computation: one pass over the data replaces thousands of
+    # small per-ticker groupby + sort + dedup operations.
+    all_groups, all_audits = _batch_concept_groups(facts_all)
+    all_qflows = _batch_flow_quarters(all_groups)
+
+    # A dummy facts frame that functions fall back to when a concept is not
+    # in the memo. All concepts are pre-populated, so this is never actually
+    # read — but the helper signatures require it.
+    _empty = facts_all.iloc[:0]
+
     rows = []
-    for ticker, facts in facts_all.groupby('ticker'):
-        memo: dict = {}
-        rev = ttm(facts, 'revenue', memo=memo)
-        ni = ttm(facts, 'net_income', memo=memo)
-        op_inc = ttm(facts, 'operating_income', memo=memo)
-        gp = ttm(facts, 'gross_profit', memo=memo)
-        ocf = ttm(facts, 'operating_cash_flow', memo=memo)
-        capex_raw = ttm(facts, 'capex', memo=memo)
+    for ticker in sorted(all_groups):
+        memo: dict = {
+            _GROUPS_KEY: all_groups[ticker],
+            _TAG_AUDIT_KEY: all_audits.get(ticker, {}),
+        }
+        for fc in FLOW_CONCEPTS:
+            qf = all_qflows.get(fc, {}).get(ticker)
+            if qf is not None:
+                memo[fc] = qf
+
+        f = _empty
+        rev = ttm(f, 'revenue', memo=memo)
+        ni = ttm(f, 'net_income', memo=memo)
+        op_inc = ttm(f, 'operating_income', memo=memo)
+        gp = ttm(f, 'gross_profit', memo=memo)
+        ocf = ttm(f, 'operating_cash_flow', memo=memo)
+        capex_raw = ttm(f, 'capex', memo=memo)
         capex = abs(capex_raw) if np.isfinite(capex_raw) else np.nan
-        buybacks = abs(ttm(facts, 'buybacks', memo=memo))
-        divs = abs(ttm(facts, 'dividends_paid', memo=memo))
+        buybacks = abs(ttm(f, 'buybacks', memo=memo))
+        divs = abs(ttm(f, 'dividends_paid', memo=memo))
 
-        assets = latest_stock(facts, 'assets', memo)
-        equity = latest_stock(facts, 'equity', memo)
-        cash = latest_stock(facts, 'cash', memo)
-        ltd = latest_stock(facts, 'long_term_debt', memo)
-        std = latest_stock(facts, 'short_term_debt', memo)
-        cur_a = latest_stock(facts, 'current_assets', memo)
-        cur_l = latest_stock(facts, 'current_liabilities', memo)
-        shares = share_count(facts, memo, as_of=as_of)
+        assets = latest_stock(f, 'assets', memo)
+        equity = latest_stock(f, 'equity', memo)
+        cash = latest_stock(f, 'cash', memo)
+        ltd = latest_stock(f, 'long_term_debt', memo)
+        std = latest_stock(f, 'short_term_debt', memo)
+        cur_a = latest_stock(f, 'current_assets', memo)
+        cur_l = latest_stock(f, 'current_liabilities', memo)
+        shares = share_count(f, memo, as_of=as_of,
+                             crosscheck=ticker not in _recent_split_tickers)
 
-        debt = np.nansum([ltd if np.isfinite(ltd) else 0,
-                          std if np.isfinite(std) else 0])
-        debt = debt if debt > 0 else np.nan
+        tot = latest_stock(f, 'total_debt', memo)
+        if np.isfinite(tot) and tot > 0:
+            debt = tot
+        else:
+            debt = np.nansum([ltd if np.isfinite(ltd) else 0,
+                              std if np.isfinite(std) else 0])
+            debt = debt if debt > 0 else np.nan
         fcf = (ocf - capex) if (np.isfinite(ocf) and np.isfinite(capex)) else np.nan
 
         roa = _safe_div(ni, assets)
+        eps = _safe_div(ni, shares)
 
         # ── Piotroski F-Score (shared memo avoids re-deriving TTMs) ──
-        rev_prev = value_n_periods_ago(facts, 'revenue', 1, memo)
-        ni_prev = value_n_periods_ago(facts, 'net_income', 1, memo)
-        gp_prev = value_n_periods_ago(facts, 'gross_profit', 1, memo)
-        assets_prev = value_n_periods_ago(facts, 'assets', 1, memo)
-        ltd_prev = value_n_periods_ago(facts, 'long_term_debt', 1, memo)
-        ca_prev = value_n_periods_ago(facts, 'current_assets', 1, memo)
-        cl_prev = value_n_periods_ago(facts, 'current_liabilities', 1, memo)
-        sh = latest_stock(facts, 'shares_diluted', memo)
-        sh_prev = value_n_periods_ago(facts, 'shares_diluted', 1, memo)
+        rev_prev = value_n_periods_ago(f, 'revenue', 1, memo)
+        ni_prev = value_n_periods_ago(f, 'net_income', 1, memo)
+        gp_prev = value_n_periods_ago(f, 'gross_profit', 1, memo)
+        assets_prev = value_n_periods_ago(f, 'assets', 1, memo)
+        ltd_prev = value_n_periods_ago(f, 'long_term_debt', 1, memo)
+        ca_prev = value_n_periods_ago(f, 'current_assets', 1, memo)
+        cl_prev = value_n_periods_ago(f, 'current_liabilities', 1, memo)
+        sh = latest_stock(f, 'shares_diluted', memo)
+        sh_prev = value_n_periods_ago(f, 'shares_diluted', 1, memo)
         roa_prev = _safe_div(ni_prev, assets_prev)
 
         pf_tests = [
@@ -470,6 +805,17 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         ]
         pf_score = float(sum(1 for t in pf_tests if t is True or t is np.True_))
 
+        tag_audit = memo.get(_TAG_AUDIT_KEY, {})
+        rev_tag = tag_audit.get('revenue', '')
+        ni_tag = tag_audit.get('net_income', '')
+
+        # last_filed / last_period_end from the concept groups
+        cg = all_groups[ticker]
+        all_filed = [g['filed'].max() for g in cg.values()
+                     if not g.empty and 'filed' in g.columns]
+        all_pe = [g['period_end'].max() for g in cg.values()
+                  if not g.empty and 'period_end' in g.columns]
+
         rows.append({
             'ticker': ticker,
             'revenue_ttm': rev, 'net_income_ttm': ni, 'operating_income_ttm': op_inc,
@@ -478,6 +824,7 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
             'assets': assets, 'equity': equity, 'cash': cash, 'debt': debt,
             'current_assets': cur_a, 'current_liabilities': cur_l,
             'shares_diluted': shares,
+            'revenue_tag': rev_tag, 'net_income_tag': ni_tag,
             'gross_margin': _safe_div(gp, rev),
             'operating_margin': _safe_div(op_inc, rev),
             'net_margin': _safe_div(ni, rev),
@@ -488,21 +835,36 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
             'gross_profitability': _safe_div(gp, assets),
             'asset_turnover': _safe_div(rev, assets),
             'debt_to_equity': _safe_div(debt, _meaningful_equity(equity, assets)),
+            'net_debt_to_equity': _safe_div(
+                debt - cash if np.isfinite(debt) and np.isfinite(cash)
+                else np.nan,
+                _meaningful_equity(equity, assets)),
             'current_ratio': _safe_div(cur_a, cur_l),
+            'fcf_conversion': _safe_div(fcf, _meaningful_income(ni, rev)),
+            'eps': eps,
             'accruals': _safe_div(ni - ocf if np.isfinite(ni) and np.isfinite(ocf)
                                   else np.nan, assets),
             'revenue_growth_1y': _growth(rev, rev_prev),
             'revenue_cagr_3y': _cagr(
-                rev, value_n_periods_ago(facts, 'revenue', 3, memo), 3),
+                rev, value_n_periods_ago(f, 'revenue', 3, memo), 3),
             'earnings_growth_1y': _growth(ni, ni_prev),
             'equity_cagr_3y': _cagr(
-                equity, value_n_periods_ago(facts, 'equity', 3, memo), 3),
+                equity, value_n_periods_ago(f, 'equity', 3, memo), 3),
+            'eps_cagr_3y': _cagr(
+                eps,
+                _safe_div(value_n_periods_ago(f, 'net_income', 3, memo),
+                          value_n_periods_ago(f, 'shares_diluted', 3, memo)),
+                3),
             'piotroski_f': pf_score,
-            'last_filed': facts['filed'].max(),
-            'last_period_end': facts['period_end'].max(),
+            'last_filed': max(all_filed) if all_filed else pd.NaT,
+            'last_period_end': max(all_pe) if all_pe else pd.NaT,
         })
 
-    return pd.DataFrame(rows).set_index('ticker')
+    result = pd.DataFrame(rows).set_index('ticker') if rows else pd.DataFrame()
+    if not carry.empty:
+        parts = [p for p in (carry, result) if not p.empty]
+        return pd.concat(parts) if parts else pd.DataFrame()
+    return result
 
 
 # ─────────────────────────────────────────────

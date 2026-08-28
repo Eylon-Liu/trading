@@ -80,9 +80,13 @@ EVENT_PATTERNS = {
 
 ANALYST_DIRECTION = [
     ('upgrade', r'\b(upgrade[sd]?|rais(?:e|es|ed) (?:price )?target|'
-                r'to (?:buy|overweight|outperform))\b'),
-    ('downgrade', r'\b(downgrade[sd]?|cut[s]? (?:price )?target|'
-                  r'to (?:sell|underweight|underperform))\b'),
+                r'to (?:buy|overweight|outperform|strong.buy))\b'),
+    ('downgrade', r'\b(downgrade[sd]?|'
+                  r'(?:cut[s]?|lower(?:s|ed)?|reduc(?:e[sd]?)) (?:price )?target|'
+                  r'to (?:sell|underweight|underperform)|'
+                  r'(?:downgrade[sd]?|cut[s]?) .{0,30}'
+                  r'(?:hold|neutral|equal.?weight|market.?perform|'
+                  r'moderate.?buy|sector.?perform))\b'),
 ]
 
 # Money and percentage figures worth capturing alongside a guidance change.
@@ -206,7 +210,8 @@ def aggregate(extractions: list[Extraction]) -> dict:
     from collections import Counter
     events = Counter(e for ex in extractions for e in ex.events)
     guidance = Counter(ex.guidance for ex in extractions if ex.guidance)
-    analyst = Counter(ex.analyst_action for ex in extractions if ex.analyst_action)
+    analyst = Counter({'upgrade': 0, 'downgrade': 0})
+    analyst.update(ex.analyst_action for ex in extractions if ex.analyst_action)
     notes: list[str] = []
     for ex in extractions:
         for n in ex.direction_notes:

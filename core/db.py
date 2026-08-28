@@ -65,6 +65,20 @@ index_members = Table(
 # MARKET DATA
 # ─────────────────────────────────────────────
 
+# Stock splits, needed to put share counts on the same basis as prices.
+#
+# Price history from the provider is restated after every split, so a 2018 bar
+# is quoted in today's shares. SEC share counts are not restated — they are
+# whatever was filed at the time. Multiplying one by the other understates the
+# market cap of any company that has since split, by exactly the split ratio,
+# and every yield built on that market cap is overstated by the same factor.
+splits = Table(
+    'splits', metadata,
+    Column('ticker', String, primary_key=True),
+    Column('date', Date, primary_key=True),
+    Column('ratio', Float),               # 10.0 for a 10-for-1 forward split
+)
+
 prices = Table(
     'prices', metadata,
     Column('ticker', String, primary_key=True),
@@ -383,6 +397,13 @@ def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
     Uses the dialect's native upsert. Restatement rows are *not* overwrites —
     they differ in `filed`, which is part of the sec_facts key — so history
     accumulates rather than being clobbered.
+
+    On conflict, only the columns actually supplied are updated. Updating every
+    non-key column instead meant a partial write erased the rest of the row:
+    marking a report as emailed with {report_id, emailed_at} set its path, kind
+    and created_at to NULL, and the report then showed in the history with no
+    file and no date. A caller that names a column intends to change it; one
+    that omits it does not intend to erase it.
     """
     rows = [r for r in rows if r]
     if not rows:
@@ -408,9 +429,13 @@ def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
                 conn.execute(table.insert(), batch)
             else:
                 stmt = _insert(table).values(batch)
+                # Only what this batch actually carries. A column absent from
+                # every row in the batch is left alone rather than nulled.
+                supplied = {k for r in batch for k in r}
                 update_cols = {
                     c.name: stmt.excluded[c.name]
-                    for c in table.columns if c.name not in pk_cols
+                    for c in table.columns
+                    if c.name not in pk_cols and c.name in supplied
                 }
                 if update_cols:
                     stmt = stmt.on_conflict_do_update(

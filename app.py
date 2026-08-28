@@ -15,6 +15,7 @@ what makes nightly ingest and scheduled reports possible.
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -110,8 +111,18 @@ def _startup_checks() -> None:
 
 if __name__ == '__main__':
     _startup_checks()
+    _port = int(os.environ.get('PORT', 8050))
+    _host = os.environ.get('HOST', '0.0.0.0')
     print(f'\n  📊 Quant Research Terminal')
-    print(f'  ➜  http://localhost:8050')
+    print(f'  ➜  http://localhost:{_port}')
+    if _host == '0.0.0.0':
+        import socket
+        _ip = socket.gethostbyname(socket.gethostname())
+        _local = socket.gethostname()
+        if not _local.endswith('.local'):
+            _local += '.local'
+        print(f'  ➜  http://{_local}:{_port}  (stable hostname)')
+        print(f'  ➜  http://{_ip}:{_port}  (LAN IP / Tailscale)')
     print(f'  ➜  database: {config.DATABASE_URL}')
     print(f'  ➜  headless equivalent: python cli.py --help\n')
-    app.run(debug=False, port=8050, host='127.0.0.1')
+    app.run(debug=False, port=_port, host=_host)

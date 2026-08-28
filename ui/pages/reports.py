@@ -8,10 +8,9 @@ from pathlib import Path
 
 import dash_bootstrap_components as dbc
 import pandas as pd
-from dash import Input, Output, State, callback, dcc, html, no_update
+from dash import ALL, Input, Output, State, callback, ctx, dcc, html, no_update
 
 import config
-from quant import strategies as ST
 from reports import builder as RB
 from reports import email as MAILER
 from ui import components as C
@@ -23,16 +22,17 @@ CRON_HELP = """\
 # Nightly ingest at 6pm, daily brief at 7am (crontab -e)
 0 18 * * 1-5  cd "{root}" && /usr/bin/python3 cli.py ingest --index SPY --full
 0  7 * * 1-5  cd "{root}" && /usr/bin/python3 cli.py report --kind daily \\
-                  --strategy quality_value --email you@example.com
+                  --email you@example.com
 
 # Monthly review on the 1st
 0  8 1 * *    cd "{root}" && /usr/bin/python3 cli.py report --kind monthly \\
-                  --strategy quality_value --email you@example.com
+                  --email you@example.com
 """
 
 
 def layout() -> html.Div:
     return html.Div([
+        dcc.Store(id='rep-strategy', data='buffett'),
         C.card('📄 Generate a report', [
             dbc.Row([
                 dbc.Col([
@@ -41,25 +41,20 @@ def layout() -> html.Div:
                                  options=[{'label': 'Daily brief', 'value': 'daily'},
                                           {'label': 'Monthly review', 'value': 'monthly'}],
                                  value='daily', clearable=False),
-                ], lg=3, md=6, className='mb-3'),
-                dbc.Col([
-                    C.label('Strategy'),
-                    dcc.Dropdown(id='rep-strategy', options=ST.options(),
-                                 value='quality_value', clearable=False),
-                ], lg=3, md=6, className='mb-3'),
+                ], lg=4, md=6, className='mb-3'),
                 dbc.Col([
                     C.label('Email to (optional)'),
                     dbc.Input(id='rep-email', type='email',
                               placeholder='you@example.com'),
-                ], lg=4, md=8, className='mb-3'),
+                ], lg=5, md=6, className='mb-3'),
                 dbc.Col([
                     dbc.Button('Build', id='rep-button', color='success',
                                className='w-100'),
-                ], lg=2, md=4, className='mb-3'),
+                ], lg=3, md=12, className='mb-3'),
             ], className='align-items-end'),
-            C.note('Reports are rendered from stored runs rather than refetched, '
-                   'so they are fast and reproducible. Run a screen first if the '
-                   'strategy has no stored run yet.', 'info'),
+            C.note('Reports aggregate across all strategies to show '
+                   'cross-strategy consensus, signal shifts, and market '
+                   'intelligence.', 'info'),
             html.Div(id='rep-status', style={'color': TH.MUTED,
                                              'fontSize': '0.84rem'}),
         ], className='mb-3'),
@@ -73,6 +68,7 @@ def layout() -> html.Div:
         ], className='mb-3'),
 
         html.Div(id='rep-preview'),
+        dcc.Store(id='rep-open-id'),
 
         C.card('🗂️ Previous reports', html.Div(id='rep-history'),
                className='mb-3'),
@@ -97,12 +93,12 @@ def layout() -> html.Div:
     State('rep-email', 'value'),
     prevent_initial_call=True,
 )
-def _build(n_clicks, kind, strategy, email):
+def _build(n_clicks, kind, _strategy, email):
     if not n_clicks:
         return no_update, no_update, no_update
 
     try:
-        path, html_doc = RB.build_report(strategy, kind=kind, as_of=date.today())
+        path, html_doc = RB.build_report(kind=kind, as_of=date.today())
     except Exception as exc:                       # noqa: BLE001
         log.exception('report build failed')
         return f'❌ {type(exc).__name__}: {str(exc)[:200]}', None, _history()
@@ -111,7 +107,7 @@ def _build(n_clicks, kind, strategy, email):
     if email:
         try:
             MAILER.send_report(html_doc, email,
-                               subject=f'{kind.title()} Brief — {strategy}')
+                               subject=f'{kind.title()} Market Brief')
             status += f'  ·  📧 emailed to {email}'
         except MAILER.SMTPNotConfigured as exc:
             status += f'  ·  ⚠️ email skipped: {exc}'
@@ -239,64 +235,95 @@ def _history():
 
     df = df.copy()
     df['file'] = df['path'].apply(lambda p: Path(p).name)
-    df['created'] = pd.to_datetime(df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
+    df['created'] = df['created_at'].apply(config.local_fmt)
     df['emailed'] = df['emailed_at'].notna().map({True: '📧', False: '—'})
     df['on disk'] = df['path'].apply(
         lambda p: '✓' if Path(p).exists() else 'missing')
 
-    return html.Div([
-        C.data_table(df[['kind', 'file', 'created', 'emailed', 'on disk']],
-                     page_size=10, table_id='rep-history-table'),
-        html.Div('Click any row to open that report below.',
-                 style={'color': TH.MUTED, 'fontSize': '0.74rem',
-                        'marginTop': '8px'}),
-    ])
+    cols = ['kind', 'file', 'created', 'emailed', 'on disk']
+    shown = df[cols].copy()
+    shown['id'] = df['report_id']
+
+    rows = []
+    for _, r in df.iterrows():
+        rid = r['report_id']
+        rows.append(
+            html.Tr([
+                html.Td(r['kind'] if 'kind' in df.columns else ''),
+                html.Td(Path(r['path']).name),
+                html.Td(config.local_fmt(r['created_at'])),
+                html.Td('📧' if pd.notna(r.get('emailed_at')) else '—'),
+                html.Td('✓' if Path(r['path']).exists() else 'missing'),
+                html.Td(
+                    html.Div([
+                        dbc.Button('View', id={'type': 'rep-view-btn', 'index': rid},
+                                   color='primary', outline=True, size='sm',
+                                   className='me-1',
+                                   style={'fontSize': '0.7rem', 'padding': '2px 8px'}),
+                        dbc.Button('Delete', id={'type': 'rep-del-btn', 'index': rid},
+                                   color='danger', outline=True, size='sm',
+                                   style={'fontSize': '0.7rem', 'padding': '2px 8px'}),
+                    ], className='d-flex'),
+                ),
+            ], style={'cursor': 'pointer'})
+        )
+
+    header = html.Thead(html.Tr([
+        html.Th(c, style={'fontSize': '0.72rem', 'textTransform': 'uppercase',
+                          'letterSpacing': '0.5px', 'color': TH.MUTED,
+                          'padding': '8px 12px', 'borderBottom': f'1px solid {TH.BORDER}'})
+        for c in ['Kind', 'File', 'Created', 'Email', 'On disk', '']
+    ]))
+    body = html.Tbody(rows)
+
+    return html.Div(
+        dbc.Table([header, body], bordered=False, hover=True, responsive=True,
+                  style={'fontSize': '0.82rem', 'color': TH.TEXT,
+                         'background': 'transparent'}),
+    )
 
 
 @callback(
     Output('rep-preview', 'children', allow_duplicate=True),
-    Input('rep-history-table', 'active_cell'),
+    Output('rep-open-id', 'data'),
+    Input({'type': 'rep-view-btn', 'index': ALL}, 'n_clicks'),
     prevent_initial_call=True,
 )
-def _open_past_report(active_cell):
-    """
-    Load a stored report into the preview pane.
+def _open_past_report(n_clicks_list):
+    if not any(n_clicks_list):
+        return no_update, no_update
 
-    The history table used to be inert — clicking a row did nothing, because
-    nothing listened for it. Reports are written to disk, so opening one is a
-    file read rather than a rebuild.
-    """
-    if not active_cell:
-        return no_update
+    report_id = ctx.triggered_id['index']
 
     try:
         df = RB.list_reports(limit=25)
     except Exception as exc:                       # noqa: BLE001
-        return C.note(f'Could not list reports: {exc}', 'error')
+        return C.note(f'Could not list reports: {exc}', 'error'), None
 
-    row = active_cell.get('row')
-    if row is None or row >= len(df):
-        return no_update
+    match = df[df['report_id'] == report_id]
+    if match.empty:
+        return no_update, no_update
 
-    rec = df.iloc[row]
+    rec = match.iloc[0]
     path = Path(rec['path'])
     name = path.name
 
     if not path.exists():
         return C.note(
-            f'“{name}” is recorded in the database but the file is gone from '
-            f'{path.parent}. Regenerate it with the button above.', 'warn')
+            f'"{name}" is recorded in the database but the file is gone from '
+            f'{path.parent}. Regenerate it with the button above.',
+            'warn'), report_id
 
     try:
         html_doc = path.read_text(encoding='utf-8')
     except Exception as exc:                       # noqa: BLE001
-        return C.note(f'Could not read {name}: {exc}', 'error')
+        return C.note(f'Could not read {name}: {exc}', 'error'), report_id
 
     return C.card(f'👁️ {name}', [
         html.Div([
             dbc.Badge(rec['kind'], color='dark', className='me-2',
                       style={'border': f'1px solid {TH.BORDER}'}),
-            html.Span(f"created {pd.to_datetime(rec['created_at']):%Y-%m-%d %H:%M}",
+            html.Span(f"created {config.local_fmt(rec['created_at'])}",
                       style={'color': TH.MUTED, 'fontSize': '0.76rem'}),
             html.A('⬇ open in a new tab', href=f'/reports/{name}',
                    target='_blank',
@@ -305,4 +332,29 @@ def _open_past_report(active_cell):
         html.Iframe(srcDoc=html_doc,
                     style={'width': '100%', 'height': '720px', 'border': 'none',
                            'borderRadius': '8px', 'background': TH.BG}),
-    ], className='mb-3')
+    ], className='mb-3'), report_id
+
+
+@callback(
+    Output('rep-preview', 'children', allow_duplicate=True),
+    Output('rep-history', 'children', allow_duplicate=True),
+    Output('rep-open-id', 'data', allow_duplicate=True),
+    Input({'type': 'rep-del-btn', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def _delete_report(n_clicks_list):
+    if not any(n_clicks_list):
+        return no_update, no_update, no_update
+
+    report_id = ctx.triggered_id['index']
+
+    try:
+        removed = RB.delete_report(report_id)
+    except Exception as exc:                       # noqa: BLE001
+        log.exception('report delete failed')
+        return C.note(f'Could not delete: {exc}', 'error'), no_update, report_id
+
+    if not removed:
+        return (C.note('That report was already gone.', 'warn'),
+                _history(), None)
+    return (C.note('🗑️ Report deleted.', 'info'), _history(), None)

@@ -96,6 +96,12 @@ SOURCES: dict[str, Source] = {
     'profiles':   Source('profiles', 'Market-cap snapshots', 24, False,
                          key_mode='global',
                          note='Yahoo enrichment; rate-limited, best effort.'),
+    # Splits are rare but the cost of missing one is not: filed share counts
+    # stay on the old basis while prices are restated, so every yield for that
+    # name reads wrong by the split ratio until it is fetched. Cheap to check
+    # daily, and checking is the only thing that keeps the correction current.
+    'splits':     Source('splits', 'Stock splits', 24, True,
+                         note='Keeps share counts on the same basis as prices.'),
     'insiders':   Source('insiders', 'Form 4 transactions', 24, False),
     'news':       Source('news', 'News articles', 3, False),
     'policy':     Source('policy', 'Federal Register', 12, False,
@@ -121,6 +127,7 @@ class SourceResult:
     total_keys: int = 0
     seconds: float = 0.0
     detail: str = ''
+    failed_keys: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -141,6 +148,10 @@ class SyncReport:
     def rows(self) -> int:
         return sum(r.rows for r in self.results)
 
+    @property
+    def failed_keys_total(self) -> int:
+        return sum(len(r.failed_keys) for r in self.results)
+
     def summary(self) -> str:
         if not self.results:
             return 'nothing to sync'
@@ -153,7 +164,10 @@ class SyncReport:
             bits.append(', '.join(f'{r.name} +{r.rows}' for r in fetched if r.rows)
                         or f'{len(fetched)} checked')
         if failed:
-            bits.append(f'{len(failed)} failed')
+            bits.append(f'{len(failed)} source(s) failed')
+        fk = self.failed_keys_total
+        if fk:
+            bits.append(f'{fk} ticker(s) failed')
         return f"{'; '.join(bits)} in {self.seconds:.1f}s"
 
     def to_frame(self) -> pd.DataFrame:
@@ -163,6 +177,9 @@ class SyncReport:
             'stale': f'{r.stale_keys}/{r.total_keys}' if r.total_keys else '—',
             'rows': r.rows,
             'seconds': round(r.seconds, 1),
+            'failed': ', '.join(r.failed_keys[:5]) + (
+                f' (+{len(r.failed_keys) - 5})' if len(r.failed_keys) > 5 else ''
+            ) if r.failed_keys else '',
             'detail': r.detail,
         } for r in self.results])
 
@@ -269,11 +286,13 @@ def freshness() -> pd.DataFrame:
                   else pd.NaT)
         age = ((now - newest.to_pydatetime()).total_seconds() / 3600
                if pd.notna(newest) else None)
+        local_newest = (newest.tz_localize('UTC').tz_convert('US/Eastern')
+                        if pd.notna(newest) else pd.NaT)
         rows.append({
             'source': src.label,
             'keys tracked': len(seen),
-            'last refreshed': (newest.strftime('%Y-%m-%d %H:%M')
-                               if pd.notna(newest) else 'never'),
+            'last refreshed': (config.local_fmt(local_newest)
+                               if pd.notna(local_newest) else 'never'),
             'age (h)': round(age, 1) if age is not None else None,
             'refresh after (h)': src.max_age_hours,
             'status': ('never fetched' if age is None
@@ -384,6 +403,7 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
         'facts': lambda ts: sec.update_facts(ts),
         'filings': lambda ts: sec.update_filings(ts),
         'profiles': lambda ts: yahoo.update_profiles(ts),
+        'splits': lambda ts: yahoo.update_splits(ts),
         'insiders': lambda ts: sec.update_insiders(ts),
         'news': lambda ts: news.update_news(ts),
         'attention': lambda ts: altdata.update_attention(ts, days_back=400),

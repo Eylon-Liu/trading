@@ -7,6 +7,7 @@ Everything tunable lives here so strategy code never hardcodes a threshold.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,6 +30,42 @@ for _d in (DB_DIR, CACHE_DIR, REPORT_DIR):
 # SQLAlchemy URL. Default is a local SQLite file; swap for a hosted libSQL/
 # Postgres URL via the env var without touching any other code.
 DATABASE_URL = os.environ.get('DATABASE_URL', f'sqlite:///{DB_DIR / "quant.sqlite"}')
+
+
+# ─────────────────────────────────────────────
+# TIMESTAMPS
+# ─────────────────────────────────────────────
+
+def utc_now() -> datetime:
+    """Timezone-aware UTC timestamp for storage (naive after .replace)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def to_local(dt) -> datetime | None:
+    """Convert a naive-UTC datetime to local time for display."""
+    if dt is None:
+        return None
+    try:
+        import pandas as pd
+        if pd.isna(dt):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(dt, str):
+        import pandas as pd
+        dt = pd.to_datetime(dt)
+    # Convert to a plain datetime so .astimezone() works uniformly
+    if hasattr(dt, 'to_pydatetime'):
+        dt = dt.to_pydatetime()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().replace(tzinfo=None)
+
+
+def local_fmt(dt, fmt: str = '%Y-%m-%d %H:%M') -> str:
+    """Format a naive-UTC datetime as local time."""
+    local = to_local(dt)
+    return local.strftime(fmt) if local else '—'
 
 
 # ─────────────────────────────────────────────
@@ -147,6 +184,14 @@ INDEX_OPTIONS = {
 INDEX_ETF_CIK = {
     'SPY': '0000884394',  # SPDR S&P 500 ETF Trust
     'QQQ': '0001067839',  # Invesco QQQ Trust, Series 1
+    'IWM': '0001100663',  # iShares Trust
+}
+
+# Series names within multi-fund trusts. When set, only N-PORT filings whose
+# <seriesName> matches are processed. Single-fund trusts (SPY, QQQ) need no
+# filter because every filing belongs to the one fund.
+INDEX_ETF_SERIES = {
+    'IWM': 'iShares Russell 2000 ETF',
 }
 
 # Wikipedia pages carrying the constituent tables (used with the MediaWiki
@@ -199,71 +244,9 @@ QUINTILES = 5
 # SEC / XBRL
 # ─────────────────────────────────────────────
 
-# The tags we extract from companyfacts. Each logical concept lists candidate
-# us-gaap tags in priority order, because filers disagree about which to use.
-SEC_TAG_MAP = {
-    'revenue': [
-        'RevenueFromContractWithCustomerExcludingAssessedTax',
-        'RevenueFromContractWithCustomerIncludingAssessedTax',
-        'Revenues', 'SalesRevenueNet', 'SalesRevenueGoodsNet',
-        # Banks and REITs report revenue under none of the tags above. Without
-        # these, Regions Financial showed $0.10B of revenue against $2.23B of
-        # net income — a net margin of 2,146% — and Camden Property $0.01B.
-        'RevenuesNetOfInterestExpense',
-        'InterestAndDividendIncomeOperating',
-        'RealEstateRevenueNet',
-        'OperatingLeasesIncomeStatementLeaseRevenue',
-        # ASC 842. REITs moved rental income here in 2019, which is why Camden
-        # Property's current contract-with-customer tag holds only $5M of
-        # ancillary revenue against ~$390M of actual rent.
-        'OperatingLeaseLeaseIncome',
-    ],
-    'net_income': ['NetIncomeLoss', 'ProfitLoss'],
-    'operating_income': ['OperatingIncomeLoss'],
-    'gross_profit': ['GrossProfit'],
-    'assets': ['Assets'],
-    'current_assets': ['AssetsCurrent'],
-    'liabilities': ['Liabilities'],
-    'current_liabilities': ['LiabilitiesCurrent'],
-    'equity': [
-        'StockholdersEquity',
-        'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
-        'CommonStockholdersEquity',
-    ],
-    'cash': [
-        'CashAndCashEquivalentsAtCarryingValue',
-        'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
-    ],
-    'operating_cash_flow': ['NetCashProvidedByUsedInOperatingActivities'],
-    'capex': [
-        'PaymentsToAcquirePropertyPlantAndEquipment',
-        'PaymentsToAcquireProductiveAssets',
-    ],
-    'long_term_debt': ['LongTermDebtNoncurrent', 'LongTermDebt'],
-    'short_term_debt': ['ShortTermBorrowings', 'DebtCurrent'],
-    'shares_diluted': ['WeightedAverageNumberOfDilutedSharesOutstanding'],
-    'shares_basic': ['WeightedAverageNumberOfSharesOutstandingBasic'],
-    'eps_diluted': ['EarningsPerShareDiluted'],
-    'interest_expense': ['InterestExpense', 'InterestIncomeExpenseNet'],
-    'rnd': ['ResearchAndDevelopmentExpense'],
-    'dividends_paid': [
-        'PaymentsOfDividendsCommonStock', 'PaymentsOfDividends',
-    ],
-    'buybacks': ['PaymentsForRepurchaseOfCommonStock'],
-    'inventory': ['InventoryNet', 'InventoryGross',
-                  'InventoryFinishedGoodsNetOfReserves'],
-}
-
-# The `dei` (Document & Entity Information) namespace, which arrives in the
-# same companyfacts payload as us-gaap and used to be discarded.
-#
-# EntityCommonStockSharesOutstanding is the cover-page share count — the exact
-# number of shares outstanding on the filing date, not the weighted average
-# used as an EPS denominator. It is what market capitalisation actually means,
-# and it carries a `filed` date like everything else, so it stays point-in-time.
-SEC_DEI_TAG_MAP = {
-    'shares_outstanding': ['EntityCommonStockSharesOutstanding'],
-}
+# Tag maps live in data/taxonomy.py for independent testability. Re-exported
+# here so existing imports (config.SEC_TAG_MAP) keep working.
+from data.taxonomy import SEC_DEI_TAG_MAP, SEC_TAG_MAP  # noqa: E402, F401
 
 # 8-K item codes worth treating as structured corporate events. These need no
 # NLP at all — the SEC already classified them.

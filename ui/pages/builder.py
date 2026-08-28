@@ -59,7 +59,7 @@ def layout() -> html.Div:
                 dbc.Col([
                     C.label('Start from'),
                     dcc.Dropdown(id='bld-source', options=ST.options(),
-                                 value='quality_value', clearable=False),
+                                 value='buffett', clearable=False),
                 ], lg=5, md=6, className='mb-2'),
                 dbc.Col([
                     C.label('Call it'),
@@ -312,13 +312,52 @@ def _saved_list():
     df = CU.summary()
     if df.empty:
         return C.placeholder('None yet — copy a preset above.')
+    rows = []
+    for _, r in df.iterrows():
+        rows.append(html.Div([
+            html.Div([
+                html.Span(r['name'], style={'fontWeight': '700',
+                                             'fontSize': '0.9rem'}),
+                html.Span(f'  ·  {r["horizon"]}  ·  {r["factors"]} factors',
+                          style={'color': TH.MUTED, 'fontSize': '0.78rem'}),
+            ], style={'flex': '1'}),
+            dbc.Button('✏️ Edit', id={'type': 'bld-load', 'key': r['key']},
+                       size='sm', color='info', outline=True,
+                       className='me-2'),
+        ], style={'display': 'flex', 'alignItems': 'center',
+                  'padding': '10px 0',
+                  'borderBottom': f'1px solid {TH.BORDER}'}))
     return html.Div([
-        C.data_table(df[['name', 'horizon', 'factors']], page_size=10),
+        html.Div(rows),
         html.Div('Saved strategies appear alongside the built-ins on the '
                  'Screen, Compare and Research tabs, marked with a ★.',
                  style={'color': TH.MUTED, 'fontSize': '0.75rem',
                         'marginTop': '8px'}),
     ])
+
+
+@callback(
+    Output('bld-weights', 'data', allow_duplicate=True),
+    Output('bld-key', 'data', allow_duplicate=True),
+    Output('bld-status', 'children', allow_duplicate=True),
+    Input({'type': 'bld-load', 'key': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def _load_saved(n_clicks_list):
+    if not any(n_clicks_list):
+        return no_update, no_update, no_update
+    trigger = ctx.triggered_id
+    if not isinstance(trigger, dict):
+        return no_update, no_update, no_update
+    key = trigger.get('key')
+    if not key:
+        return no_update, no_update, no_update
+    try:
+        s = CU.resolve(key)
+    except KeyError:
+        return no_update, no_update, '❌ Strategy not found.'
+    return (dict(s.weights), key,
+            f'✏️ Editing "{s.name}". Change weights below, then save.')
 
 
 @callback(Output('bld-list', 'children', allow_duplicate=True),

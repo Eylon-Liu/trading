@@ -14,7 +14,7 @@ from datetime import date
 
 import dash_bootstrap_components as dbc
 import pandas as pd
-from dash import Input, Output, State, callback, dcc, html, no_update
+from dash import Input, Output, State, callback, clientside_callback, dcc, html, no_update
 
 import config
 from data.universe import PRESETS, UniverseSpec
@@ -87,6 +87,45 @@ def layout() -> html.Div:
                 ], lg=6, md=6, className='mb-2'),
             ], className='align-items-end'),
 
+            # Only meaningful for the style-factor strategy, so it stays hidden
+            # rather than sitting inert above every other screen.
+            dbc.Collapse(dbc.Row([
+                dbc.Col([
+                    C.label('Value proxy'),
+                    dcc.Dropdown(
+                        id='style-value',
+                        options=[{'label': lab, 'value': f}
+                                 for f, lab in ST.STYLE_PROXIES['value']],
+                        value=ST.DEFAULT_STYLE_PROXIES['value'],
+                        clearable=False),
+                ], lg=4, md=12, className='mb-2'),
+                dbc.Col([
+                    C.label('Growth proxy'),
+                    dcc.Dropdown(
+                        id='style-growth',
+                        options=[{'label': lab, 'value': f}
+                                 for f, lab in ST.STYLE_PROXIES['growth']],
+                        value=ST.DEFAULT_STYLE_PROXIES['growth'],
+                        clearable=False),
+                ], lg=4, md=12, className='mb-2'),
+                dbc.Col([
+                    C.label('Momentum proxy'),
+                    dcc.Dropdown(
+                        id='style-momentum',
+                        options=[{'label': lab, 'value': f}
+                                 for f, lab in ST.STYLE_PROXIES['momentum']],
+                        value=ST.DEFAULT_STYLE_PROXIES['momentum'],
+                        clearable=False),
+                ], lg=4, md=12, className='mb-2'),
+                dbc.Col(C.note(
+                    'The three styles are weighted equally, so this compares '
+                    'proxies rather than weightings. Backtest the combination '
+                    'before trusting it — trying proxies until the numbers look '
+                    'good finds a winner by chance long before it finds one by '
+                    'signal, and neither growth proxy has shown a reliable edge '
+                    'on this universe.', 'warn'), lg=12),
+            ], className='mt-3'), id='style-proxies', is_open=False),
+
             # Secondary filters start folded. Four more controls on screen at
             # all times pushed the results below the fold for a setting most
             # runs never change.
@@ -156,6 +195,27 @@ def _toggle_filters(_n, is_open):
 
 
 @callback(
+    Output('style-proxies', 'is_open'),
+    Input('strategy-dd', 'value'),
+)
+def _toggle_style_proxies(strategy):
+    return strategy == ST.STYLE_FACTORS_KEY
+
+
+clientside_callback(
+    """function(n) {
+        if (!n) return [window.dash_clientside.no_update,
+                        window.dash_clientside.no_update];
+        return ["⏳ Computing factors — this can take up to a minute on first run…", true];
+    }""",
+    Output('screen-status', 'children', allow_duplicate=True),
+    Output('run-button', 'disabled', allow_duplicate=True),
+    Input('run-button', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
+
+@callback(
     Output('screen-store', 'data'),
     Output('screen-meta', 'data'),
     Output('screen-status', 'children'),
@@ -167,9 +227,13 @@ def _toggle_filters(_n, is_open):
     State('mcap-slider', 'value'),
     State('topn-slider', 'value'),
     State('asof-date', 'value'),
+    State('style-value', 'value'),
+    State('style-growth', 'value'),
+    State('style-momentum', 'value'),
     prevent_initial_call=True,
 )
-def _run_screen(n_clicks, strategy, preset, sectors, mcap_b, top_n, as_of):
+def _run_screen(n_clicks, strategy, preset, sectors, mcap_b, top_n, as_of,
+                sv, sg, sm):
     if not n_clicks or not strategy:
         return no_update, no_update, '', False
 
@@ -184,7 +248,12 @@ def _run_screen(n_clicks, strategy, preset, sectors, mcap_b, top_n, as_of):
             label=base.label,
         )
 
-        result = EN.run(spec, strategy, as_of=as_of, top_n=top_n)
+        # The style screen's weights come from the dropdowns, so it is passed
+        # as a built Strategy rather than a key. ST.get() takes either.
+        target = (ST.style_strategy(value=sv, growth=sg, momentum=sm)
+                  if strategy == ST.STYLE_FACTORS_KEY else strategy)
+
+        result = EN.run(spec, target, as_of=as_of, top_n=top_n)
         if result.scores.empty:
             return None, None, ('❌ No results. Check that data has been ingested '
                                 'for this universe (see the Data tab).'), False
@@ -206,6 +275,7 @@ def _run_screen(n_clicks, strategy, preset, sectors, mcap_b, top_n, as_of):
             'shown': len(scores),
             'spec': spec.describe(),
             'plans': plans,
+            'warnings': result.warnings,
         }
         if result.sync:
             meta['sync'] = result.sync.summary()
@@ -215,6 +285,11 @@ def _run_screen(n_clicks, strategy, preset, sectors, mcap_b, top_n, as_of):
                   f'{len(result.universe)} names as of {result.as_of}')
         if result.sync:
             status += f'  ·  data: {result.sync.summary()}'
+        # A ranking built on less than the configured strategy has to say so on
+        # the page. Logging it means the one person who needs to know never
+        # sees it.
+        if result.degraded:
+            status += f'  ·  ⚠️ {len(result.warnings) - 1} factor(s) unavailable'
         return scores.to_dict('records'), meta, status, False
 
     except Exception as exc:                       # noqa: BLE001
@@ -278,6 +353,7 @@ def _render_results(data, meta):
             html.Span(f'  ·  {meta["spec"]}',
                       style={'color': TH.MUTED, 'fontSize': '0.76rem'}),
         ], className='mb-2'),
+        _degraded_note(meta.get('warnings')),
         _insight_strip(df, meta, counts, sector_counts),
         dbc.Row([
             dbc.Col(C.card('🏆 Ranked results', [
@@ -299,6 +375,24 @@ def _render_results(data, meta):
             ], lg=3, className='mb-3'),
         ]),
     ])
+
+
+def _degraded_note(warnings):
+    """
+    Say plainly when the ranking is not the strategy as configured.
+
+    A factor with no data does not blank the screen — its weight redistributes
+    over the rest and a full, confident-looking ranking comes back. Without
+    this the only trace is a log line, and the person acting on the ranking is
+    not reading the log.
+    """
+    if not warnings:
+        return None
+    return C.note(
+        html.Span([
+            html.B('⚠️ Ranked on less than the full strategy. '),
+            html.Span('; '.join(warnings)),
+        ]), 'warn')
 
 
 def _insight_strip(df, meta, counts, sector_counts):

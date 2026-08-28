@@ -7,9 +7,9 @@ thing cron-able: a nightly ingest followed by a morning report needs no browser.
 
     python cli.py init
     python cli.py ingest --index DIA --full
-    python cli.py screen --universe "SPY,sector=Information Technology" --strategy quality_value
+    python cli.py screen --universe "SPY,sector=Information Technology" --strategy buffett
     python cli.py backtest --strategy momentum_trend --start 2023-01-01
-    python cli.py report --kind daily --strategy quality_value --email you@example.com
+    python cli.py report --kind daily --strategy buffett --email you@example.com
     python cli.py strategies
 """
 
@@ -71,7 +71,18 @@ def cmd_ingest(args) -> int:
         tickers = tickers[:args.limit]
     print(f'  {len(tickers)} constituents')
 
-    sources = None if args.full else sync.ESSENTIAL + ['filings', 'profiles']
+    if args.sources:
+        wanted = [s.strip() for s in args.sources.split(',') if s.strip()]
+        unknown = [s for s in wanted if s not in sync.SOURCES]
+        if unknown:
+            print(f'❌  unknown source(s): {", ".join(unknown)}')
+            print(f'    available: {", ".join(sync.SOURCES)}')
+            return 1
+        sources = wanted
+    elif args.full:
+        sources = None
+    else:
+        sources = sync.ESSENTIAL + ['filings', 'profiles']
     report = sync.sync(tickers, index=index, sources=sources,
                        force=args.force,
                        progress=lambda m: print(f'  ▸ {m}'))
@@ -88,6 +99,84 @@ def cmd_ingest(args) -> int:
         print('   Nothing was stale — the stored data is already current.')
     print()
     print(db.table_counts().head(12).to_string(index=False))
+    return 0
+
+
+def cmd_schedule(args) -> int:
+    """
+    Print an ingest schedule matched to how fast each source actually changes.
+
+    Fetching faster than the source updates spends rate limit and returns the
+    same bytes; fetching slower leaves the screen reading yesterday. The
+    cadence below comes from `sync.SOURCES`, where each entry already declares
+    the age past which it is considered stale — so this reads the schedule off
+    the data model rather than inventing a second one that can drift from it.
+
+    `ingest` is idempotent and freshness-aware: a run over an already-current
+    store makes no network calls, so overlapping schedules cost nothing.
+    """
+    import sys as _sys
+
+    from data import sync
+
+    root = config.ROOT
+    py = _sys.executable
+
+    # Grouped by declared max age. Market data settles once a day; news moves
+    # within hours; index membership changes on scheduled reviews.
+    buckets: dict[str, list[str]] = {}
+    for key, src in sync.SOURCES.items():
+        if src.max_age_hours <= 6:
+            buckets.setdefault('hourly', []).append(key)
+        elif src.max_age_hours <= 24:
+            buckets.setdefault('daily', []).append(key)
+        elif src.max_age_hours <= 24 * 7:
+            buckets.setdefault('weekly', []).append(key)
+        else:
+            buckets.setdefault('monthly', []).append(key)
+
+    index = args.index.upper()
+    print(f'Ingest cadence for {index}, derived from sync.SOURCES\n')
+    for when in ('hourly', 'daily', 'weekly', 'monthly'):
+        names = sorted(buckets.get(when, []))
+        if not names:
+            continue
+        ages = {k: sync.SOURCES[k].max_age_hours for k in names}
+        print(f'  {when:8s} {", ".join(names)}')
+        print(f'           (stale after {min(ages.values())}-{max(ages.values())}h)')
+    print()
+
+    def line(sched: str, sources: list[str], comment: str) -> str:
+        return (f'# {comment}\n{sched}  cd "{root}" && {py} cli.py ingest '
+                f'--index {index} --sources {",".join(sorted(sources))} '
+                f'>> "{root}/logs/ingest.log" 2>&1')
+
+    print('─' * 70)
+    print('crontab -e   (macOS and Linux)')
+    print('─' * 70)
+    print(f'# Market data lands after the close; the rest follow the filing day.')
+    if buckets.get('hourly'):
+        print(line('0 * * * *', buckets['hourly'],
+                   'News moves intraday — hourly during and after market hours.'))
+    if buckets.get('daily'):
+        print(line('30 18 * * 1-5', buckets['daily'],
+                   'Weekday evening, after bars settle and filings post.'))
+    if buckets.get('weekly'):
+        print(line('0 7 * * 6', buckets['weekly'],
+                   'Saturday morning — membership changes on scheduled reviews.'))
+    if buckets.get('monthly'):
+        print(line('0 7 1 * *', buckets['monthly'],
+                   'Monthly — effectively static reference data.'))
+    print()
+    print('Create the log directory first:')
+    print(f'  mkdir -p "{root}/logs"')
+    print()
+    print('Notes')
+    print('  · ingest is freshness-aware, so a run with nothing stale is free.')
+    print('  · cron does not load your shell profile; the absolute python path')
+    print('    above is deliberate, and .env is read from the project root.')
+    print('  · on macOS, cron needs Full Disk Access for the calling terminal,')
+    print('    or use launchd instead (launchctl load ~/Library/LaunchAgents).')
     return 0
 
 
@@ -243,14 +332,15 @@ def cmd_report(args) -> int:
     from reports import email as mailer
 
     db.init_db()
-    path, html = builder.build_report(args.strategy, kind=args.kind,
-                                      as_of=args.as_of)
+    path, html = builder.build_report(
+        strategy=getattr(args, 'strategy', None),
+        kind=args.kind, as_of=args.as_of)
     print(f'✅  report written to {path}')
 
     if args.email:
         try:
             mailer.send_report(html, args.email,
-                               subject=f'{args.kind.title()} Brief — {args.strategy}')
+                               subject=f'{args.kind.title()} Market Brief')
             print(f'📧  emailed to {args.email}')
         except mailer.SMTPNotConfigured as exc:
             print(f'⚠️  email skipped: {exc}')
@@ -304,6 +394,10 @@ def build_parser() -> argparse.ArgumentParser:
     ing.add_argument('--period', default='10y', help='price history depth')
     ing.add_argument('--full', action='store_true',
                      help='also fetch insiders, news, policy and attention')
+    ing.add_argument('--sources',
+                     help='comma-separated subset to refresh, e.g. "news" or '
+                          '"prices,facts,splits". Lets a schedule run each '
+                          'source at the rate its data actually changes.')
     ing.add_argument('--members-from', help='backfill membership from this date')
     ing.add_argument('--insider-days', type=int, default=730)
     ing.add_argument('--force', action='store_true',
@@ -313,14 +407,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     scr = sub.add_parser('screen', help='rank a universe under a strategy')
     scr.add_argument('--universe', help='e.g. "SPY,sector=Health Care,mcap>5B"')
-    scr.add_argument('--strategy', default='quality_value')
+    scr.add_argument('--strategy', default='buffett')
     scr.add_argument('--as-of', help='YYYY-MM-DD (defaults to today)')
     scr.add_argument('--top', type=int, default=20)
     scr.set_defaults(func=cmd_screen)
 
     bt = sub.add_parser('backtest', help='walk-forward test a strategy')
     bt.add_argument('--universe')
-    bt.add_argument('--strategy', default='quality_value')
+    bt.add_argument('--strategy', default='buffett')
     bt.add_argument('--start', default=str(date.today() - timedelta(days=1460)))
     bt.add_argument('--end')
     bt.add_argument('--top', type=int, default=15)
@@ -329,10 +423,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     rep = sub.add_parser('report', help='render a daily or monthly report')
     rep.add_argument('--kind', default='daily', choices=['daily', 'monthly'])
-    rep.add_argument('--strategy', default='quality_value')
+    rep.add_argument('--strategy', default='buffett')
     rep.add_argument('--as-of')
     rep.add_argument('--email', help='send the rendered report to this address')
     rep.set_defaults(func=cmd_report)
+
+    sch = sub.add_parser('schedule',
+                         help='print an ingest schedule matched to each source')
+    sch.add_argument('--index', default='SPY', help='SPY | QQQ | DIA | IWM')
+    sch.set_defaults(func=cmd_schedule)
 
     sub.add_parser('strategies', help='list available strategies by horizon') \
         .set_defaults(func=cmd_strategies)

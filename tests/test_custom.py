@@ -136,48 +136,48 @@ def store(monkeypatch):
 
 def test_copy_is_independent_of_its_parent(store):
     """A saved strategy that changes underneath you is not worth saving."""
-    key = CU.copy_from('compounder', 'Tilted')
-    parent_weights = dict(ST.ALL_STRATEGIES['compounder'].weights)
+    key = CU.copy_from('buffett', 'Tilted')
+    parent_weights = dict(ST.ALL_STRATEGIES['buffett'].weights)
 
     copy = CU.resolve(key)
     copy_weights = dict(copy.weights)
     copy_weights['ROIC'] = 99.0
     CU.save('Tilted', copy.horizon, copy_weights, key=key)
 
-    assert ST.ALL_STRATEGIES['compounder'].weights == parent_weights
+    assert ST.ALL_STRATEGIES['buffett'].weights == parent_weights
     assert CU.resolve(key).weights['ROIC'] == 99.0
 
 
 def test_copy_records_its_parent(store):
-    key = CU.copy_from('deep_value', 'My Value')
-    assert store[key]['based_on'] == 'deep_value'
+    key = CU.copy_from('shareholder_yield', 'My Value')
+    assert store[key]['based_on'] == 'shareholder_yield'
 
 
 def test_custom_cannot_shadow_a_builtin(store):
     with pytest.raises(CU.ValidationError, match='collides'):
-        CU.save('x', 'long', {'ROIC': 1}, key='compounder')
+        CU.save('x', 'long', {'ROIC': 1}, key='buffett')
 
 
 def test_builtins_cannot_be_deleted(store):
     with pytest.raises(CU.ValidationError, match='cannot be deleted'):
-        CU.delete('compounder')
+        CU.delete('buffett')
 
 
 def test_registry_contains_both_kinds(store):
-    key = CU.copy_from('garp', 'Mine')
+    key = CU.copy_from('insider_conviction', 'Mine')
     reg = CU.registry()
-    assert 'garp' in reg and key in reg
+    assert 'insider_conviction' in reg and key in reg
 
 
 def test_options_mark_custom_entries(store):
-    key = CU.copy_from('garp', 'Mine')
+    key = CU.copy_from('insider_conviction', 'Mine')
     labels = {o['value']: o['label'] for o in CU.options()}
     assert labels[key].startswith('★')
-    assert not labels['garp'].startswith('★')
+    assert not labels['insider_conviction'].startswith('★')
 
 
 def test_a_corrupt_row_does_not_hide_the_others(store, monkeypatch):
-    good = CU.copy_from('garp', 'Good One')
+    good = CU.copy_from('insider_conviction', 'Good One')
     store['my_broken'] = {**store[good], 'key': 'my_broken',
                           'weights_json': '{not json'}
     loaded = CU.load_all()

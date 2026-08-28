@@ -363,7 +363,37 @@ input[type="radio"], input[type="checkbox"] {{ accent-color:{ACCENT_DEEP}; }}
 .metric-label {{ font-size:.7rem; color:{MUTED}; text-transform:uppercase;
                 letter-spacing:.5px; }}
 a {{ color:{ACCENT}; }}
+
+@media (max-width: 576px) {{
+    .nav-tabs {{
+        flex-wrap:nowrap !important;
+        overflow-x:auto !important;
+        -webkit-overflow-scrolling:touch;
+        scrollbar-width:none;
+    }}
+    .nav-tabs::-webkit-scrollbar {{ display:none; }}
+    .nav-tabs .nav-link {{
+        white-space:nowrap !important;
+        padding:9px 11px !important;
+        font-size:0.76rem !important;
+    }}
+    h1 {{ font-size:1.3rem !important; }}
+    .text-center.py-3 {{ padding:0.5rem 0 !important; }}
+    .container-fluid {{ padding-left:8px !important; padding-right:8px !important; }}
+}}
 """
+
+_MANIFEST = (
+    '{{'
+    '"name":"Quant Research Terminal",'
+    '"short_name":"QRT",'
+    '"start_url":"/",'
+    '"display":"standalone",'
+    '"background_color":"#0f1117",'
+    '"theme_color":"#11998e",'
+    '"description":"Point-in-time equity screening, backtesting and filings intelligence"'
+    '}}'
+)
 
 INDEX_STRING = f'''<!DOCTYPE html>
 <html>
@@ -372,6 +402,11 @@ INDEX_STRING = f'''<!DOCTYPE html>
     <title>{{%title%}}</title>
     {{%favicon%}}
     {{%css%}}
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#11998e">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="data:application/manifest+json,{_MANIFEST}">
     <style>{INDEX_CSS}</style>
   </head>
   <body>

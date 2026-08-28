@@ -203,6 +203,33 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'Not comparable across sectors — banks and utilities are structurally '
         'leveraged. Sector-relative scoring handles most of this.'),
 
+    'NET_DEBT_TO_EQUITY': FactorDoc(
+        'NET_DEBT_TO_EQUITY', 'Net Debt to Equity', 'Quality',
+        'NET_DEBT_TO_EQUITY = (Total Debt − Cash) / Shareholders Equity',
+        'SEC debt tags, CashAndCashEquivalents ÷ StockholdersEquity',
+        'lower',
+        'The fortress-balance-sheet test. Gross debt-to-equity calls a company '
+        'levered when it holds more cash than debt; netting the cash off shows '
+        'who is actually a borrower. Negative values are the net-cash case — '
+        'the company could repay every dollar of debt tomorrow.',
+        'Treats all cash as available, which overstates flexibility where much '
+        'of it is held overseas or committed. Same sector caveat as gross '
+        'leverage.'),
+
+    'FCF_CONVERSION': FactorDoc(
+        'FCF_CONVERSION', 'FCF Conversion', 'Quality',
+        'FCF_CONVERSION = Free Cash Flow (TTM) / Net Income (TTM)',
+        'SEC OperatingCashFlow − CapEx ÷ NetIncomeLoss',
+        'higher',
+        'Cash is a fact, profit is an opinion. Reported earnings involve '
+        'judgement — revenue recognition, depreciation schedules, provisions — '
+        'while cash in the bank does not. A business converting close to or '
+        'above 100% of its earnings into free cash flow is reporting profits '
+        'it actually collected.',
+        'Meaningless when net income is negative or near zero, where the ratio '
+        'explodes or flips sign. Genuinely lumpy for capital-intensive names '
+        'in a heavy investment year, which depresses it for a good reason.'),
+
     'PIOTROSKI_F': FactorDoc(
         'PIOTROSKI_F', 'Piotroski F-Score', 'Quality',
         'Sum of 9 binary tests (0-9), all from filed statements:\n'
@@ -267,6 +294,33 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'Intermediate trend. Faster than the 200-day, used to confirm that a '
         'name is not merely above its long-term average but currently advancing.',
         'Whipsaws more than the 200-day; a cross is not a signal on its own.'),
+
+    'RETURN_1M': FactorDoc(
+        'RETURN_1M', '1-Month Total Return', 'Momentum',
+        'RETURN_1M = P(t) / P(t − 21 sessions) − 1',
+        'Adjusted closes (dividends reinvested)', 'higher',
+        'The most recent month of total return, read as continuation. This is '
+        'the same series as REVERSAL_1M with the opposite sign, and which one '
+        'is right is an empirical question rather than a settled one: the '
+        'academic prior is short-term reversal, but 1-month momentum has been '
+        'the stronger of the two in recent testing on this universe.',
+        'The classic literature says the last month mean-reverts, which is why '
+        'MOM_12_1 skips it. Using RETURN_1M is a bet against that prior — check '
+        'it on the Backtest tab before relying on it, and note it turns over '
+        'the portfolio far faster than a 6- or 12-month signal.'),
+
+    'RETURN_6M': FactorDoc(
+        'RETURN_6M', '6-Month Total Return', 'Momentum',
+        'RETURN_6M = P(t) / P(t − 126 sessions) − 1',
+        'Adjusted closes (dividends reinvested)', 'higher',
+        'Half a year of total return, including the most recent month. Long '
+        'enough to express a real trend and short enough to turn before the '
+        'trend is exhausted; computed on adjusted closes, so it is a total '
+        'return rather than price-only.',
+        'Includes the last month, so it carries the short-term reversal '
+        'contamination MOM_6_1 deliberately skips. The two are otherwise the '
+        'same window and correlate heavily — weighting both double-counts one '
+        'signal.'),
 
     'RETURN_3M': FactorDoc(
         'RETURN_3M', '3-Month Total Return', 'Momentum',
@@ -337,6 +391,18 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'a $40M loss to a $100M profit is not "−250% growth", and reporting a '
         'number there would be worse than reporting none.'),
 
+    'REVENUE_GROWTH_1Y': FactorDoc(
+        'REVENUE_GROWTH_1Y', 'Revenue Growth (1Y)', 'Growth',
+        'REVENUE_GROWTH_1Y = (Revenue_TTM − Revenue_TTM_1y_ago) / |Revenue_1y_ago|',
+        'SEC Revenues / RevenueFromContractWithCustomer', 'higher',
+        'Top-line growth over the last year on a trailing-twelve-month basis, '
+        'so it compares like with like rather than a quarter against a year. '
+        'The Style Factors screen offers it as the Growth proxy.',
+        'Revenue growth says nothing about whether the growth earns its cost '
+        'of capital — a company can buy revenue with margin. Returns nothing '
+        'across a sign flip, and is the noisiest of the growth measures here '
+        'because a single acquisition moves it.'),
+
     'EQUITY_CAGR_3Y': FactorDoc(
         'EQUITY_CAGR_3Y', 'Equity CAGR (3Y)', 'Growth',
         'EQUITY_CAGR_3Y = (Equity_now / Equity_3y_ago)^(1/3) − 1',
@@ -344,6 +410,21 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'higher', 'Book-value compounding — retained earnings accumulating.',
         'Buybacks shrink equity, so a company returning heavy capital can show '
         'negative equity CAGR while performing well.'),
+
+    'EPS_CAGR_3Y': FactorDoc(
+        'EPS_CAGR_3Y', 'EPS CAGR (3Y)', 'Growth',
+        'EPS       = Net income (TTM) / Diluted shares\n'
+        'EPS_CAGR_3Y = (EPS_now / EPS_3y_ago)^(1/3) − 1',
+        'SEC NetIncomeLoss, WeightedAverageNumberOfDilutedSharesOutstanding',
+        'higher', 'Durable earning power — is the business earning more per '
+        'share than it did three years ago? Because it is per *share*, it '
+        'credits buybacks and penalises dilution, and because it is a *rate* '
+        'it is comparable across companies where raw EPS is not.',
+        'Undefined through a loss year — a growth rate across a sign flip is '
+        'meaningless — so it is NaN for about a quarter of the S&P 500 and '
+        'names scored on it skew profitable. It also rewards a steady 8% '
+        'compounder and a name that halved then quadrupled identically; '
+        'consistency is not measured here.'),
 
     # ── MOMENTUM ─────────────────────────────────────────────────
     'MOM_12_1': FactorDoc(
