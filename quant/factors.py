@@ -353,6 +353,69 @@ def _div(a: pd.Series, b: pd.Series) -> pd.Series:
 
 
 # ─────────────────────────────────────────────
+# INSIDER SIGNAL HELPERS
+# ─────────────────────────────────────────────
+
+# ESPP purchases are coded as "P" (same as voluntary open-market buys) on
+# Form 4, so the transaction code alone cannot distinguish them.  ESPP buys
+# are typically small, recurring at regular intervals (quarterly near plan
+# purchase dates), and often for the same dollar amount.  We flag and remove
+# transactions that match this pattern so the insider factor reflects genuine
+# conviction, not payroll deductions.
+_ESPP_MAX_VALUE = 25_000          # IRS annual ESPP limit is $25k
+_ESPP_MIN_OCCURRENCES = 3         # need a pattern, not a one-off
+_ESPP_INTERVAL_TOLERANCE = 15     # days of slack around quarterly cadence
+
+
+def _filter_likely_espp(signal: pd.DataFrame) -> pd.DataFrame:
+    """Remove purchase transactions that look like ESPP payroll deductions."""
+    if signal.empty:
+        return signal
+    buys = signal[signal['shares'] > 0].copy()
+    if buys.empty:
+        return signal
+    drop_idx = set()
+    for (ticker, insider), grp in buys.groupby(['ticker', 'insider']):
+        if len(grp) < _ESPP_MIN_OCCURRENCES:
+            continue
+        vals = grp['value'].dropna()
+        if vals.empty or vals.max() > _ESPP_MAX_VALUE:
+            continue
+        # Check for regular timing (roughly quarterly)
+        dates = pd.to_datetime(grp['txn_date']).sort_values()
+        if len(dates) < _ESPP_MIN_OCCURRENCES:
+            continue
+        gaps = dates.diff().dropna().dt.days
+        quarterly = gaps.between(90 - _ESPP_INTERVAL_TOLERANCE,
+                                 90 + _ESPP_INTERVAL_TOLERANCE)
+        if quarterly.mean() >= 0.5:
+            drop_idx.update(grp.index)
+    if drop_idx:
+        return signal.drop(index=drop_idx)
+    return signal
+
+
+def _sell_conviction_weight(row) -> float:
+    """Scale a sale's signal weight by the fraction of holdings disposed.
+
+    Selling 3% of a position is routine diversification (weight → 0.15).
+    Selling 40% is a real signal (weight → 1.0).  Without holdings data
+    every sale counts equally at weight 1.0.
+    """
+    if row['shares'] >= 0:
+        return 1.0
+    post = row.get('post_txn_shares')
+    if pd.isna(post) or post < 0:
+        return 1.0
+    pre = post + abs(row['shares'])
+    if pre <= 0:
+        return 1.0
+    pct_sold = abs(row['shares']) / pre
+    # Below 5% → weight 0.15 (mostly noise).  Above 20% → weight 1.0.
+    return float(np.clip((pct_sold - 0.05) / 0.15, 0.15, 1.0))
+
+
+# ─────────────────────────────────────────────
 # ALTERNATIVE-DATA FACTORS
 # ─────────────────────────────────────────────
 
@@ -381,10 +444,24 @@ def alt_factors(tickers: list[str], as_of: date | str,
     if not ins.empty:
         signal = ins[ins['txn_code'].isin(config.INSIDER_SIGNAL_CODES)].copy()
         if not signal.empty:
+            # Filter out likely ESPP purchases: small recurring buys at
+            # regular intervals are compensation mechanics, not conviction.
+            signal = _filter_likely_espp(signal)
+
             signal['buy_val'] = np.where(signal['shares'] > 0,
                                          signal['value'].fillna(0), 0.0)
             signal['sell_val'] = np.where(signal['shares'] < 0,
                                           signal['value'].fillna(0), 0.0)
+
+            # Weight sells by % of holdings: a director selling 3% of their
+            # position is routine diversification; a CEO selling 40% is a
+            # conviction signal.  When post_txn_shares is available, scale
+            # sell value by the fraction disposed.
+            if 'post_txn_shares' in signal.columns:
+                signal['sell_conviction'] = signal.apply(
+                    _sell_conviction_weight, axis=1)
+                signal['sell_val'] = signal['sell_val'] * signal['sell_conviction']
+
             agg = signal.groupby('ticker').agg(
                 buy=('buy_val', 'sum'), sell=('sell_val', 'sum'),
                 n_buyers=('insider', lambda s: s[signal.loc[s.index, 'shares'] > 0].nunique()),

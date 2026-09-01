@@ -625,11 +625,12 @@ def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> di
 
     ppy = len(rets) / years
     vol = float(rets.std() * np.sqrt(ppy)) if len(rets) > 1 else 0.0
-    sharpe = float(cagr / vol) if vol > 0 else 0.0
+    rf = config.RISK_FREE_RATE
+    sharpe = float((cagr - rf) / vol) if vol > 0 else 0.0
 
     downside = rets[rets < 0]
     dvol = float(downside.std() * np.sqrt(ppy)) if len(downside) > 1 else 0.0
-    sortino = float(cagr / dvol) if dvol > 0 else 0.0
+    sortino = float((cagr - rf) / dvol) if dvol > 0 else 0.0
 
     dd = eq / eq.cummax() - 1.0
     max_dd = float(dd.min())

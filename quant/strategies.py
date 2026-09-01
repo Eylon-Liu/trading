@@ -297,8 +297,8 @@ MID_TERM = {
         thesis='Insiders buying together is a costly signal; exit on the stop or '
                'when the cluster stops.',
         weights={
-            'INSIDER_NET_BUY': 1.5, 'INSIDER_CLUSTER': 1.2,
-            'EARNINGS_YIELD': 0.8, 'PCT_VS_MA200': 0.6, 'FCF_YIELD': 0.6,
+            'INSIDER_NET_BUY': 2.0,
+            'EARNINGS_YIELD': 1.0, 'PCT_VS_MA200': 0.8, 'FCF_YIELD': 0.8,
         },
         setup='pullback',
     ),
