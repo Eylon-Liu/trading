@@ -115,17 +115,29 @@ def _vectorized_atr(high: pd.DataFrame, low: pd.DataFrame,
 
 
 def price_factors(tickers: list[str], as_of: date | str,
-                  benchmark: str | None = None) -> pd.DataFrame:
+                  benchmark: str | None = None,
+                  _bt_ohlc: tuple | None = None) -> pd.DataFrame:
     """
     Every price-derived factor, computed only from bars at or before `as_of`.
     """
     as_of = pd.to_datetime(as_of).date()
     benchmark = benchmark or config.BENCHMARK_TICKER
-    start = as_of - timedelta(days=int(TD['3Y'] * 1.6))
 
-    universe = sorted(set(tickers) | {benchmark})
-    px, high, low, adj_close = yahoo.price_and_ohlc(universe, start=start,
-                                                     end=as_of)
+    if _bt_ohlc is not None:
+        adj_c, adj_h, adj_l, _raw_c = _bt_ohlc
+        cutoff = pd.Timestamp(as_of)
+        px = adj_c.loc[:cutoff].copy()
+        high = adj_h.loc[:cutoff].copy()
+        low = adj_l.loc[:cutoff].copy()
+        adj_close = px
+        needed = sorted(set(tickers) | {benchmark})
+        avail = px.columns.intersection(needed)
+        px, high, low, adj_close = px[avail], high[avail], low[avail], adj_close[avail]
+    else:
+        start = as_of - timedelta(days=int(TD['3Y'] * 1.6))
+        universe = sorted(set(tickers) | {benchmark})
+        px, high, low, adj_close = yahoo.price_and_ohlc(universe, start=start,
+                                                         end=as_of)
     if px.empty:
         return pd.DataFrame()
     px = px.ffill()
@@ -215,7 +227,8 @@ def fundamental_factors(tickers: list[str], as_of: date | str,
                         _changed_tickers: set[str] | None = None,
                         _splits: pd.DataFrame | None = None,
                         _splits_applied: bool = False,
-                        _fund_stash: dict | None = None) -> pd.DataFrame:
+                        _fund_stash: dict | None = None,
+                        _bt_close: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Valuation, quality, and growth factors from point-in-time SEC data.
 
@@ -255,7 +268,12 @@ def fundamental_factors(tickers: list[str], as_of: date | str,
     # onto the current basis in fundamentals.adjust_shares_for_splits, so that
     # by this point shares and price already share one basis. Without that,
     # Lam Research showed a $3.1B market cap in 2018 against ~$30B actual.
-    px_close = yahoo.latest_prices(tickers, as_of, field='close')
+    if _bt_close is not None:
+        cutoff = pd.Timestamp(as_of)
+        close_slice = _bt_close.loc[:cutoff]
+        px_close = yahoo.last_close(close_slice).reindex(tickers)
+    else:
+        px_close = yahoo.latest_prices(tickers, as_of, field='close')
     est = fund['shares_diluted'].reindex(fund.index) * px_close.reindex(fund.index)
     filled_from_est = mcap.isna() & est.notna()
     mcap = mcap.fillna(est)
@@ -338,7 +356,9 @@ def _div(a: pd.Series, b: pd.Series) -> pd.Series:
 # ALTERNATIVE-DATA FACTORS
 # ─────────────────────────────────────────────
 
-def alt_factors(tickers: list[str], as_of: date | str) -> pd.DataFrame:
+def alt_factors(tickers: list[str], as_of: date | str,
+                _bt_insiders: pd.DataFrame | None = None,
+                _bt_events: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Signals from filings and attention data.
 
@@ -349,7 +369,15 @@ def alt_factors(tickers: list[str], as_of: date | str) -> pd.DataFrame:
     out = pd.DataFrame(index=pd.Index(tickers, name='ticker'))
 
     # ── insider activity (Form 4, open-market only) ───────────────
-    ins = sec.insiders_asof(tickers, as_of, lookback_days=180)
+    if _bt_insiders is not None:
+        cutoff = pd.Timestamp(as_of)
+        lo = cutoff - pd.Timedelta(days=180)
+        mask = ((_bt_insiders['filed'] >= lo)
+                & (_bt_insiders['filed'] <= cutoff)
+                & (_bt_insiders['ticker'].isin(tickers)))
+        ins = _bt_insiders[mask]
+    else:
+        ins = sec.insiders_asof(tickers, as_of, lookback_days=180)
     if not ins.empty:
         signal = ins[ins['txn_code'].isin(config.INSIDER_SIGNAL_CODES)].copy()
         if not signal.empty:
@@ -368,7 +396,15 @@ def alt_factors(tickers: list[str], as_of: date | str) -> pd.DataFrame:
             out['INSIDER_CLUSTER'] = agg['n_buyers'].reindex(out.index).fillna(0)
 
     # ── 8-K event intensity ───────────────────────────────────────
-    ev = sec.events_asof(tickers, as_of, lookback_days=90)
+    if _bt_events is not None:
+        cutoff = pd.Timestamp(as_of)
+        lo = cutoff - pd.Timedelta(days=90)
+        mask = ((_bt_events['filed'] >= lo)
+                & (_bt_events['filed'] <= cutoff)
+                & (_bt_events['ticker'].isin(tickers)))
+        ev = _bt_events[mask]
+    else:
+        ev = sec.events_asof(tickers, as_of, lookback_days=90)
     if not ev.empty:
         counts = ev.groupby('ticker').size()
         out['EVENT_INTENSITY_90D'] = counts.reindex(out.index).fillna(0)
@@ -455,7 +491,10 @@ def build_all(tickers: list[str], as_of: date | str,
               _changed_tickers: set[str] | None = None,
               _splits: pd.DataFrame | None = None,
               _splits_applied: bool = False,
-              _fund_stash: dict | None = None) -> pd.DataFrame:
+              _fund_stash: dict | None = None,
+              _bt_ohlc: tuple | None = None,
+              _bt_insiders: pd.DataFrame | None = None,
+              _bt_events: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     All factor families joined into one frame, plus sector labels.
 
@@ -477,8 +516,10 @@ def build_all(tickers: list[str], as_of: date | str,
     started = time.perf_counter()
     inner_stash: dict = {}
 
+    bt_close = _bt_ohlc[3] if _bt_ohlc is not None else None
+
     def _build_price():
-        return price_factors(tickers, as_of)
+        return price_factors(tickers, as_of, _bt_ohlc=_bt_ohlc)
 
     def _build_fund():
         return fundamental_factors(tickers, as_of,
@@ -487,10 +528,13 @@ def build_all(tickers: list[str], as_of: date | str,
                                    _changed_tickers=_changed_tickers,
                                    _splits=_splits,
                                    _splits_applied=_splits_applied,
-                                   _fund_stash=inner_stash)
+                                   _fund_stash=inner_stash,
+                                   _bt_close=bt_close)
 
     def _build_alt():
-        return alt_factors(tickers, as_of)
+        return alt_factors(tickers, as_of,
+                           _bt_insiders=_bt_insiders,
+                           _bt_events=_bt_events)
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         fut_pf = pool.submit(_build_price)

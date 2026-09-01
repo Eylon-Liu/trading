@@ -397,6 +397,41 @@ def _ohlc_raw(tickers: list[str], start=None, end=None) -> pd.DataFrame:
         params, parse_dates=['date'])
 
 
+def bulk_ohlc(tickers: list[str], start=None, end=None
+              ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Pre-load all OHLC data and return pre-pivoted, adjusted wide frames.
+
+    Returns (adj_close, adj_high, adj_low, raw_close) — all wide date × ticker.
+    Designed for backtests that will slice this data many times by date.
+    """
+    raw = _ohlc_raw(tickers, start, end)
+    if raw.empty:
+        e = pd.DataFrame()
+        return e, e, e, e
+
+    adj_close = raw.pivot_table(index='date', columns='ticker',
+                                values='adj_close', aggfunc='last')
+    close = raw.pivot_table(index='date', columns='ticker',
+                            values='close', aggfunc='last')
+    high = raw.pivot_table(index='date', columns='ticker',
+                           values='high', aggfunc='last')
+    low = raw.pivot_table(index='date', columns='ticker',
+                          values='low', aggfunc='last')
+
+    ratio = (adj_close / close.replace(0, np.nan)).replace(
+        [np.inf, -np.inf], np.nan)
+    ratio = ratio.ffill().bfill().fillna(1.0)
+    common = ratio.columns
+    if not high.empty:
+        high = high[high.columns.intersection(common)].mul(
+            ratio, fill_value=np.nan)
+    if not low.empty:
+        low = low[low.columns.intersection(common)].mul(
+            ratio, fill_value=np.nan)
+
+    return adj_close, high, low, close
+
+
 def price_and_ohlc(tickers: list[str], start=None, end=None
                    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
                               pd.DataFrame]:

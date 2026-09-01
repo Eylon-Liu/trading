@@ -324,7 +324,10 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
         _bt_prev_fund: pd.DataFrame | None = None,
         _bt_changed_tickers: set[str] | None = None,
         _bt_splits: pd.DataFrame | None = None,
-        _bt_splits_applied: bool = False) -> RunResult:
+        _bt_splits_applied: bool = False,
+        _bt_ohlc: tuple | None = None,
+        _bt_insiders: pd.DataFrame | None = None,
+        _bt_events: pd.DataFrame | None = None) -> RunResult:
     """
     Score a universe from stored data.
 
@@ -381,7 +384,10 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                        _changed_tickers=_bt_changed_tickers,
                        _splits=_bt_splits,
                        _splits_applied=_bt_splits_applied,
-                       _fund_stash=fund_stash)
+                       _fund_stash=fund_stash,
+                       _bt_ohlc=_bt_ohlc,
+                       _bt_insiders=_bt_insiders,
+                       _bt_events=_bt_events)
     if raw.empty:
         return RunResult(str(uuid.uuid4()), as_of, strategy,
                          pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,

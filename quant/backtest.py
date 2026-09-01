@@ -160,7 +160,7 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     log.info('backtest %s | %s -> %s | %d rebalances | top %d',
              strategy.name, start, end, len(dates), n_holdings)
 
-    # ── pre-fetch: read SEC facts and splits once for the entire window ──
+    # ── pre-fetch: load everything once for the entire backtest window ──
     all_tickers: set[str] = set()
     for ts in dates:
         all_tickers.update(spec.resolve(ts.date()))
@@ -169,6 +169,24 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     dv = factorcache.data_version()
     splits = yahoo.split_factors(all_tickers_sorted) if all_tickers_sorted else pd.DataFrame()
     facts_full = adjust_shares_for_splits(facts_full, splits)
+
+    # Prices: one SQL read for the entire window (lookback + forward).
+    price_lookback = int(config.TRADING_DAYS['3Y'] * 1.6)
+    price_start = start - timedelta(days=price_lookback)
+    bt_ohlc = yahoo.bulk_ohlc(all_tickers_sorted, start=price_start, end=end)
+    adj_close_all = bt_ohlc[0].ffill() if not bt_ohlc[0].empty else pd.DataFrame()
+    log.info('pre-loaded prices: %d tickers, %d bars',
+             len(adj_close_all.columns) if not adj_close_all.empty else 0,
+             len(adj_close_all))
+
+    # Insiders and events: one read each covering the full lookback.
+    ins_start = start - timedelta(days=180)
+    bt_insiders = sec.insiders_asof(all_tickers_sorted, dates[-1].date(),
+                                     lookback_days=(dates[-1].date() - ins_start).days)
+    evt_start = start - timedelta(days=90)
+    bt_events = sec.events_asof(all_tickers_sorted, dates[-1].date(),
+                                 lookback_days=(dates[-1].date() - evt_start).days)
+
     prev_fund: pd.DataFrame | None = None
     prev_d0: date | None = None
 
@@ -196,7 +214,10 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                         _bt_prev_fund=prev_fund,
                         _bt_changed_tickers=changed,
                         _bt_splits=splits,
-                        _bt_splits_applied=True)
+                        _bt_splits_applied=True,
+                        _bt_ohlc=bt_ohlc,
+                        _bt_insiders=bt_insiders,
+                        _bt_events=bt_events)
         prev_fund = result._fund_raw
         prev_d0 = d0
         if strict and result.degraded:
@@ -215,17 +236,12 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
             equity.append(equity[-1]); equity_dates.append(d1)
             continue
 
-        # Forward return over the holding period — the only forward-looking
-        # step, and it is the realised outcome, not an input to the decision.
-        # The -7d padding ensures we get a row for d0 even if it's a weekend;
-        # truncating back to d0 keeps the return window honest.
-        px = yahoo.price_history(list(w.index), start=d0 - timedelta(days=7),
-                                 end=d1, field='adj_close')
-        if px.empty:
-            equity.append(equity[-1]); equity_dates.append(d1)
-            continue
-        px = px.ffill()
-        px = px.loc[pd.Timestamp(d0):]
+        # Forward return from pre-loaded prices (no SQL per rebalance).
+        if not adj_close_all.empty:
+            avail = adj_close_all.columns.intersection(w.index)
+            px = adj_close_all.loc[pd.Timestamp(d0):pd.Timestamp(d1), avail]
+        else:
+            px = pd.DataFrame()
         if px.empty or len(px) < 2:
             equity.append(equity[-1]); equity_dates.append(d1)
             continue
@@ -239,14 +255,12 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
         equity_dates.append(d1)
         turnover_log.append(traded)
 
-        # Rank IC: correlation between the score and the return that followed.
-        if len(result.scores) >= 8:
-            all_px = yahoo.price_history(list(result.scores.index),
-                                         start=d0 - timedelta(days=7), end=d1,
-                                         field='adj_close')
-            if not all_px.empty:
-                all_px = all_px.ffill().loc[pd.Timestamp(d0):]
-                fwd = (all_px.iloc[-1] / all_px.iloc[0] - 1.0) if len(all_px) >= 2 else pd.Series(dtype=float)
+        # Rank IC from pre-loaded prices (no SQL per rebalance).
+        if len(result.scores) >= 8 and not adj_close_all.empty:
+            ic_tickers = adj_close_all.columns.intersection(result.scores.index)
+            all_px = adj_close_all.loc[pd.Timestamp(d0):pd.Timestamp(d1), ic_tickers]
+            if not all_px.empty and len(all_px) >= 2:
+                fwd = all_px.iloc[-1] / all_px.iloc[0] - 1.0
                 pair = pd.concat([result.scores['composite'], fwd], axis=1).dropna()
                 pair.columns = ['score', 'fwd']
                 if len(pair) >= 8:
@@ -451,7 +465,7 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     scan_dates = pd.date_range(start, end, freq='ME')
     trades: list[dict] = []
 
-    # ── pre-fetch: read SEC facts and splits once for the entire window ──
+    # ── pre-fetch: load everything once for the entire window ──
     all_tickers_mid: set[str] = set()
     for ts in scan_dates:
         all_tickers_mid.update(spec.resolve(ts.date()))
@@ -463,7 +477,21 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
         if all_tickers_mid_sorted else pd.DataFrame()
     if not facts_full_mid.empty:
         facts_full_mid = adjust_shares_for_splits(facts_full_mid, splits_mid)
-    _empty_splits_mid = pd.DataFrame()
+
+    price_lookback_mid = int(config.TRADING_DAYS['3Y'] * 1.6)
+    bt_ohlc_mid = yahoo.bulk_ohlc(all_tickers_mid_sorted,
+                                   start=start - timedelta(days=price_lookback_mid),
+                                   end=end + timedelta(days=int(params.time_stop_days * 1.5)))
+    ins_start_mid = start - timedelta(days=180)
+    bt_insiders_mid = sec.insiders_asof(
+        all_tickers_mid_sorted, scan_dates[-1].date(),
+        lookback_days=(scan_dates[-1].date() - ins_start_mid).days) \
+        if all_tickers_mid_sorted else pd.DataFrame()
+    bt_events_mid = sec.events_asof(
+        all_tickers_mid_sorted, scan_dates[-1].date(),
+        lookback_days=(scan_dates[-1].date() - (start - timedelta(days=90))).days) \
+        if all_tickers_mid_sorted else pd.DataFrame()
+
     prev_fund_mid: pd.DataFrame | None = None
     prev_d0_mid: date | None = None
 
@@ -486,7 +514,10 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
                         _bt_prev_fund=prev_fund_mid,
                         _bt_changed_tickers=changed_mid,
                         _bt_splits=splits_mid,
-                        _bt_splits_applied=True)
+                        _bt_splits_applied=True,
+                        _bt_ohlc=bt_ohlc_mid,
+                        _bt_insiders=bt_insiders_mid,
+                        _bt_events=bt_events_mid)
         prev_fund_mid = result._fund_raw
         prev_d0_mid = d0
         if result.plans.empty:
