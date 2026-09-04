@@ -545,14 +545,23 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'INSIDER_NET_BUY', 'Insider Net Buying', 'Alt Data',
         'INSIDER_NET_BUY = (Σ buy value − Σ sell value) / (Σ buy + Σ sell)\n'
         '                  over Form 4 filings in the last 180 days,\n'
-        '                  open-market transactions only (codes P and S)',
+        '                  open-market transactions only (codes P and S).\n'
+        '                  Likely ESPP purchases are filtered out (recurring\n'
+        '                  quarterly buys under $25k by the same insider).\n'
+        '                  Sells are conviction-weighted by % of holdings\n'
+        '                  disposed (via post_txn_shares from Form 4).',
         'SEC Form 4 filings', 'higher',
         'Insiders trade with better information than anyone else. Restricted to '
         'open-market purchases and sales — grants, option exercises and '
         'tax-withholding disposals (codes A, M, F) are compensation mechanics, '
-        'not opinions.',
+        'not opinions. ESPP payroll purchases (code P but small, recurring, '
+        'quarterly) are heuristically removed since they reflect a standing '
+        'enrollment, not a conviction buy.',
         'Selling is far noisier than buying: executives diversify and pay tax '
-        'bills for reasons unrelated to their view.'),
+        'bills for reasons unrelated to their view. To reduce this noise, sell '
+        'signals are scaled by the fraction of total holdings disposed — a CEO '
+        'selling 50% of their stake is a much stronger signal than one trimming '
+        '2% for tax purposes.'),
 
     'INSIDER_CLUSTER': FactorDoc(
         'INSIDER_CLUSTER', 'Insider Cluster Buying', 'Alt Data',

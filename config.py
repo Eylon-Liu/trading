@@ -233,6 +233,7 @@ REBALANCE_OPTIONS = {'M': 'Monthly', 'Q': 'Quarterly', 'SA': 'Semi-Annual', 'A':
 
 BENCHMARK_TICKER = 'SPY'
 RISK_FREE_SERIES = 'DGS3MO'      # FRED 3-month T-bill
+RISK_FREE_RATE = 0.05             # annualised fallback; update when FRED pipeline lands
 TRANSACTION_COST_BPS = 10.0      # one-way, per trade
 SLIPPAGE_BPS = 5.0
 DEFAULT_PORTFOLIO_SIZE = 20
