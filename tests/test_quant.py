@@ -496,3 +496,205 @@ def test_validate_flags_impossible_ratios():
     found = V.check_factor_bounds(factors)
     assert found and found[0].count == 1
     assert 'ERIE' in [t for t, _v in found[0].examples]
+
+
+# ─────────────────────────────────────────────
+# SHARPE / SORTINO with risk-free rate
+# ─────────────────────────────────────────────
+
+def test_sharpe_subtracts_risk_free_rate():
+    """Sharpe must be (CAGR - Rf) / vol, not CAGR / vol."""
+    import config
+    idx = pd.date_range('2020-01-31', periods=61, freq='ME')
+    equity = pd.Series(1.01 ** np.arange(61), index=idx)
+    m = BT.compute_metrics(equity)
+    cagr = m['cagr']
+    vol = m['volatility']
+    rf = config.RISK_FREE_RATE
+    expected_sharpe = (cagr - rf) / vol if vol > 0 else 0.0
+    assert m['sharpe'] == pytest.approx(expected_sharpe, rel=1e-6)
+    assert m['sharpe'] < cagr / vol, 'subtracting Rf must reduce Sharpe'
+
+
+def test_sortino_subtracts_risk_free_rate():
+    """Sortino must be (CAGR - Rf) / downside_vol."""
+    import config
+    rng = np.random.RandomState(42)
+    idx = pd.date_range('2020-01-31', periods=120, freq='ME')
+    equity = pd.Series(np.cumprod(1 + 0.005 + 0.03 * rng.randn(120)), index=idx)
+    m = BT.compute_metrics(equity)
+    rf = config.RISK_FREE_RATE
+    assert m['sortino'] != 0.0
+    # Recompute from scratch
+    rets = equity.pct_change().dropna()
+    years = max((equity.index[-1] - equity.index[0]).days / 365.25, 1e-9)
+    cagr = float((equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1.0)
+    ppy = len(rets) / years
+    downside = rets[rets < 0]
+    dvol = float(downside.std() * np.sqrt(ppy))
+    expected = (cagr - rf) / dvol
+    assert m['sortino'] == pytest.approx(expected, rel=1e-6)
+
+
+def test_sharpe_zero_vol_returns_zero():
+    idx = pd.date_range('2020-01-31', periods=2, freq='ME')
+    equity = pd.Series([1.0, 1.0], index=idx)
+    m = BT.compute_metrics(equity)
+    assert m.get('sharpe', 0.0) == 0.0
+
+
+# ─────────────────────────────────────────────
+# ESPP FILTERING
+# ─────────────────────────────────────────────
+
+def _insider_frame(rows):
+    """Build a minimal insider-transaction DataFrame."""
+    df = pd.DataFrame(rows)
+    df['txn_date'] = pd.to_datetime(df['txn_date'])
+    for col in ('value', 'shares', 'post_txn_shares'):
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+
+def test_espp_filter_removes_recurring_small_buys():
+    """Regular quarterly purchases under $25k should be flagged as ESPP."""
+    from quant.factors import _filter_likely_espp
+    rows = []
+    base = pd.Timestamp('2024-01-15')
+    for i in range(4):
+        rows.append({
+            'ticker': 'ACME', 'insider': 'John Doe',
+            'txn_date': base + pd.Timedelta(days=90 * i),
+            'shares': 50, 'value': 5000.0,
+        })
+    df = _insider_frame(rows)
+    filtered = _filter_likely_espp(df)
+    assert len(filtered) == 0, 'all 4 ESPP-like purchases should be removed'
+
+
+def test_espp_filter_keeps_large_purchases():
+    """Purchases above the $25k ESPP limit should be kept."""
+    from quant.factors import _filter_likely_espp
+    rows = []
+    base = pd.Timestamp('2024-01-15')
+    for i in range(4):
+        rows.append({
+            'ticker': 'ACME', 'insider': 'John Doe',
+            'txn_date': base + pd.Timedelta(days=90 * i),
+            'shares': 500, 'value': 50_000.0,
+        })
+    df = _insider_frame(rows)
+    filtered = _filter_likely_espp(df)
+    assert len(filtered) == 4, 'large purchases should survive the filter'
+
+
+def test_espp_filter_keeps_irregular_buys():
+    """Purchases at irregular intervals should not be flagged."""
+    from quant.factors import _filter_likely_espp
+    rows = [
+        {'ticker': 'ACME', 'insider': 'Jane Smith', 'txn_date': '2024-01-15',
+         'shares': 100, 'value': 8000.0},
+        {'ticker': 'ACME', 'insider': 'Jane Smith', 'txn_date': '2024-02-10',
+         'shares': 200, 'value': 15000.0},
+        {'ticker': 'ACME', 'insider': 'Jane Smith', 'txn_date': '2024-02-28',
+         'shares': 80, 'value': 6000.0},
+    ]
+    df = _insider_frame(rows)
+    filtered = _filter_likely_espp(df)
+    assert len(filtered) == 3, 'irregular purchases should be kept'
+
+
+def test_espp_filter_preserves_sells():
+    """Sales should never be removed by the ESPP filter."""
+    from quant.factors import _filter_likely_espp
+    rows = []
+    base = pd.Timestamp('2024-01-15')
+    for i in range(4):
+        rows.append({
+            'ticker': 'ACME', 'insider': 'John Doe',
+            'txn_date': base + pd.Timedelta(days=90 * i),
+            'shares': 50, 'value': 5000.0,
+        })
+    rows.append({
+        'ticker': 'ACME', 'insider': 'John Doe',
+        'txn_date': '2024-06-01', 'shares': -200, 'value': 40000.0,
+    })
+    df = _insider_frame(rows)
+    filtered = _filter_likely_espp(df)
+    assert len(filtered) == 1
+    assert filtered.iloc[0]['shares'] < 0, 'the sell should survive'
+
+
+def test_espp_filter_handles_empty():
+    from quant.factors import _filter_likely_espp
+    empty = pd.DataFrame(columns=['ticker', 'insider', 'txn_date', 'shares', 'value'])
+    assert _filter_likely_espp(empty).empty
+
+
+def test_espp_filter_needs_minimum_occurrences():
+    """Two purchases are too few to establish an ESPP pattern."""
+    from quant.factors import _filter_likely_espp
+    rows = [
+        {'ticker': 'ACME', 'insider': 'John Doe', 'txn_date': '2024-01-15',
+         'shares': 50, 'value': 5000.0},
+        {'ticker': 'ACME', 'insider': 'John Doe', 'txn_date': '2024-04-15',
+         'shares': 50, 'value': 5000.0},
+    ]
+    df = _insider_frame(rows)
+    filtered = _filter_likely_espp(df)
+    assert len(filtered) == 2, 'too few occurrences to flag as ESPP'
+
+
+# ─────────────────────────────────────────────
+# SELL CONVICTION WEIGHTING
+# ─────────────────────────────────────────────
+
+def test_sell_conviction_full_weight_for_large_disposal():
+    """Selling 40% of holdings should get weight ~1.0."""
+    from quant.factors import _sell_conviction_weight
+    row = pd.Series({'shares': -400, 'post_txn_shares': 600})
+    w = _sell_conviction_weight(row)
+    assert w == pytest.approx(1.0)
+
+
+def test_sell_conviction_low_weight_for_tiny_trim():
+    """Selling 2% of holdings should get a low weight."""
+    from quant.factors import _sell_conviction_weight
+    row = pd.Series({'shares': -20, 'post_txn_shares': 980})
+    w = _sell_conviction_weight(row)
+    assert w < 0.5, f'trimming 2% should get low conviction, got {w}'
+    assert w >= 0.15, 'weight should not go below the floor of 0.15'
+
+
+def test_sell_conviction_returns_1_for_buys():
+    """Buy transactions should always get weight 1.0."""
+    from quant.factors import _sell_conviction_weight
+    row = pd.Series({'shares': 100, 'post_txn_shares': 500})
+    assert _sell_conviction_weight(row) == 1.0
+
+
+def test_sell_conviction_returns_1_without_post_data():
+    """Missing post_txn_shares should default to weight 1.0."""
+    from quant.factors import _sell_conviction_weight
+    row = pd.Series({'shares': -100, 'post_txn_shares': np.nan})
+    assert _sell_conviction_weight(row) == 1.0
+
+
+def test_sell_conviction_scales_linearly():
+    """Weight should increase monotonically with % sold."""
+    from quant.factors import _sell_conviction_weight
+    weights = []
+    for pct_sold in [0.03, 0.10, 0.20, 0.40]:
+        sold = int(1000 * pct_sold)
+        remaining = 1000 - sold
+        row = pd.Series({'shares': -sold, 'post_txn_shares': remaining})
+        weights.append(_sell_conviction_weight(row))
+    assert weights == sorted(weights), 'weight must increase with % sold'
+
+
+def test_sell_conviction_100pct_disposal():
+    """Selling the entire position should get weight 1.0."""
+    from quant.factors import _sell_conviction_weight
+    row = pd.Series({'shares': -1000, 'post_txn_shares': 0})
+    assert _sell_conviction_weight(row) == pytest.approx(1.0)
