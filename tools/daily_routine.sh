@@ -19,11 +19,18 @@ LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 
 LOGFILE="$LOG_DIR/routine_$(date +%Y%m%d_%H%M).log"
-EMAIL="${QUANT_EMAIL:-liuxy.eylon2012@gmail.com}"
+EMAIL="${QUANT_EMAIL:?Set QUANT_EMAIL in .env or your shell profile}"
 INDEX="${QUANT_INDEX:-SPY}"
 MODE="${1:-full}"
 
 log() { echo "$(date '+%H:%M:%S')  $*" | tee -a "$LOGFILE"; }
+
+# Markets are closed on weekends — skip unless forced.
+DOW=$(date +%u)  # 1=Mon … 7=Sun
+if [ "$DOW" -ge 6 ] && [ "${QUANT_FORCE:-}" != "1" ]; then
+    echo "$(date '+%H:%M:%S')  weekend — skipping (set QUANT_FORCE=1 to override)" >> "$LOGFILE"
+    exit 0
+fi
 
 log "=== Quant routine ($MODE) — $(date '+%Y-%m-%d %H:%M') ==="
 log "index=$INDEX  email=$EMAIL  python=$PYTHON"

@@ -34,7 +34,7 @@ install)
     echo "Schedule:"
     echo "  🌅 Morning (7:00 AM) — quick refresh (news + prices) + report"
     echo "  🌆 Evening (6:30 PM) — full ingest + screens + report"
-    echo "  📧 Reports emailed to: ${QUANT_EMAIL:-liuxy.eylon2012@gmail.com}"
+    echo "  📧 Reports emailed to: \$QUANT_EMAIL (set in .env or shell profile)"
     echo ""
     echo "Logs: $ROOT/logs/"
     echo "To test now: bash tools/setup_schedule.sh run"

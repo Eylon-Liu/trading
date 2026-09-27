@@ -6,10 +6,14 @@
     <key>Label</key>
     <string>com.quant.evening</string>
 
+    <!-- Full ingest + all strategy screens + daily report.
+         The script itself skips weekends, so this fires daily and
+         exits immediately on Saturday / Sunday. -->
+
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/eylon/Desktop/Python/Quant Finance/trading/tools/daily_routine.sh</string>
+        <string>tools/daily_routine.sh</string>
         <string>full</string>
     </array>
 
@@ -21,18 +25,21 @@
         <integer>30</integer>
     </dict>
 
+    <!-- Set WorkingDirectory to the repo root on your machine, e.g.:
+         <string>/Users/you/trading</string>
+         The script resolves all other paths relative to this. -->
     <key>WorkingDirectory</key>
-    <string>/Users/eylon/Desktop/Python/Quant Finance/trading</string>
+    <string>/Users/CHANGEME/trading</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Library/Frameworks/Python.framework/Versions/3.12/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Library/Frameworks/Python.framework/Versions/3.12/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/eylon/Desktop/Python/Quant Finance/trading/logs/launchd_evening.log</string>
+    <string>logs/launchd_evening.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/eylon/Desktop/Python/Quant Finance/trading/logs/launchd_evening.log</string>
+    <string>logs/launchd_evening.log</string>
 </dict>
 </plist>
