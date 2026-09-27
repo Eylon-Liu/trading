@@ -9,14 +9,14 @@ bash run.sh          # install, create the database, load the Dow 30, launch
 ```
 
 <p align="center">
-  <img src="docs/screenshot-screen.png" alt="Screen tab — strategy selection and universe builder" width="700">
+  <img src="docs/screenshot-screen.png" alt="Screen tab — Buffett Quality strategy ranked results" width="700">
 </p>
-<p align="center"><em>Screen tab: choose a strategy, horizon, and universe, then run a point-in-time screen</em></p>
+<p align="center"><em>Screen tab: Buffett Quality on the S&P 500 — ranked results with sector mix and signal breakdown</em></p>
 
 <p align="center">
-  <img src="docs/screenshot-methodology.png" alt="Methodology tab — scoring pipeline" width="700">
+  <img src="docs/screenshot-intel.png" alt="Intel tab — company overview, price chart, and cross-strategy signals" width="700">
 </p>
-<p align="center"><em>Methodology tab: the full scoring pipeline — MAD winsorization, sector z-scores, composite blending</em></p>
+<p align="center"><em>Intel tab: company overview, candlestick chart with 50d MA, and screen recommendations across strategies</em></p>
 
 ---
 
