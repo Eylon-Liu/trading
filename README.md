@@ -8,6 +8,16 @@ Runs entirely on your machine — `python3 app.py`, then open `http://localhost:
 bash run.sh          # install, create the database, load the Dow 30, launch
 ```
 
+<p align="center">
+  <img src="docs/screenshot-screen.png" alt="Screen tab — strategy selection and universe builder" width="700">
+</p>
+<p align="center"><em>Screen tab: choose a strategy, horizon, and universe, then run a point-in-time screen</em></p>
+
+<p align="center">
+  <img src="docs/screenshot-methodology.png" alt="Methodology tab — scoring pipeline" width="700">
+</p>
+<p align="center"><em>Methodology tab: the full scoring pipeline — MAD winsorization, sector z-scores, composite blending</em></p>
+
 ---
 
 ## Two horizons, two different jobs
@@ -228,7 +238,7 @@ quant/               fundamentals, factors, transforms, strategies,
 nlp/                 sentiment (Loughran-McDonald), extract, summarize
 reports/             builder (HTML), email
 ui/                  theme, components, layout, pages/
-tests/               77 tests, including the look-ahead assertions
+tests/               278 tests, including the look-ahead assertions
 ```
 
 Storage is SQLite by default (~250–300 MB for 500 tickers × 10 years). Because the data layer is SQLAlchemy, moving to a hosted database is a `DATABASE_URL` change — Turso is the easiest since it *is* SQLite.
