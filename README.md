@@ -2,7 +2,7 @@
 
 A local web app for **mid- and long-horizon** equity research. It stores everything it fetches, so you can re-run a screen **as of any past date**, compare today against a month or a year ago, and backtest a strategy without accidentally using information that did not exist yet.
 
-Runs entirely on your machine — `python3 app.py`, then open `http://localhost:8050`. Uses only free data sources and needs **no API keys**.
+Runs entirely on your machine — `python3 app.py`, then open `http://localhost:8050`. Uses only free data sources; **no API keys required** for data, screening, or backtesting. An optional [AI analysis layer](#optional-ai-analysis-layer) adds natural-language interpretation when a Gemini or Anthropic key is set.
 
 ```bash
 bash run.sh          # install, create the database, load the Dow 30, launch
