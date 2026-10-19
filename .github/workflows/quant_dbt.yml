@@ -46,17 +46,18 @@ jobs:
       - name: Verify the tests can fail
         run: python scripts/mutation_check.py
 
-      # Compares against the Python implementation the models were translated
-      # from — the independent opinion, debugged against real filings.
-      - name: Check parity with the original implementation
-        run: |
-          pip install -r ../requirements.txt
-          QUANT_TRADING_PATH=.. python scripts/parity_check.py
-
       - name: Generate docs
         run: dbt docs generate --no-partial-parse
         env:
           DBT_PROFILES_DIR: .
+
+      # Last, because it installs the application's unpinned dependencies into
+      # the same environment and those could resolve over something dbt needs.
+      # Nothing after this step runs dbt.
+      - name: Check parity with the original implementation
+        run: |
+          pip install -r ../requirements.txt
+          QUANT_TRADING_PATH=.. python scripts/parity_check.py
 
       - name: Upload docs site
         uses: actions/upload-artifact@v4

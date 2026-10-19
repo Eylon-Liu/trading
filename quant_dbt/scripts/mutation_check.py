@@ -19,6 +19,7 @@ working tree is left as it was found.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -125,11 +126,15 @@ MUTATIONS = [
 
 def run_build() -> tuple[bool, str]:
     """Run dbt build. Returns (every_test_passed, combined_output)."""
+    # Inherit the environment and override only the profiles directory.
+    # Building a minimal env from scratch meant hardcoding PATH, which found
+    # dbt locally and not on a CI runner, where setup-python installs it under
+    # /opt/hostedtoolcache. There is nothing in the ambient environment this
+    # script needs protection from.
     proc = subprocess.run(
         ['dbt', 'build', '--no-partial-parse'],
         cwd=ROOT,
-        env={'DBT_PROFILES_DIR': '.', 'PATH': '/usr/local/bin:/usr/bin:/bin',
-             'HOME': str(Path.home())},
+        env={**os.environ, 'DBT_PROFILES_DIR': '.'},
         capture_output=True, text=True,
     )
     return proc.returncode == 0, proc.stdout + proc.stderr

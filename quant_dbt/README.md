@@ -260,10 +260,11 @@ cd .. && git clone -b quant_dbt_only trading quant_dbt && cd quant_dbt
 git remote set-url origin git@github.com:<you>/quant_dbt.git && git push -u origin main
 ```
 
-Then `quant_dbt/.github/workflows/dbt.yml` becomes the active workflow — it checks out
-the trading repo as a sibling for the parity step — and
+Then `quant_dbt/.github/workflows/dbt.yml` becomes the active workflow — it checks the
+trading repo out into `trading-src/` for the parity step — and
 `trading/.github/workflows/quant_dbt.yml` can be deleted. `scripts/parity_check.py`
-takes `QUANT_TRADING_PATH` if the two repos are not siblings.
+defaults to the parent directory and takes `QUANT_TRADING_PATH` (absolute or relative)
+when the two repos sit elsewhere.
 
 ## Docs site
 
