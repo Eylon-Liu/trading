@@ -104,7 +104,12 @@ def _build(n_clicks, kind, _strategy, email):
         return f'❌ {type(exc).__name__}: {str(exc)[:200]}', None, _history()
 
     status = f'✅ Written to {path}'
-    if email:
+    if email and config.DEMO_MODE:
+        # Building and previewing are harmless; sending is not. An open form
+        # wired to the deployer's SMTP account is an open relay.
+        status += ('  ·  🔒 email disabled in this demo — the preview below is '
+                   'the full report')
+    elif email:
         try:
             MAILER.send_report(html_doc, email,
                                subject=f'{kind.title()} Market Brief')

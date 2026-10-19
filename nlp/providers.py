@@ -100,6 +100,15 @@ def status() -> dict:
 
     label = 'Gemini' if provider == 'gemini' else 'Claude'
     model = model_name(provider)
+
+    if config.DEMO_MODE:
+        # Still 'enabled' so callers run and can serve a cached brief; the
+        # flag tells the UI to explain an empty result as policy, not failure.
+        return {'enabled': True, 'demo': True, 'provider': provider,
+                'model': model,
+                'reason': f'{label} ({model}) — cached analysis only in this '
+                          f'demo; new generation is disabled.'}
+
     return {'enabled': True, 'provider': provider, 'model': model,
             'reason': f'{label} analysis enabled ({model}).'}
 
@@ -114,6 +123,13 @@ def available() -> bool:
 
 def complete(user_prompt: str, system: str, max_tokens: int) -> str | None:
     """Run one completion on whichever backend is configured."""
+    # The one place a demo deployment can bill the owner's key. Gating here
+    # rather than in status() keeps already-generated briefs readable: callers
+    # check their cache before reaching this point, so a cache hit still
+    # renders and only a genuine new call is refused.
+    if config.DEMO_MODE:
+        return None
+
     provider = resolve()
     if provider == 'gemini':
         return _complete_gemini(user_prompt, system, max_tokens)

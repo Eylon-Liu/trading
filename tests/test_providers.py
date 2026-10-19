@@ -14,6 +14,18 @@ import config
 from nlp import providers
 
 
+@pytest.fixture(autouse=True)
+def _demo_mode_off(monkeypatch):
+    """Pin DEMO_MODE off for this module.
+
+    DEMO_MODE short-circuits `complete()` before any backend is chosen, so a
+    developer who happens to have it exported would see every transport test
+    fail for a reason unrelated to the transport. The demo gate has its own
+    tests below; these ones are about the provider.
+    """
+    monkeypatch.setattr(config, 'DEMO_MODE', False)
+
+
 # ─────────────────────────────────────────────
 # PROVIDER SELECTION
 # ─────────────────────────────────────────────
@@ -283,3 +295,50 @@ def test_empty_inputs_short_circuit_before_any_call(keys, monkeypatch):
     assert llm.explain_backtest('s', {}) is None
     assert llm.policy_impact(pd.DataFrame(), []) is None
     assert llm.compare_runs_narrative('s', 'a', 'b', [], [], [], []) is None
+
+
+# ─────────────────────────────────────────────
+# DEMO MODE
+# ─────────────────────────────────────────────
+
+def test_demo_mode_makes_no_billable_call(keys, monkeypatch):
+    """The property a public deployment depends on.
+
+    DEMO_MODE must stop the request before the transport, not merely hide the
+    output — a visitor clicking an AI panel cannot be allowed to spend the
+    deployer's quota.
+    """
+    keys(gemini='g')
+    monkeypatch.setattr(config, 'DEMO_MODE', True)
+
+    def explode(*a, **kw):
+        raise AssertionError('DEMO_MODE must not reach the network')
+
+    monkeypatch.setattr(providers.requests, 'post', explode)
+
+    assert providers.complete('prompt', 'system', 100) is None
+
+
+def test_demo_mode_reports_itself_without_claiming_to_be_off(keys, monkeypatch):
+    """Status stays enabled so cached briefs still render.
+
+    Reporting `enabled: False` would be simpler but would stop callers before
+    they consult their own cache, hiding analysis that was generated ahead of
+    deployment and costs nothing to show.
+    """
+    keys(gemini='g')
+    monkeypatch.setattr(config, 'DEMO_MODE', True)
+
+    s = providers.status()
+    assert s['enabled'] is True
+    assert s['demo'] is True
+
+
+def test_demo_mode_does_not_resurrect_a_disabled_backend(keys, monkeypatch):
+    """With no key, demo mode changes nothing — it only ever subtracts."""
+    keys()
+    monkeypatch.setattr(config, 'DEMO_MODE', True)
+
+    s = providers.status()
+    assert s['enabled'] is False
+    assert s.get('demo') is None

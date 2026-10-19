@@ -1,0 +1,72 @@
+name: dbt
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The parity check runs the original implementation side by side with the
+      # models, so it needs that repo on disk. `path` has to stay inside the
+      # workspace — actions/checkout rejects anything above it — so the repo
+      # lands in a subdirectory and parity_check.py is pointed at it.
+      - uses: actions/checkout@v4
+        with:
+          repository: Eylon-Liu/trading
+          path: trading-src
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      # Builds every model and runs every test against the committed fixtures.
+      # No warehouse, no credentials, no network — which is the point of
+      # keeping the fixtures in the repo rather than depending on a database
+      # dump that CI would have to fetch from somewhere.
+      - name: dbt build
+        run: dbt build --no-partial-parse
+        env:
+          DBT_PROFILES_DIR: .
+
+      # A green suite proves nothing by itself. This breaks each guard in turn
+      # and requires a specific test to go red, so a test that has quietly
+      # stopped checking anything fails the build instead of passing silently.
+      - name: Verify the tests can fail
+        run: python scripts/mutation_check.py
+
+      - name: Generate docs
+        run: dbt docs generate --no-partial-parse
+        env:
+          DBT_PROFILES_DIR: .
+
+      # Compares against the Python implementation the models were translated
+      # from. The tests only know what this project believes; the original was
+      # debugged against real filings and is the independent opinion.
+      #
+      # Last, because it installs the application's unpinned dependencies into
+      # the same environment and those could resolve over something dbt needs.
+      # Nothing after this step runs dbt.
+      - name: Check parity with the original implementation
+        run: |
+          pip install -r trading-src/requirements.txt
+          QUANT_TRADING_PATH=trading-src python scripts/parity_check.py
+
+      - name: Upload docs site
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-docs
+          path: |
+            target/index.html
+            target/manifest.json
+            target/catalog.json

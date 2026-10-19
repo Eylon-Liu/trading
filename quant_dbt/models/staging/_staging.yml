@@ -1,0 +1,54 @@
+version: 2
+
+models:
+  - name: stg_sec_facts
+    description: >
+      Raw XBRL facts, typed, with the reporting span classified. One row per
+      (concept, period, filing) — restatements are still present at this
+      layer and are resolved downstream.
+    columns:
+      - name: ticker
+        tests: [not_null]
+      - name: filed
+        description: When the figure became public. Every PIT read gates here.
+        tests: [not_null]
+      - name: duration_class
+        description: >
+          Q / H / 9M / A for recognised spans, 'other' for anything outside the
+          windows. This is what separates a quarterly figure from a
+          year-to-date cumulative sharing its end date.
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['Q', 'H', '9M', 'A', 'other']
+
+  - name: stg_prices
+    description: One OHLCV bar per (ticker, date), with the adjustment ratio.
+    columns:
+      - name: ticker
+        tests: [not_null]
+      - name: date
+        tests: [not_null]
+      - name: adj_ratio
+        description: adj_close / close — the factor that puts high and low on the adjusted basis.
+        tests: [not_null]
+
+  - name: stg_securities
+    columns:
+      - name: ticker
+        tests: [unique, not_null]
+
+  - name: stg_splits
+    columns:
+      - name: ticker
+        tests: [not_null]
+      - name: ratio
+        tests: [not_null]
+
+  - name: stg_index_members
+    columns:
+      - name: ticker
+        tests: [not_null]
+      - name: as_of
+        description: The date the membership was knowable, not its effective date.
+        tests: [not_null]

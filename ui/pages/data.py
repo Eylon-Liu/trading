@@ -26,6 +26,14 @@ from ui import theme as TH
 
 log = logging.getLogger(__name__)
 
+DEMO_PULL_MESSAGE = (
+    '🔒 Data ingestion is disabled in this public demo. Pulling would issue '
+    'hundreds of rate-limited SEC and Yahoo requests under the deployer\'s '
+    'identity, which an unauthenticated page cannot responsibly offer. The '
+    'database shipped with this demo is a point-in-time snapshot — everything '
+    'that reads it works normally. Clone the repo and run it locally to pull '
+    'live data.')
+
 INGEST_HELP = """\
 # One-time setup for a full S&P 500 universe (takes a while)
 python cli.py init
@@ -394,6 +402,9 @@ def _pull(n_clicks, index, scope):
     if not n_clicks:
         return no_update, no_update, no_update, no_update
 
+    if config.DEMO_MODE:
+        return (DEMO_PULL_MESSAGE, None, no_update, no_update)
+
     try:
         if index == 'ALL':
             tickers = db.read_sql(
@@ -445,6 +456,9 @@ def _pull(n_clicks, index, scope):
 def _sync_all_members(n_clicks):
     if not n_clicks:
         return no_update, no_update
+
+    if config.DEMO_MODE:
+        return (DEMO_PULL_MESSAGE, None)
 
     results = []
     for idx in config.INDEX_OPTIONS:

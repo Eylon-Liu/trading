@@ -1,0 +1,41 @@
+# Two targets, because the project has two jobs.
+#
+# `dev` (default) runs against the committed CSV fixtures in seeds/. It needs
+# no external state, which is what lets CI run the whole pipeline — models,
+# tests and all — on a clean checkout.
+#
+# `local` attaches the application's own SQLite store read-only, for checking
+# the models against real data volume and messiness. It is not the default
+# because that database is ~15-300MB, takes a network ingest to build, and
+# would make the project unrunnable for anyone who just cloned it.
+#
+# Both targets share one DuckDB file, so a `dbt build --target local` run
+# overwrites the dev build and vice versa. That is deliberate: the models are
+# identical and only their sources differ, so there is nothing to keep apart.
+
+quant_dbt:
+  target: dev
+  outputs:
+
+    dev:
+      type: duckdb
+      path: 'target/quant_dbt.duckdb'
+      threads: 4
+
+    # Attaching SQLite pulls DuckDB's `sqlite_scanner` extension, which is
+    # fetched over the network the first time and cached in ~/.duckdb
+    # afterwards. On a machine without outbound access the attach fails with
+    # "Failed to download extension"; `duckdb -c 'INSTALL sqlite;'` somewhere
+    # with network, once, is the whole fix.
+    local:
+      type: duckdb
+      path: 'target/quant_dbt.duckdb'
+      threads: 4
+      attach:
+        # DuckDB's sqlite extension reads the file in place — no export step,
+        # no copy to drift out of date. Read-only so a dbt run can never write
+        # back into the application's store.
+        - path: '../db/quant.sqlite'
+          type: sqlite
+          alias: quant
+          read_only: true

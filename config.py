@@ -33,6 +33,27 @@ DATABASE_URL = os.environ.get('DATABASE_URL', f'sqlite:///{DB_DIR / "quant.sqlit
 
 
 # ─────────────────────────────────────────────
+# DEMO MODE
+# ─────────────────────────────────────────────
+#
+# The app has no authentication, so on a public URL every visitor would be
+# spending the owner's resources: ingestion fires hundreds of rate-limited SEC
+# and Yahoo requests under the owner's SEC_USER_AGENT, the report builder can
+# send mail through the owner's SMTP account to any address typed into the
+# form, and each AI panel bills the owner's API key.
+#
+# DEMO_MODE closes those four surfaces and leaves everything that only reads
+# the database untouched, so a published demo stays useful without being an
+# open wallet. See README for what the demo can and cannot do.
+
+DEMO_MODE = os.environ.get('DEMO_MODE', '').strip().lower() in ('1', 'true', 'yes')
+
+# Backtests are CPU-bound and run inside the request, so a free-tier container
+# with two cores needs a ceiling that a local machine does not.
+DEMO_MAX_BACKTEST_YEARS = float(os.environ.get('DEMO_MAX_BACKTEST_YEARS', '3'))
+
+
+# ─────────────────────────────────────────────
 # TIMESTAMPS
 # ─────────────────────────────────────────────
 

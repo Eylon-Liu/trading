@@ -1,0 +1,39 @@
+version: 2
+
+sources:
+  - name: quant
+    description: >
+      The trading application's SQLite store, attached read-only by the `local`
+      target. Only reachable under that target — the default `dev` target reads
+      the committed fixtures in seeds/ instead, via the `raw()` macro.
+    database: quant
+    schema: main
+
+    tables:
+      - name: sec_facts
+        description: >
+          One row per (concept, period, filing). Restatements produce several
+          rows for the same period with different `filed` dates, and
+          period_start together with period_end is what distinguishes a
+          quarterly figure from a year-to-date cumulative sharing its end date.
+        columns:
+          - name: filed
+            description: >
+              When the figure became public. Every point-in-time read gates on
+              this, never on period_end.
+
+      - name: prices
+        description: One OHLCV bar per (ticker, date).
+
+      - name: splits
+        description: >
+          One row per split event. Needed because the price feed is restated
+          after a split but SEC share counts are not.
+
+      - name: securities
+        description: One row per ticker — the security master.
+
+      - name: index_members
+        description: >
+          Point-in-time index membership. `as_of` is the date the membership
+          was knowable, not the date it took effect.
