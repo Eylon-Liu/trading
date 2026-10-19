@@ -1,0 +1,19 @@
+# Keep the build context small and the image free of local state.
+.git
+.githooks
+__pycache__
+*.pyc
+.pytest_cache
+
+# Local data and caches — the container creates its own.
+db/
+cache/
+logs/
+reports/out/
+
+# Local secrets must never reach an image layer.
+.env
+
+# Not needed at runtime.
+docs/
+tools/launchd/
