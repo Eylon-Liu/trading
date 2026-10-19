@@ -301,6 +301,14 @@ def ai_panel(generate, title: str = '🤖 AI analysis',
                  'quantitative output is unaffected.', 'warn'),
         ])
 
+    if not text and status.get('demo'):
+        return _wrap([
+            note('AI analysis is disabled in this public demo — generating it '
+                 'would spend the owner\'s API quota on every visitor. Panels '
+                 'generated before deployment still display. Run the app '
+                 'locally with a key to see this one.', 'info'),
+        ])
+
     if not text:
         return _wrap([
             note(f"AI analysis is enabled ({status['model']}) but this request "

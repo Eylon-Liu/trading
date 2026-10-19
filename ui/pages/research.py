@@ -15,6 +15,7 @@ import dash_bootstrap_components as dbc
 import pandas as pd
 from dash import Input, Output, State, callback, dcc, html, no_update
 
+import config
 from data.universe import PRESETS, UniverseSpec
 from nlp import llm as LLM
 from quant import backtest as BT
@@ -24,6 +25,34 @@ from ui import components as C
 from ui import theme as TH
 
 log = logging.getLogger(__name__)
+
+
+def _cap_demo_start(start):
+    """Clamp a backtest start date to the demo's window.
+
+    A walk-forward backtest re-runs the whole scoring engine at every
+    rebalance, so its cost scales with the window. On a shared free-tier
+    container an unbounded start date is how one visitor stalls the page for
+    everyone else. Returns the possibly-adjusted start and a note to append to
+    the status line, so a shortened run never silently claims to be the one
+    that was asked for.
+    """
+    floor = date.today() - timedelta(days=int(365.25 * config.DEMO_MAX_BACKTEST_YEARS))
+
+    if not start:
+        return floor.isoformat(), ''
+
+    try:
+        requested = date.fromisoformat(str(start)[:10])
+    except ValueError:
+        return floor.isoformat(), ''
+
+    if requested >= floor:
+        return start, ''
+
+    return floor.isoformat(), (
+        f'  ·  🔒 start capped to {floor:%Y-%m-%d} '
+        f'({config.DEMO_MAX_BACKTEST_YEARS:g}y) in this demo')
 
 
 def layout() -> html.Div:
@@ -96,6 +125,10 @@ def layout() -> html.Div:
 def _run_backtest(n_clicks, strategy, preset, start, holdings, rebalance):
     if not n_clicks or not strategy:
         return no_update, '', False
+
+    capped_note = ''
+    if config.DEMO_MODE:
+        start, capped_note = _cap_demo_start(start)
 
     try:
         base = PRESETS.get(preset or 'dia', UniverseSpec())
@@ -214,4 +247,4 @@ def _run_backtest(n_clicks, strategy, preset, start, holdings, rebalance):
         lambda: LLM.explain_backtest(strat.name, m),
         title='🤖 AI read on this backtest', className='mb-3'))
 
-    return html.Div(panels), f'✅ {res.summary()}', False
+    return html.Div(panels), f'✅ {res.summary()}{capped_note}', False
