@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: fct_factor_inputs_pit
+    description: >
+      One row per ticker, as of a single date. Everything here was knowable on
+      `as_of`; move that var and the whole table moves with it.
+    columns:
+      - name: ticker
+        tests: [unique, not_null]
+      - name: as_of
+        tests: [not_null]
+      - name: last_fact_filed
+        description: >
+          Newest filing date contributing to this row. Must never exceed
+          as_of — asserted in tests/assert_no_lookahead_in_pit_mart.sql.
+
+  - name: dim_security
+    description: Security identity and classification, one row per ticker.
+    columns:
+      - name: ticker
+        tests: [unique, not_null]
+      - name: sector
+        description: From SEC SIC codes — coarser than GICS, but always present.
+        tests: [not_null]

@@ -1,0 +1,10 @@
+index_symbol,ticker,as_of,source,confidence
+DEMO,AAPL,2021-06-01,wiki_revision,1.0
+DEMO,RSTT,2021-06-01,wiki_revision,1.0
+DEMO,ABMD,2021-06-01,wiki_revision,1.0
+DEMO,AAPL,2026-01-01,wiki_revision,1.0
+DEMO,RSTT,2026-01-01,wiki_revision,1.0
+DEMO,PRXY,2026-01-01,wiki_revision,1.0
+DEMO,TAGS,2026-01-01,wiki_revision,1.0
+DEMO,RTRD,2026-01-01,wiki_revision,1.0
+DEMO,SPLT,2026-01-01,wiki_revision,1.0

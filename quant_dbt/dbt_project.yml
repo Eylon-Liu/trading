@@ -1,0 +1,53 @@
+name: 'quant_dbt'
+version: '1.0.0'
+config-version: 2
+profile: 'quant_dbt'
+
+model-paths: ['models']
+seed-paths: ['seeds']
+test-paths: ['tests']
+macro-paths: ['macros']
+target-path: 'target'
+clean-targets: ['target', 'dbt_packages']
+
+vars:
+  # The point-in-time cutoff. Every model that reads a filing-dated table gates
+  # on `filed <= as_of`, so moving this date moves the whole pipeline to what
+  # was knowable then — which is the property the entire project exists to
+  # demonstrate.
+  #
+  #   dbt build --vars 'as_of: 2026-05-15'
+  #
+  # The default sits after every fixture filing so a plain `dbt build` sees the
+  # complete history. Tests that need a mid-history view pass their own date.
+  as_of: '2026-12-31'
+
+  # Only financial statements carry figures in the units the rest of the
+  # pipeline assumes. A DEF 14A proxy reports in thousands, and because
+  # restatement collapsing keeps the newest filing, a proxy filed after a 10-K
+  # silently replaced $3.5B with $3,511 for ANET, PCG, ED, SCHW and STZ.
+  statement_forms: ['10-K', '10-Q', '10-K/A', '10-Q/A', '10-KT', '10-QT', '20-F', '20-F/A']
+
+models:
+  quant_dbt:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
+
+seeds:
+  quant_dbt:
+    +schema: raw
+    # Dates would otherwise land as VARCHAR and compare lexicographically,
+    # which happens to work for ISO dates and then stops working the moment
+    # arithmetic is involved.
+    raw_sec_facts:
+      +column_types: {period_start: date, period_end: date, filed: date, val: double}
+    raw_prices:
+      +column_types: {date: date, open: double, high: double, low: double, close: double, adj_close: double, volume: double}
+    raw_splits:
+      +column_types: {date: date, ratio: double}
+    raw_index_members:
+      +column_types: {as_of: date, confidence: double}

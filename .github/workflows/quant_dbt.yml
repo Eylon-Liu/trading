@@ -1,0 +1,68 @@
+# Runs the quant_dbt pipeline while it still lives inside this repository.
+#
+# GitHub only reads workflows from the repository root, so quant_dbt's own
+# .github/workflows/dbt.yml does not fire from a subdirectory. This is the
+# version that runs today; when quant_dbt moves to its own repository, that
+# one takes over and this file goes away.
+
+name: quant_dbt
+
+on:
+  push:
+    branches: [main]
+    paths: ['quant_dbt/**', '.github/workflows/quant_dbt.yml']
+  pull_request:
+    paths: ['quant_dbt/**', 'quant/fundamentals.py', '.github/workflows/quant_dbt.yml']
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: quant_dbt
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      # Builds every model and runs every test against the committed fixtures.
+      # No warehouse, no credentials, no network.
+      - name: dbt build
+        run: dbt build --no-partial-parse
+        env:
+          DBT_PROFILES_DIR: .
+
+      # A green suite proves nothing by itself. This breaks each guard in turn
+      # and requires a specific test to go red.
+      - name: Verify the tests can fail
+        run: python scripts/mutation_check.py
+
+      # Compares against the Python implementation the models were translated
+      # from — the independent opinion, debugged against real filings.
+      - name: Check parity with the original implementation
+        run: |
+          pip install -r ../requirements.txt
+          QUANT_TRADING_PATH=.. python scripts/parity_check.py
+
+      - name: Generate docs
+        run: dbt docs generate --no-partial-parse
+        env:
+          DBT_PROFILES_DIR: .
+
+      - name: Upload docs site
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-docs
+          path: |
+            quant_dbt/target/index.html
+            quant_dbt/target/manifest.json
+            quant_dbt/target/catalog.json

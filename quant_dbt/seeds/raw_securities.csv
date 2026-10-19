@@ -1,0 +1,8 @@
+ticker,cik,name,sector,industry,exchange,country
+AAPL,0000320193,Apple Inc.,Information Technology,Electronic Computers,NASDAQ,US
+RSTT,0000999001,Restatement Industries,Industrials,Machinery,NYSE,US
+PRXY,0000999002,Proxy Units Corp,Utilities,Electric Services,NYSE,US
+TAGS,0000999003,Camden-Style Realty,Real Estate,REIT Residential,NYSE,US
+RTRD,0000999004,Retired Tag Holdings,Consumer Staples,Food Products,NYSE,US
+SPLT,0000999005,Split Dynamics,Information Technology,Semiconductors,NASDAQ,US
+STAL,0000999006,Stale Counts Energy,Energy,Petroleum Refining,NYSE,US

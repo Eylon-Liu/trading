@@ -1,0 +1,71 @@
+version: 2
+
+# The order of these models IS the business logic. Three of the bugs they
+# guard against were not wrong logic but correct logic in the wrong place, so
+# each description says what must already have happened upstream.
+
+models:
+  - name: int_facts_pit
+    description: >
+      Step 1. Form whitelist, then the `filed <= as_of` gate. Must precede
+      restatement collapsing: a DEF 14A reports in thousands and, being filed
+      later than the 10-K, would win the "newest filing" contest in step 3.
+    columns:
+      - name: filed
+        tests: [not_null]
+
+  - name: int_facts_tagged
+    description: >
+      Step 2. One XBRL tag per (ticker, concept) — drop retired tags first,
+      then take the largest median magnitude. The order matters: magnitude
+      alone picks a retired tag precisely when it is the largest one.
+
+  - name: int_facts_deduped
+    description: >
+      Step 3. One row per reported period, newest knowable filing wins.
+      Replaces quant/fundamentals.py::_latest_filed entirely with QUALIFY.
+      Its grain is asserted in
+      tests/assert_one_row_per_period_after_dedupe.sql — written as a singular
+      test rather than pulling in dbt_utils for a single composite-key check.
+
+  - name: int_quarterly_flows
+    description: >
+      Step 4. Genuine single-quarter observations, including quarters that were
+      only ever reported cumulatively and are recovered by differencing. A
+      derived quarter carries the LATER of its two constituent filing dates,
+      because it is not knowable until both exist.
+    columns:
+      - name: is_derived
+        description: True when the quarter was differenced out of cumulative filings.
+        tests: [not_null]
+
+  - name: int_ttm_fundamentals
+    description: >
+      Step 5. Trailing-twelve-month totals — four quarters, or a labelled
+      annual fallback, or nothing. Never an annualised single quarter.
+    columns:
+      - name: ttm_source
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['quarters', 'annual']
+      - name: quarters_used
+        tests: [not_null]
+
+  - name: int_latest_stocks
+    description: Step 5b. Latest knowable balance-sheet value per concept.
+
+  - name: int_shares_split_adjusted
+    description: >
+      Step 6. Share counts restated for splits dated after the count was filed
+      and at or before as_of. Must precede any market-cap or per-share
+      arithmetic.
+    columns:
+      - name: split_factor
+        tests: [not_null]
+
+  - name: int_adjusted_prices
+    description: >
+      Step 7. One adjustment basis per bar. `raw_close` is kept deliberately —
+      it is the correct input for market cap, since share counts carry their
+      own split restatement.
