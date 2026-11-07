@@ -60,6 +60,9 @@ def store(tmp_path, monkeypatch):
     _db.init_db()
     yield _db
     _db.get_engine().dispose()
+    # The reload left the module bound to this test's file; drop it so the
+    # next test reconnects to whatever DATABASE_URL is current.
+    _db._engine = None
 
 
 # ─────────────────────────────────────────────

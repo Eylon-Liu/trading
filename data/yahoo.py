@@ -21,6 +21,7 @@ import pandas as pd
 
 import config
 from core import db, http
+from core import market_calendar as MC
 
 log = logging.getLogger(__name__)
 
@@ -143,14 +144,46 @@ def _parse_chart(payload: dict, ticker: str) -> pd.DataFrame:
     df['ticker'] = ticker
 
     df = df.dropna(subset=['close']).drop_duplicates(subset=['date'], keep='last')
-    return df.sort_values('date').reset_index(drop=True)
+    df = df.sort_values('date').reset_index(drop=True)
+    return _drop_unfinished_bar(df, result.get('meta') or {})
 
 
-def _fetch_chart(ticker: str, period: str = '10y') -> pd.DataFrame:
+def _drop_unfinished_bar(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    """
+    Remove the trailing bar when the payload says its session was still live.
+
+    During market hours the chart API returns today's bar with the latest
+    trade as its close. Stored under the same (ticker, date) key as a final
+    bar, it was never replaced: the next check found a bar for that date and
+    called the ticker current, so an intraday print became the permanent
+    close. `regularMarketTime` is the time of the last trade the payload
+    reflects; a bar is final only once that reaches the session's close.
+    """
+    if df.empty:
+        return df
+    stamp = meta.get('regularMarketTime')
+    if not stamp:
+        return df
+    try:
+        traded = pd.Timestamp(int(stamp), unit='s', tz='UTC')
+    except (TypeError, ValueError):
+        return df
+    last_day = df['date'].iloc[-1].date()
+    if not MC.is_trading_day(last_day):
+        return df
+    close = pd.Timestamp(MC.session_close(last_day)).tz_convert('UTC')
+    if traded < close - pd.Timedelta(minutes=1):
+        return df.iloc[:-1]
+    return df
+
+
+def _fetch_chart(ticker: str, period: str = '10y',
+                 ttl: int | None = None) -> pd.DataFrame:
     """Primary path: the chart endpoint, with a yfinance fallback."""
     payload = http.fetch_json(
         CHART_URL.format(ticker=ticker), category='prices',
         params={'range': period, 'interval': '1d', 'events': 'div,split'},
+        ttl=ttl,
     )
     df = _parse_chart(payload, ticker) if payload else pd.DataFrame()
     if not df.empty:
@@ -178,27 +211,138 @@ def _fetch_chart(ticker: str, period: str = '10y') -> pd.DataFrame:
 
 
 def _existing_range(ticker: str) -> tuple[date | None, date | None]:
-    row = db.read_sql(
-        'SELECT MIN(date) AS lo, MAX(date) AS hi FROM prices WHERE ticker = :t',
-        {'t': ticker})
-    if row.empty or pd.isna(row.iloc[0]['hi']):
-        return None, None
-    return (pd.to_datetime(row.iloc[0]['lo']).date(),
-            pd.to_datetime(row.iloc[0]['hi']).date())
+    return _existing_ranges([ticker]).get(ticker, (None, None))
 
 
-def _period_for(last: date | None, full_period: str) -> str | None:
-    """Smallest range that closes the gap, or None when already current."""
+def _existing_ranges(tickers: list[str]) -> dict[str, tuple[date, date]]:
+    """Oldest and newest stored bar per ticker, in one query."""
+    if not tickers:
+        return {}
+    ph = ','.join(f':t{i}' for i in range(len(tickers)))
+    df = db.read_sql(
+        f'SELECT ticker, MIN(date) AS lo, MAX(date) AS hi FROM prices '
+        f'WHERE ticker IN ({ph}) GROUP BY ticker',
+        {f't{i}': t for i, t in enumerate(tickers)})
+    out = {}
+    for _i, r in df.iterrows():
+        if pd.isna(r['hi']):
+            continue
+        out[r['ticker']] = (pd.to_datetime(r['lo']).date(),
+                            pd.to_datetime(r['hi']).date())
+    return out
+
+
+# Yahoo range buckets, each paired with a calendar-day span comfortably
+# shorter than what the range returns. The margin guarantees the response
+# reaches back past the newest stored bar, so every incremental fetch
+# overlaps at least one bar already in the store — which is what lets a
+# split or dividend re-basing be detected at all.
+_RANGES = ((3, '5d'), (25, '1mo'), (80, '3mo'), (170, '6mo'),
+           (350, '1y'), (720, '2y'), (1800, '5y'), (3600, '10y'))
+
+
+def _today_et() -> date:
+    return datetime.now(MC.ET).date()
+
+
+def _period_for(last: date | None, full_period: str,
+                target: date | None = None) -> str | None:
+    """
+    Smallest range that closes the gap to `target`, or None when current.
+
+    `target` is the last *completed* session. The previous version compared
+    against the calendar date and skipped any gap of one day, which meant an
+    evening run never fetched that day's close: on Tuesday at 18:30 the newest
+    bar was Monday's, the gap was one day, and Tuesday's bar was not requested
+    until Wednesday — so every evening screen ran on the previous close.
+    """
     if last is None:
         return full_period
-    gap = (date.today() - last).days
-    if gap <= 1:
+    target = target or MC.last_completed_session()
+    if last >= target:
         return None
-    for days, period in ((5, '5d'), (28, '1mo'), (85, '3mo'),
-                         (170, '6mo'), (350, '1y'), (720, '2y'), (1800, '5y')):
+    gap = (_today_et() - last).days
+    for days, period in _RANGES:
         if gap <= days:
             return period
     return full_period
+
+
+def _period_covering(first: date | None, full_period: str) -> str:
+    """A range long enough to rewrite everything stored from `first` on."""
+    if first is None:
+        return full_period
+    span = (_today_et() - first).days
+    for days, period in _RANGES:
+        if span <= days and period in ('1y', '2y', '5y', '10y'):
+            return period
+    return 'max'
+
+
+# Tolerances for deciding the provider has re-based its history. A split
+# moves every earlier close by the split ratio; a dividend moves every earlier
+# adj_close by (1 - D/P), as little as a few hundredths of a percent.
+_CLOSE_TOL = 0.005
+_ADJ_TOL = 2e-4
+
+
+def _basis_changed(fresh: pd.DataFrame, stored: pd.DataFrame) -> bool:
+    """
+    True when bars present in both frames disagree beyond rounding.
+
+    Yahoo restates the *whole* history after a split (close) or dividend
+    (adj_close). Upserting only the new bars left everything older on the
+    previous basis: a 10-for-1 split read as a 90% one-day crash in every
+    momentum and volatility factor, and each dividend since the first ingest
+    was silently dropped from total return.
+    """
+    if fresh.empty or stored.empty:
+        return False
+    a = fresh[['date', 'close', 'adj_close']].copy()
+    b = stored[['date', 'close', 'adj_close']].copy()
+    a['date'] = pd.to_datetime(a['date']).dt.normalize()
+    b['date'] = pd.to_datetime(b['date']).dt.normalize()
+    both = a.merge(b, on='date', suffixes=('_new', '_old')).dropna(
+        subset=['close_new', 'close_old'])
+    if both.empty:
+        return False
+
+    def rel(new, old):
+        old = old.astype(float).replace(0, np.nan)
+        return ((new.astype(float) / old) - 1).abs()
+
+    if (rel(both['close_new'], both['close_old']) > _CLOSE_TOL).any():
+        return True
+    adj = both.dropna(subset=['adj_close_new', 'adj_close_old'])
+    return bool((rel(adj['adj_close_new'], adj['adj_close_old']) > _ADJ_TOL).any())
+
+
+def _stored_bars(ticker: str, start: date) -> pd.DataFrame:
+    return db.read_sql(
+        'SELECT date, close, adj_close FROM prices '
+        'WHERE ticker = :t AND date >= :s ORDER BY date',
+        {'t': ticker, 's': str(start)}, parse_dates=['date'])
+
+
+def _to_rows(df: pd.DataFrame, ticker: str) -> list[dict]:
+    rows = [{
+        'ticker': r['ticker'], 'date': r['date'].date(),
+        'open': _f(r['open']), 'high': _f(r['high']), 'low': _f(r['low']),
+        'close': _f(r['close']), 'adj_close': _f(r['adj_close']),
+        'volume': _f(r['volume']),
+    } for _i, r in df.iterrows()]
+    return _validate_bars(rows, ticker)
+
+
+def _cache_ttl(target: date) -> int:
+    """
+    Seconds a cached chart payload stays usable: only if written after the
+    target session's bar was final. An entry cached at 14:00 would otherwise
+    be served at 17:00 and its intraday bar stored as the close.
+    """
+    published = MC.session_published(target)
+    age = (datetime.now(MC.ET) - published).total_seconds()
+    return max(60, int(age))
 
 
 def update_prices(tickers: list[str], period: str = '10y',
@@ -206,16 +350,28 @@ def update_prices(tickers: list[str], period: str = '10y',
     """
     Fetch and store daily bars, skipping tickers already current.
 
+    Three rules keep the store consistent:
+
+      * only *completed* sessions are written — a bar for a session still
+        trading is dropped, never stored as if final;
+      * every incremental fetch overlaps stored bars, and if the provider
+        has re-based them (split, dividend, correction) the ticker's whole
+        history is re-fetched so old and new bars share one basis;
+      * when that re-fetch fails, the new bars are not written either:
+        consistent-but-stale beats current-but-mixed.
+
     Returns the number of rows written.
     """
     tickers = sorted({t for t in tickers if t})
     if not tickers:
         return 0
 
+    target = MC.last_completed_session()
+    have = _existing_ranges(tickers)
     jobs: list[tuple[str, str]] = []
     for t in tickers:
-        _lo, hi = _existing_range(t)
-        p = period if force else _period_for(hi, period)
+        _lo, hi = have.get(t, (None, None))
+        p = period if force else _period_for(hi, period, target)
         if p:
             jobs.append((t, p))
 
@@ -225,28 +381,57 @@ def update_prices(tickers: list[str], period: str = '10y',
     if not jobs:
         return 0
 
+    ttl = 0 if force else _cache_ttl(target)
+    target_ts = pd.Timestamp(target)
+
+    def completed(df: pd.DataFrame) -> pd.DataFrame:
+        return df[df['date'] <= target_ts] if not df.empty else df
+
     written = 0
+    rebase: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_chart, t, p): t for t, p in jobs}
+        futures = {pool.submit(_fetch_chart, t, p, ttl): t for t, p in jobs}
         for fut in as_completed(futures):
             t = futures[fut]
             try:
-                df = fut.result()
+                df = completed(fut.result())
             except Exception as exc:              # noqa: BLE001
                 log.warning('price fetch failed for %s: %s', t, exc)
                 db.record_ingest('prices', t, error=str(exc)[:200])
                 continue
             if df.empty:
                 continue
-            rows = [{
-                'ticker': r['ticker'], 'date': r['date'].date(),
-                'open': _f(r['open']), 'high': _f(r['high']), 'low': _f(r['low']),
-                'close': _f(r['close']), 'adj_close': _f(r['adj_close']),
-                'volume': _f(r['volume']),
-            } for _i, r in df.iterrows()]
-            rows = _validate_bars(rows, t)
+            if t in have and not force:
+                stored = _stored_bars(t, df['date'].min().date())
+                if _basis_changed(df, stored):
+                    rebase[t] = df
+                    continue
+            rows = _to_rows(df, t)
             if not rows:
                 continue
+            written += db.upsert(db.prices, rows)
+            db.record_ingest('prices', t, rows=len(rows))
+
+    if rebase:
+        log.info('prices: %d ticker(s) re-based by the provider (split, '
+                 'dividend or correction) — refetching full history: %s',
+                 len(rebase), ', '.join(sorted(rebase)))
+    for t, recent in sorted(rebase.items()):
+        full_period = _period_covering(have[t][0], period)
+        try:
+            full = completed(_fetch_chart(t, full_period, ttl=0))
+        except Exception as exc:                  # noqa: BLE001
+            full = pd.DataFrame()
+            log.warning('full refetch failed for %s: %s', t, exc)
+        # The refetch must agree with the fresh incremental bars; anything
+        # else (an empty response, a stale cached payload) is not written.
+        if full.empty or _basis_changed(full, recent):
+            db.record_ingest('prices', t,
+                             error='history re-based by provider; full '
+                                   'refetch failed — kept stored bars')
+            continue
+        rows = _to_rows(full, t)
+        if rows:
             written += db.upsert(db.prices, rows)
             db.record_ingest('prices', t, rows=len(rows))
 
