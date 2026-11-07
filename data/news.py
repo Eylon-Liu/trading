@@ -16,7 +16,9 @@ which is why the strategies lean on those instead.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
@@ -34,8 +36,22 @@ YAHOO_RSS = 'https://feeds.finance.yahoo.com/rss/2.0/headline'
 GOOGLE_RSS = 'https://news.google.com/rss/search'
 
 
-def _mk_id(ticker: str, title: str, published) -> str:
-    raw = f'{ticker}|{(title or "").strip().lower()}|{published}'
+def normalize_title(title: str | None) -> str:
+    """Case- and whitespace-insensitive form of a headline, for identity."""
+    return re.sub(r'\s+', ' ', (title or '').strip().lower())
+
+
+def _mk_id(ticker: str, title: str, published=None) -> str:
+    """
+    Stable article id: ticker plus normalised headline.
+
+    The publish time used to be part of the id. Items with no timestamp were
+    stamped with the fetch time, so each refresh (every three hours) minted a
+    new id for the same article and stored it again — and the copy then read
+    as fresh news in the next report. `published` is accepted and ignored so
+    older callers keep working.
+    """
+    raw = f'{ticker}|{normalize_title(title)}'
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -139,8 +155,9 @@ def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]
             'body_summary': SUM.summarize(it['body'], max_sentences=2) if it['body'] else '',
             'sentiment': sent['polarity'], 'sentiment_label': sent['label'],
             'events': ','.join(ex.events)[:200],
-            'extracted_json': pd.io.json.dumps(ex.to_dict())
-            if hasattr(pd.io.json, 'dumps') else str(ex.to_dict()),
+            # json, not repr: pandas 2 removed pd.io.json.dumps, and the
+            # fallback stored a Python repr that no JSON reader can parse.
+            'extracted_json': json.dumps(ex.to_dict(), default=str),
             'fetched_at': datetime.utcnow(),
         })
     return rows
@@ -170,7 +187,9 @@ def update_news(tickers: list[str]) -> int:
                 log.warning('news failed for %s: %s', t, exc)
                 continue
             if rows:
-                written += db.upsert(db.news, rows)
+                # First sighting wins: an article already stored keeps its
+                # original publish time instead of being re-dated to now.
+                written += db.upsert(db.news, rows, on_conflict='ignore')
             db.record_ingest('news', t, rows=len(rows) if rows else 0)
 
     log.info('news: %d articles across %d tickers', written, len(tickers))

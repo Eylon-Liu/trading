@@ -329,7 +329,8 @@ def _screen_context_panel(ticker: str) -> html.Div | None:
         ma_events = db.read_sql(
             "SELECT 1 FROM corporate_events WHERE ticker = :t "
             "AND item_code = '2.01' AND filed >= date(:cutoff) LIMIT 1",
-            {'t': ticker, 'cutoff': str(date.today().replace(year=date.today().year - 1))})
+            {'t': ticker, 'cutoff': str((pd.Timestamp(date.today())
+                                         - pd.DateOffset(years=1)).date())})
         had_ma = not ma_events.empty
     except Exception:  # noqa: BLE001
         pass

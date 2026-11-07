@@ -98,7 +98,8 @@ class UniverseSpec:
                         'No PIT membership for %s at %s — falling back to '
                         'current constituents (%d names). Historical screens '
                         'may have survivorship bias. Run '
-                        '"cli.py backfill-members %s" to fix.',
+                        '"cli.py ingest --index %s --members-from 2015-01-01" '
+                        'to fix.',
                         self.preset, as_of, len(candidates), self.preset)
         else:
             candidates = db.read_sql(

@@ -267,6 +267,8 @@ runs = Table(
     Column('params_json', Text),
     Column('universe_n', Integer),
     Column('created_at', DateTime),
+    # "Latest run of strategy S on or before D" is the report's hot query.
+    Index('ix_runs_lookup', 'strategy', 'as_of', 'created_at'),
 )
 
 factor_scores = Table(
@@ -377,8 +379,28 @@ def get_engine() -> Engine:
 
 def init_db() -> None:
     """Create every table and index if absent. Safe to run repeatedly."""
-    metadata.create_all(get_engine())
+    eng = get_engine()
+    metadata.create_all(eng)
+    _ensure_indexes(eng)
     log.info('schema ready at %s', config.DATABASE_URL)
+
+
+def _ensure_indexes(eng: Engine) -> None:
+    """
+    Create indexes declared in the schema but missing from the database.
+
+    `create_all` skips a table that already exists, *including* its indexes,
+    so an index added to the schema after a database was first built never
+    reached it. This closes that gap for existing stores; it is a no-op on a
+    fresh one.
+    """
+    with eng.begin() as conn:
+        for table in metadata.sorted_tables:
+            for ix in table.indexes:
+                try:
+                    ix.create(conn, checkfirst=True)
+                except Exception as exc:              # noqa: BLE001
+                    log.warning('could not create index %s: %s', ix.name, exc)
 
 
 @contextmanager
@@ -400,7 +422,8 @@ def execute(sql: str, params: dict | None = None) -> int:
         return result.rowcount or 0
 
 
-def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
+def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000,
+           on_conflict: str = 'update', conn=None) -> int:
     """
     Insert-or-replace rows keyed on the table's primary key.
 
@@ -414,13 +437,19 @@ def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
     and created_at to NULL, and the report then showed in the history with no
     file and no date. A caller that names a column intends to change it; one
     that omits it does not intend to erase it.
+
+    `on_conflict='ignore'` keeps the existing row untouched — first write
+    wins. `conn` joins an outer transaction so several writes commit or roll
+    back together.
     """
     rows = [r for r in rows if r]
     if not rows:
         return 0
+    if conn is None:
+        with get_engine().begin() as own:
+            return upsert(table, rows, chunk, on_conflict, conn=own)
 
-    eng = get_engine()
-    dialect = eng.dialect.name
+    dialect = conn.dialect.name
     total = 0
 
     if dialect == 'sqlite':
@@ -432,43 +461,45 @@ def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
 
     pk_cols = [c.name for c in table.primary_key.columns]
 
-    with eng.begin() as conn:
-        for i in range(0, len(rows), chunk):
-            batch = rows[i:i + chunk]
-            if _insert is None:
-                conn.execute(table.insert(), batch)
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        if _insert is None:
+            conn.execute(table.insert(), batch)
+        else:
+            stmt = _insert(table).values(batch)
+            # Only what this batch actually carries. A column absent from
+            # every row in the batch is left alone rather than nulled.
+            supplied = {k for r in batch for k in r}
+            update_cols = {
+                c.name: stmt.excluded[c.name]
+                for c in table.columns
+                if c.name not in pk_cols and c.name in supplied
+            }
+            if update_cols and on_conflict == 'update':
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=pk_cols, set_=update_cols
+                )
             else:
-                stmt = _insert(table).values(batch)
-                # Only what this batch actually carries. A column absent from
-                # every row in the batch is left alone rather than nulled.
-                supplied = {k for r in batch for k in r}
-                update_cols = {
-                    c.name: stmt.excluded[c.name]
-                    for c in table.columns
-                    if c.name not in pk_cols and c.name in supplied
-                }
-                if update_cols:
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=pk_cols, set_=update_cols
-                    )
-                else:
-                    stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
-                conn.execute(stmt)
-            total += len(batch)
+                stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
+            conn.execute(stmt)
+        total += len(batch)
 
     return total
 
 
 def record_ingest(source: str, key: str, rows: int = 0, error: str | None = None) -> None:
-    """Bookkeeping so the Data tab can show freshness and failures."""
-    upsert(ingest_log, [{
-        'source': source,
-        'key': key,
-        'last_success': pd.Timestamp.utcnow().to_pydatetime().replace(tzinfo=None)
-                        if error is None else None,
-        'last_error': error,
-        'rows': rows,
-    }])
+    """
+    Bookkeeping so the Data tab can show freshness and failures.
+
+    A failure records the error and leaves `last_success` alone. Writing NULL
+    there erased the time of the last good refresh, so one bad fetch made a
+    source look as if it had never been loaded.
+    """
+    row = {'source': source, 'key': key, 'last_error': error}
+    if error is None:
+        row['last_success'] = config.utc_now()
+        row['rows'] = rows
+    upsert(ingest_log, [row])
 
 
 # ─────────────────────────────────────────────

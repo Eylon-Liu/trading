@@ -274,8 +274,10 @@ def _run_validation(n_clicks, universe, survivorship):
     if survivorship and 'yes' in survivorship and universe != 'ALL':
         for yr_back in (1, 3, 5):
             try:
-                as_of = date(date.today().year - yr_back, date.today().month,
-                             date.today().day)
+                # DateOffset, not date(year - n, ...): that raised on Feb 29
+                # and the except below silently skipped the check.
+                as_of = (pd.Timestamp(date.today())
+                         - pd.DateOffset(years=yr_back)).date()
                 findings += V.check_survivorship(universe, as_of)
             except Exception as exc:                 # noqa: BLE001
                 log.debug('survivorship %dY failed: %s', yr_back, exc)

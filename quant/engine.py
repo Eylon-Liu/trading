@@ -451,35 +451,77 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                      _fund_raw=fund_stash.get('result'))
 
 
+def superseded_runs(conn, strategy_key: str, as_of: date,
+                    spec_json: str) -> list[str]:
+    """Stored runs a new run of the same strategy, date and universe replaces."""
+    from sqlalchemy import text
+    rows = conn.execute(text(
+        'SELECT run_id FROM runs WHERE strategy = :s AND as_of = :d '
+        'AND universe_spec_json = :u'),
+        {'s': strategy_key, 'd': str(as_of), 'u': spec_json}).fetchall()
+    return [r[0] for r in rows]
+
+
+def delete_runs(conn, run_ids: list[str]) -> int:
+    """Remove runs together with their scores and factor detail."""
+    from sqlalchemy import bindparam, text
+    if not run_ids:
+        return 0
+    for table in ('factor_scores', 'scores', 'runs'):
+        conn.execute(
+            text(f'DELETE FROM {table} WHERE run_id IN :ids')
+            .bindparams(bindparam('ids', expanding=True)),
+            {'ids': list(run_ids)})
+    return len(run_ids)
+
+
 def _persist(run_id: str, as_of: date, spec: UniverseSpec,
              strategy: ST.Strategy, universe: list[str],
              scores: pd.DataFrame, detail: pd.DataFrame) -> None:
-    """Store the run so future dates can be compared against it."""
-    db.upsert(db.runs, [{
-        'run_id': run_id, 'as_of': as_of, 'strategy': strategy.key,
-        'universe_spec_json': spec.to_json(),
-        'universe_tickers': ','.join(universe),
-        'params_json': json.dumps(strategy.weights),
-        'universe_n': len(universe), 'created_at': datetime.utcnow(),
-    }])
+    """
+    Store the run so future dates can be compared against it.
 
-    db.upsert(db.scores, [{
-        'run_id': run_id, 'ticker': t,
-        'composite': _num(r.get('composite')), 'rank': int(r.get('rank', 0)),
-        'signal': r.get('signal'), 'signal_score': _num(r.get('signal_score')),
-        'reasons': r.get('reasons'), 'coverage': _num(r.get('coverage')),
-        'sector': r.get('sector'),
-    } for t, r in scores.iterrows()])
+    One transaction, and one stored run per (strategy, as-of date, universe).
 
-    if not detail.empty:
-        db.upsert(db.factor_scores, [{
-            'run_id': run_id, 'ticker': r['ticker'], 'factor': r['factor'],
-            'raw': _num(r.get('raw')), 'winsorized': _num(r.get('winsorized')),
-            'z': _num(r.get('z')), 'sector_z': _num(r.get('sector_z')),
-            'pct_rank': _num(r.get('pct_rank')),
-        } for _i, r in detail.iterrows()])
+    Every run used to get a fresh id and nothing was ever replaced. The
+    scheduled routine screens every strategy twice a day, and each S&P 500
+    run writes ~500 score rows and ~5,000 factor rows, so the tables grew by
+    well over 100k rows a day of near-identical copies that only the newest
+    of was ever read. The three writes were also separate transactions: a
+    failure between them left a run with no scores, which the report then
+    skipped instead of falling back to an earlier run.
+    """
+    spec_json = spec.to_json()
+    with db.connect() as conn:
+        replaced = delete_runs(
+            conn, superseded_runs(conn, strategy.key, as_of, spec_json))
 
-    log.info('persisted run %s (%d names)', run_id[:8], len(scores))
+        db.upsert(db.runs, [{
+            'run_id': run_id, 'as_of': as_of, 'strategy': strategy.key,
+            'universe_spec_json': spec_json,
+            'universe_tickers': ','.join(universe),
+            'params_json': json.dumps(strategy.weights),
+            'universe_n': len(universe), 'created_at': config.utc_now(),
+        }], conn=conn)
+
+        db.upsert(db.scores, [{
+            'run_id': run_id, 'ticker': t,
+            'composite': _num(r.get('composite')), 'rank': int(r.get('rank', 0)),
+            'signal': r.get('signal'), 'signal_score': _num(r.get('signal_score')),
+            'reasons': r.get('reasons'), 'coverage': _num(r.get('coverage')),
+            'sector': r.get('sector'),
+        } for t, r in scores.iterrows()], conn=conn)
+
+        if not detail.empty:
+            db.upsert(db.factor_scores, [{
+                'run_id': run_id, 'ticker': r['ticker'], 'factor': r['factor'],
+                'raw': _num(r.get('raw')), 'winsorized': _num(r.get('winsorized')),
+                'z': _num(r.get('z')), 'sector_z': _num(r.get('sector_z')),
+                'pct_rank': _num(r.get('pct_rank')),
+            } for _i, r in detail.iterrows()], conn=conn)
+
+    log.info('persisted run %s (%d names%s)', run_id[:8], len(scores),
+             f', replaced {replaced} earlier run(s) for {as_of}' if replaced else '')
 
 
 def _num(v):
