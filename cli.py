@@ -9,7 +9,9 @@ thing cron-able: a nightly ingest followed by a morning report needs no browser.
     python cli.py ingest --index DIA --full
     python cli.py screen --universe "SPY,sector=Information Technology" --strategy buffett
     python cli.py backtest --strategy momentum_trend --start 2023-01-01
-    python cli.py report --kind daily --strategy buffett --email you@example.com
+    python cli.py report --kind daily --email you@example.com
+    python cli.py daily                      # the scheduled routine, end to end
+    python cli.py db status                  # size, backups, row counts
     python cli.py strategies
 """
 
@@ -264,13 +266,22 @@ def cmd_freshness(args) -> int:
     return 0
 
 
+def _resolve_as_of(value: str | None):
+    """'session' / 'last-session' -> the last completed trading session."""
+    if value and value.lower() in ('session', 'last-session', 'last_session'):
+        from core import market_calendar as MC
+        return MC.last_completed_session()
+    return value
+
+
 def cmd_screen(args) -> int:
     from data.universe import UniverseSpec, parse_spec
     from quant import engine
 
     db.init_db()
     spec = parse_spec(args.universe) if args.universe else UniverseSpec(preset='SPY')
-    result = engine.run(spec, args.strategy, as_of=args.as_of, top_n=args.top)
+    result = engine.run(spec, args.strategy, as_of=_resolve_as_of(args.as_of),
+                        top_n=args.top)
 
     if result.scores.empty:
         print('❌  no results — check the universe resolves and data is ingested')
@@ -332,21 +343,236 @@ def cmd_report(args) -> int:
     from reports import email as mailer
 
     db.init_db()
-    path, html = builder.build_report(
-        strategy=getattr(args, 'strategy', None),
-        kind=args.kind, as_of=args.as_of)
-    print(f'✅  report written to {path}')
+    as_of = pd.to_datetime(args.as_of or date.today()).date()
+    kind = builder.auto_kind(as_of) if args.kind == 'auto' else args.kind
+    path, html = builder.build_report(kind=kind, as_of=as_of)
+    print(f'✅  {kind} report written to {path}')
 
     if args.email:
         try:
             mailer.send_report(html, args.email,
-                               subject=f'{args.kind.title()} Market Brief')
+                               subject=builder.subject_for(kind, as_of),
+                               report_id=builder.report_id_for(kind, as_of))
             print(f'📧  emailed to {args.email}')
         except mailer.SMTPNotConfigured as exc:
             print(f'⚠️  email skipped: {exc}')
+            return 1
         except Exception as exc:                   # noqa: BLE001
-            print(f'⚠️  email failed: {exc}')
+            _explain_smtp_error(exc)
+            return 1
     return 0
+
+
+def _all_strategy_keys() -> list[str]:
+    from quant import custom as CU
+    from quant import strategies as ST
+    keys = list(ST.ALL_STRATEGIES)
+    try:
+        extra = CU.summary()
+        if not extra.empty:
+            keys += [k for k in extra['key'] if k not in keys]
+    except Exception:                              # noqa: BLE001
+        pass
+    return keys
+
+
+def cmd_daily(args) -> int:
+    """
+    The scheduled routine, end to end: pull → screen → build → email.
+
+    Which email goes out is decided by the NYSE calendar for the day it runs:
+
+      trading day      the full brief — screens for every strategy, dated
+                       to the last completed session, compared with the
+                       session before it
+      weekend/holiday  a news-only digest of what was published since the
+                       last close; nothing is screened, because nothing
+                       traded
+
+    Safe to run more than once a day: a report already emailed for this date
+    is not sent again (unless --resend), and a re-run replaces the day's
+    screens instead of adding to them. A failed source is reported and the
+    brief is still built from stored data, with a warning in the email.
+    """
+    from core import maintenance
+    from core import market_calendar as MC
+    from data import members, sync
+    from data.universe import parse_spec
+    from quant import engine
+    from reports import builder
+    from reports import email as mailer
+
+    db.init_db()
+    today = pd.to_datetime(args.date).date() if args.date else date.today()
+    kind = builder.auto_kind(today) if args.kind == 'auto' else args.kind
+    index = (args.index or config.QUANT_INDEX).upper()
+    to = [] if args.no_email else mailer.recipients(args.email or config.QUANT_EMAIL)
+    report_id = builder.report_id_for(kind, today)
+    session = MC.last_completed_session()
+    spec = parse_spec(index)
+    watch = config.WATCHLIST
+
+    reason = MC.closed_reason(today)
+    print(f'▸ {today:%a %Y-%m-%d} · '
+          f'{"market open" if reason is None else f"market closed ({reason})"}'
+          f' · last completed session {session} · report: {kind}')
+    print(f'  index={index}  mode={args.mode}  '
+          f'email={", ".join(to) if to else "(none)"}'
+          + (f'  watchlist={",".join(watch)}' if watch else ''))
+
+    if not to and not args.no_email:
+        print('⚠️  no recipient: set QUANT_EMAIL in .env or pass --email '
+              '(or --no-email to only prepare data).')
+        return 1
+
+    if kind == 'news' and not to and not args.force:
+        print('  market closed and no email requested — nothing to prepare.')
+        return 0
+
+    if to and not args.resend and builder.emailed_at(report_id):
+        print(f'✓ the {kind} report for {today} was already emailed — '
+              f'nothing to do (pass --resend to send again).')
+        return 0
+
+    if kind == 'news':
+        sources = ['news', 'policy']
+    elif args.mode == 'full':
+        sources = None                          # every source
+    else:
+        sources = ['prices', 'news', 'policy']
+
+    if args.dry_run:
+        print(f'  dry run: would ingest {sources or "all sources"}, '
+              f'{"skip screens" if kind == "news" else f"screen as of {session}"}, '
+              f'build "{builder.subject_for(kind, today)}"'
+              + (f', email {", ".join(to)}' if to else ''))
+        return 0
+
+    # ── 1. pull ──────────────────────────────────────────────────
+    if not args.skip_ingest:
+        try:
+            tickers = members.latest_members(index)
+        except Exception as exc:                   # noqa: BLE001
+            print(f'⚠️  could not resolve {index} members: {exc}')
+            tickers = []
+        tickers = sorted(set(tickers) | set(watch))
+        print(f'▸ ingest {", ".join(sources) if sources else "all sources"} '
+              f'for {len(tickers)} names')
+        try:
+            rep = sync.sync(tickers, index=index, sources=sources,
+                            progress=lambda m: print(f'  ▸ {m}'))
+            print(f'  {rep.summary()}')
+        except Exception as exc:                   # noqa: BLE001
+            print(f'⚠️  ingest failed ({type(exc).__name__}: {exc}) — '
+                  f'continuing with stored data')
+
+    # ── 2. screen ────────────────────────────────────────────────
+    failed: list[str] = []
+    if kind != 'news' and not args.skip_screens:
+        keys = _all_strategy_keys()
+        print(f'▸ screening {len(keys)} strategies on {index} as of {session}')
+        for key in keys:
+            try:
+                res = engine.run(spec, key, as_of=session)
+                note = f'{len(res.scores)} ranked' if not res.scores.empty else 'no results'
+                if res.warnings:
+                    note += f' ({len(res.warnings)} warning(s))'
+                print(f'  ▸ {key:22} {note}')
+            except Exception as exc:               # noqa: BLE001
+                failed.append(key)
+                print(f'  ⚠️ {key:22} failed: {type(exc).__name__}: {str(exc)[:120]}')
+
+    # ── 3. build ─────────────────────────────────────────────────
+    if not to and builder.emailed_at(report_id):
+        # The evening job: this morning's email is the record of what was
+        # sent, so leave its file alone. Tomorrow's brief reads these screens.
+        print(f'✓ screens ready; the {kind} report for {today} was already '
+              f'emailed, so its file is left as sent.')
+        return 1 if failed else 0
+    path, html = builder.build_report(kind=kind, as_of=today, universe=spec)
+    print(f'✅  {kind} report written to {path}')
+
+    # ── 4. email ─────────────────────────────────────────────────
+    rc = 0
+    if to:
+        try:
+            mailer.send_report(html, to, subject=builder.subject_for(kind, today),
+                               report_id=report_id)
+            print(f'📧  emailed to {", ".join(to)}')
+        except mailer.SMTPNotConfigured as exc:
+            print(f'❌  email not sent: {exc}')
+            rc = 1
+        except Exception as exc:                   # noqa: BLE001
+            _explain_smtp_error(exc)
+            rc = 1
+
+    if args.backup:
+        try:
+            out = maintenance.backup()
+            if out:
+                print(f'💾  database backed up to {out}')
+        except Exception as exc:                   # noqa: BLE001
+            print(f'⚠️  backup failed: {exc}')
+
+    if failed:
+        print(f'⚠️  {len(failed)} strategy screen(s) failed: {", ".join(failed)}')
+    return rc
+
+
+def cmd_db(args) -> int:
+    """Database upkeep: status, backup, integrity check, clean-up."""
+    from core import maintenance as M
+
+    db.init_db()
+    if args.action == 'status':
+        info = M.status()
+        print(f'database : {info["url"]}')
+        if info.get('size_mb') is not None:
+            print(f'size     : {info["size_mb"]} MB (+{info["wal_mb"]} MB WAL)')
+        print(f'backups  : {info["backups"]}'
+              + (f' — newest {info["latest_backup"]}' if info['latest_backup'] else ''))
+        print()
+        print(info['tables'].to_string(index=False))
+        problems = {k: v for k, v in M.consistency_report().items() if v}
+        print()
+        if problems:
+            print('cleanable: ' + ', '.join(f'{k}={v}' for k, v in problems.items()))
+            print('           run `python cli.py db clean` to remove them')
+        else:
+            print('no duplicate or orphaned rows')
+        return 0
+
+    if args.action == 'backup':
+        out = M.backup(keep=args.keep)
+        if out is None:
+            print('❌  backups are only supported for a local SQLite database')
+            return 1
+        print(f'✅  backup written to {out}')
+        return 0
+
+    if args.action == 'check':
+        res = M.integrity_check(full=args.full)
+        if res == ['ok']:
+            print('✅  integrity check passed')
+        else:
+            print('❌  integrity problems:')
+            for line in res[:50]:
+                print(f'   {line}')
+        for k, v in M.consistency_report().items():
+            print(f'  {k:22} {v}')
+        return 0 if res == ['ok'] else 1
+
+    if args.action == 'clean':
+        if not args.no_backup:
+            out = M.backup(keep=args.keep)
+            if out:
+                print(f'💾  backup first: {out}')
+        res = M.clean(vacuum=args.vacuum, factor_detail_days=args.prune_detail_days)
+        for k, v in res.items():
+            print(f'  {k:22} {v}')
+        print('✅  clean-up done' + (' (vacuumed)' if args.vacuum else ''))
+        return 0
+    return 1
 
 
 def cmd_strategies(args) -> int:
@@ -408,7 +634,8 @@ def build_parser() -> argparse.ArgumentParser:
     scr = sub.add_parser('screen', help='rank a universe under a strategy')
     scr.add_argument('--universe', help='e.g. "SPY,sector=Health Care,mcap>5B"')
     scr.add_argument('--strategy', default='buffett')
-    scr.add_argument('--as-of', help='YYYY-MM-DD (defaults to today)')
+    scr.add_argument('--as-of', help='YYYY-MM-DD, or "session" for the last '
+                                     'completed trading session (default: today)')
     scr.add_argument('--top', type=int, default=20)
     scr.set_defaults(func=cmd_screen)
 
@@ -421,12 +648,53 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument('--rebalance', default=None, help='M | Q | SA | A')
     bt.set_defaults(func=cmd_backtest)
 
-    rep = sub.add_parser('report', help='render a daily or monthly report')
-    rep.add_argument('--kind', default='daily', choices=['daily', 'monthly'])
-    rep.add_argument('--strategy', default='buffett')
+    rep = sub.add_parser('report', help='render a daily, news or monthly report')
+    rep.add_argument('--kind', default='daily',
+                     choices=['daily', 'news', 'monthly', 'auto'],
+                     help='news = closed-market digest; auto = daily on '
+                          'trading days, news otherwise')
+    rep.add_argument('--strategy', default='buffett',
+                     help='ignored; kept for old cron lines')
     rep.add_argument('--as-of')
-    rep.add_argument('--email', help='send the rendered report to this address')
+    rep.add_argument('--email', help='send the rendered report to this address '
+                                     '(comma-separate several)')
     rep.set_defaults(func=cmd_report)
+
+    dly = sub.add_parser(
+        'daily', help='scheduled routine: ingest, screen, build and email — '
+                      'full brief on trading days, news-only when closed')
+    dly.add_argument('--mode', choices=['quick', 'full'], default='quick',
+                     help='quick: prices+news+policy; full: every source')
+    dly.add_argument('--index', help=f'universe (default QUANT_INDEX={config.QUANT_INDEX})')
+    dly.add_argument('--email', help='recipient(s); default QUANT_EMAIL from .env')
+    dly.add_argument('--no-email', action='store_true',
+                     help='prepare data and screens only (the evening job)')
+    dly.add_argument('--kind', choices=['auto', 'daily', 'news'], default='auto')
+    dly.add_argument('--date', help='pretend today is YYYY-MM-DD (for testing)')
+    dly.add_argument('--resend', action='store_true',
+                     help='send even if today\'s report was already emailed')
+    dly.add_argument('--force', action='store_true',
+                     help='run even when the market is closed and no email is due')
+    dly.add_argument('--skip-ingest', action='store_true')
+    dly.add_argument('--skip-screens', action='store_true')
+    dly.add_argument('--backup', action='store_true',
+                     help='back up the database afterwards (keeps 5)')
+    dly.add_argument('--dry-run', action='store_true',
+                     help='print what would happen and exit')
+    dly.set_defaults(func=cmd_daily)
+
+    dbp = sub.add_parser('db', help='database upkeep: status | backup | check | clean')
+    dbp.add_argument('action', choices=['status', 'backup', 'check', 'clean'])
+    dbp.add_argument('--keep', type=int, default=5, help='backups to keep')
+    dbp.add_argument('--full', action='store_true',
+                     help='check: full integrity_check instead of quick_check')
+    dbp.add_argument('--vacuum', action='store_true',
+                     help='clean: VACUUM afterwards to return space to disk')
+    dbp.add_argument('--prune-detail-days', type=int,
+                     help='clean: drop per-factor detail of runs older than N days')
+    dbp.add_argument('--no-backup', action='store_true',
+                     help='clean: skip the safety backup')
+    dbp.set_defaults(func=cmd_db)
 
     sch = sub.add_parser('schedule',
                          help='print an ingest schedule matched to each source')

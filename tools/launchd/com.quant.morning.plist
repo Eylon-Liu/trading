@@ -6,15 +6,18 @@
     <key>Label</key>
     <string>com.quant.morning</string>
 
-    <!-- Quick refresh: news + prices, then email the daily report.
-         The script itself skips weekends, so this fires daily and
-         exits immediately on Saturday / Sunday. -->
+    <!-- The one email of the day, every day at 7:00 local time.
+         Trading day: full brief. Weekend or NYSE holiday: news-only digest.
+         The calendar decision is made in `cli.py daily`, not here.
+
+         __ROOT__ and __PATH__ are filled in by `tools/setup_schedule.sh
+         install`; do not copy this file into LaunchAgents by hand. -->
 
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>tools/daily_routine.sh</string>
-        <string>quick</string>
+        <string>__ROOT__/tools/daily_routine.sh</string>
+        <string>morning</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -25,21 +28,18 @@
         <integer>0</integer>
     </dict>
 
-    <!-- Set WorkingDirectory to the repo root on your machine, e.g.:
-         <string>/Users/you/trading</string>
-         The script resolves all other paths relative to this. -->
     <key>WorkingDirectory</key>
-    <string>/Users/CHANGEME/trading</string>
+    <string>__ROOT__</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Library/Frameworks/Python.framework/Versions/3.12/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__PATH__</string>
     </dict>
 
     <key>StandardOutPath</key>
-    <string>logs/launchd_morning.log</string>
+    <string>__ROOT__/logs/launchd_morning.log</string>
     <key>StandardErrorPath</key>
-    <string>logs/launchd_morning.log</string>
+    <string>__ROOT__/logs/launchd_morning.log</string>
 </dict>
 </plist>

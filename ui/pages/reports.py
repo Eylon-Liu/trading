@@ -19,13 +19,17 @@ from ui import theme as TH
 log = logging.getLogger(__name__)
 
 CRON_HELP = """\
-# Nightly ingest at 6pm, daily brief at 7am (crontab -e)
-0 18 * * 1-5  cd "{root}" && /usr/bin/python3 cli.py ingest --index SPY --full
-0  7 * * 1-5  cd "{root}" && /usr/bin/python3 cli.py report --kind daily \\
-                  --email you@example.com
+# crontab -e   (set QUANT_EMAIL in .env first)
+# Every morning: full brief on trading days, news-only digest when the
+# market is closed (weekends and NYSE holidays). Never sends twice a day.
+0  7 * * *    cd "{root}" && python3 cli.py daily >> logs/daily.log 2>&1
+
+# Weekday evenings: pull everything and pre-run the screens, no email.
+30 18 * * 1-5 cd "{root}" && python3 cli.py daily --mode full --no-email \\
+                  --backup >> logs/daily.log 2>&1
 
 # Monthly review on the 1st
-0  8 1 * *    cd "{root}" && /usr/bin/python3 cli.py report --kind monthly \\
+0  8 1 * *    cd "{root}" && python3 cli.py report --kind monthly \\
                   --email you@example.com
 """
 
@@ -39,6 +43,8 @@ def layout() -> html.Div:
                     C.label('Kind'),
                     dcc.Dropdown(id='rep-kind',
                                  options=[{'label': 'Daily brief', 'value': 'daily'},
+                                          {'label': 'News digest (market closed)',
+                                           'value': 'news'},
                                           {'label': 'Monthly review', 'value': 'monthly'}],
                                  value='daily', clearable=False),
                 ], lg=4, md=6, className='mb-3'),
@@ -107,7 +113,8 @@ def _build(n_clicks, kind, _strategy, email):
     if email:
         try:
             MAILER.send_report(html_doc, email,
-                               subject=f'{kind.title()} Market Brief')
+                               subject=RB.subject_for(kind, date.today()),
+                               report_id=RB.report_id_for(kind, date.today()))
             status += f'  ·  📧 emailed to {email}'
         except MAILER.SMTPNotConfigured as exc:
             status += f'  ·  ⚠️ email skipped: {exc}'

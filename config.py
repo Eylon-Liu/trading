@@ -12,7 +12,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Explicit path: cron and launchd start in another directory, and the
+# scheduled email must read the same .env as an interactive run.
+load_dotenv(Path(__file__).parent.resolve() / '.env')
 
 # ─────────────────────────────────────────────
 # PATHS
@@ -385,6 +387,21 @@ SMTP_USER = (os.environ.get('SMTP_USER') or '').strip() or None
 # copy-paste straight from Google fails authentication.
 SMTP_PASS = (os.environ.get('SMTP_PASS') or '').replace(' ', '').strip() or None
 FRED_API_KEY = os.environ.get('FRED_API_KEY')
+
+# ── Daily routine (cli.py daily) ─────────────────────────────────
+# Read here rather than by the shell script: .env holds values with spaces
+# (SEC_USER_AGENT) that `source .env` would try to execute as commands.
+QUANT_EMAIL = (os.environ.get('QUANT_EMAIL') or '').strip() or None
+QUANT_INDEX = (os.environ.get('QUANT_INDEX') or 'SPY').strip().upper()
+
+# Names you hold or are watching. They lead the daily brief and the weekend
+# digest, and are ingested even when they are not in QUANT_INDEX.
+# Comma- or space-separated: QUANT_WATCHLIST=AAPL, MSFT, BRK.B
+WATCHLIST = [
+    t.strip().upper().replace('.', '-')
+    for t in (os.environ.get('QUANT_WATCHLIST') or '').replace(',', ' ').split()
+    if t.strip()
+]
 
 
 # ─────────────────────────────────────────────

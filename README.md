@@ -186,12 +186,15 @@ python3 cli.py ingest --index SPY --full --members-from 2015-01-01
 
 python3 cli.py strategies                               # list, by horizon
 python3 cli.py screen --universe "SPY,sector=Health Care,mcap>5B" \
-                      --strategy quality_value
+                      --strategy buffett
 python3 cli.py screen --strategy momentum_trend --top 10   # mid-term + plans
 
-python3 cli.py backtest --strategy quality_value --start 2020-01-01
+python3 cli.py backtest --strategy buffett --start 2020-01-01
 python3 cli.py report --kind daily --email you@example.com
+python3 cli.py report --kind news                       # closed-market digest
+python3 cli.py daily                                    # the scheduled routine
 python3 cli.py status                                   # coverage and freshness
+python3 cli.py db status                                # size, backups, clean-ups
 ```
 
 ### Universe expressions
@@ -202,15 +205,74 @@ sector=Information Technology,mcap>10B     compose filters
 SPY,sector=Health Care,adv>25M,top=50      cap by size rank, never at random
 ```
 
+### The daily email
+
+`python3 cli.py daily` is the whole routine in one command — pull, screen,
+build, email — and the **NYSE calendar** decides what goes out:
+
+| Day | Email |
+|---|---|
+| Trading day (incl. 1 p.m. half-days) | **Full brief** — screens for every strategy as of the last completed session, compared with the session before it, plus market snapshot, watchlist, consensus picks, signal shifts, news and policy |
+| Weekend, or an NYSE holiday (Thanksgiving, Good Friday, Juneteenth, …) | **News-only digest** — what was published since the last close: watchlist news, news on current picks, material events, 8-K filings, policy. No prices, ranks or signals, because nothing traded |
+
+Holidays are computed by rule (and one-off closures are listed in
+`core/market_calendar.py`), so nothing needs updating each year. A report
+already emailed for a date is never sent twice, so a job that launchd re-runs
+after the machine wakes up is harmless. If the price ingest failed, the brief
+says so at the top instead of quietly showing yesterday's numbers.
+
+Configure it in `.env`:
+
+```bash
+QUANT_EMAIL=you@example.com          # comma-separate several
+QUANT_WATCHLIST=AAPL, MSFT, NVDA     # optional: leads every email
+QUANT_INDEX=SPY                      # optional: universe to screen
+```
+
+```bash
+python3 cli.py daily --dry-run                   # what would be sent today
+python3 cli.py daily --dry-run --date 2026-11-26 # …on Thanksgiving
+python3 cli.py daily                             # do it
+```
+
 ### Scheduling
 
-```cron
-0 18 * * 1-5  cd /path/to/trading && python3 cli.py ingest --index SPY --full
-0  7 * * 1-5  cd /path/to/trading && python3 cli.py report --kind daily \
-                  --strategy quality_value --email you@example.com
-0  8 1 * *    cd /path/to/trading && python3 cli.py report --kind monthly \
-                  --strategy quality_value --email you@example.com
+macOS (launchd — fills in this checkout's paths for you):
+
+```bash
+bash tools/setup_schedule.sh install   # 07:00 daily email; 18:30 Mon–Fri prep + backup
+bash tools/setup_schedule.sh test      # dry run
 ```
+
+Linux, or cron anywhere — `bash tools/setup_schedule.sh cron` prints these
+with your paths filled in:
+
+```cron
+0 7 * * *     cd /path/to/trading && python3 cli.py daily >> logs/daily.log 2>&1
+30 18 * * 1-5 cd /path/to/trading && python3 cli.py daily --mode full --no-email --backup >> logs/daily.log 2>&1
+0 8 1 * *     cd /path/to/trading && python3 cli.py report --kind monthly --email you@example.com
+```
+
+The morning job sends the one email of the day. The evening job pulls every
+source (SEC filings, insiders, profiles) and pre-runs the screens for that
+day's close, so the next morning's brief is quick; it never emails.
+
+### Database upkeep
+
+The store holds things that cannot be re-downloaded — membership history,
+profile snapshots, news — so it is worth protecting.
+
+```bash
+python3 cli.py db status     # size, row counts, backups, anything cleanable
+python3 cli.py db backup     # consistent online copy to db/backups/ (keeps 5)
+python3 cli.py db check      # SQLite integrity check + consistency counts
+python3 cli.py db clean      # backup, then remove duplicate runs / news rows,
+                             # orphans; --vacuum to return space to disk
+```
+
+The evening job backs up automatically (`--backup`). On a store built before
+this version, run `db clean --vacuum` once: earlier versions kept every
+re-run of every screen, which is usually most of the file.
 
 ---
 
@@ -220,7 +282,7 @@ SPY,sector=Health Care,adv>25M,top=50      cap by size rank, never at random
 **Compare** — two run dates, rank migration, entrants and dropouts, signal changes.
 **Research** — backtest with equity curve, drawdown, and the rank-IC honesty panel.
 **Intel** — company direction, 8-K events, insider activity, and a policy panel.
-**Reports** — generate, preview and email daily or monthly briefs.
+**Reports** — generate, preview and email daily briefs, closed-market news digests, or monthly reviews.
 **Data** — coverage, freshness, and where the membership sources disagree (shown, not hidden).
 
 ---
@@ -238,7 +300,7 @@ quant/               fundamentals, factors, transforms, strategies,
 nlp/                 sentiment (Loughran-McDonald), extract, summarize
 reports/             builder (HTML), email
 ui/                  theme, components, layout, pages/
-tests/               278 tests, including the look-ahead assertions
+tests/               350+ tests, including the look-ahead assertions
 ```
 
 Storage is SQLite by default (~250–300 MB for 500 tickers × 10 years). Because the data layer is SQLAlchemy, moving to a hosted database is a `DATABASE_URL` change — Turso is the easiest since it *is* SQLite.
@@ -250,6 +312,9 @@ Storage is SQLite by default (~250–300 MB for 500 tickers × 10 years). Becaus
 ```bash
 python3 -m pytest -q
 ```
+
+The suite runs against a throwaway database, never `db/quant.sqlite`. To run
+the data-dependent tests against your real store, set `QUANT_TEST_REAL_DB=1`.
 
 The suite covers the transforms against hand-computed values, Wilder RSI against a reference, TTM assembly from a fixture containing the real Apple duplicate-duration case and a restatement, trade-plan sizing arithmetic, backtest metrics against an analytically known curve, and the point-in-time assertions — including that a factor computed as of date `T` references no row dated after `T`.
 

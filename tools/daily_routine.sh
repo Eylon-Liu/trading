@@ -1,68 +1,63 @@
 #!/bin/bash
 #
-# Daily routine: ingest data → run screens → build and email report.
+# Scheduled routine — a thin wrapper around `python cli.py daily`.
 #
-# Called by launchd morning and evening, or manually:
-#   bash tools/daily_routine.sh          # full run (ingest + screen + report)
-#   bash tools/daily_routine.sh quick    # news-only refresh + report
+#   bash tools/daily_routine.sh morning   # the one email of the day:
+#                                         #   trading day  -> full brief
+#                                         #   weekend / NYSE holiday -> news-only digest
+#   bash tools/daily_routine.sh evening   # weekday evening: full ingest, screens and a
+#                                         # database backup; no email. Prepares the
+#                                         # next morning's brief so it is fast.
 #
-# The script is idempotent: ingest skips sources that are already fresh,
-# and re-running a screen on the same day overwrites the prior run_id.
+# The old mode names still work: quick = morning, full = evening.
+#
+# Recipient, index and watchlist come from .env (QUANT_EMAIL, QUANT_INDEX,
+# QUANT_WATCHLIST) and are read by Python. This script deliberately does not
+# `source .env`: values such as SEC_USER_AGENT contain spaces, and sourcing
+# would try to execute the second word as a command.
+#
+# Which email goes out is decided by the exchange calendar, not by this
+# script, and a report already emailed today is never sent twice — so it is
+# safe for launchd to re-run a job missed while the machine was asleep.
 
-set -euo pipefail
+set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-PYTHON="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+# Interpreter: $QUANT_PYTHON, else a project virtualenv, else python3 on PATH.
+if [ -n "${QUANT_PYTHON:-}" ]; then
+    PYTHON="$QUANT_PYTHON"
+elif [ -x "$ROOT/.venv/bin/python" ]; then
+    PYTHON="$ROOT/.venv/bin/python"
+elif [ -x "$ROOT/venv/bin/python" ]; then
+    PYTHON="$ROOT/venv/bin/python"
+else
+    PYTHON="$(command -v python3 || true)"
+fi
+if [ -z "$PYTHON" ]; then
+    echo "python3 not found — set QUANT_PYTHON to your interpreter" >&2
+    exit 1
+fi
+
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
+MODE="${1:-morning}"
+LOGFILE="$LOG_DIR/routine_$(date +%Y%m%d_%H%M)_${MODE}.log"
 
-LOGFILE="$LOG_DIR/routine_$(date +%Y%m%d_%H%M).log"
-EMAIL="${QUANT_EMAIL:?Set QUANT_EMAIL in .env or your shell profile}"
-INDEX="${QUANT_INDEX:-SPY}"
-MODE="${1:-full}"
+case "$MODE" in
+    morning|quick) ARGS=(daily --mode quick) ;;
+    evening|full)  ARGS=(daily --mode full --no-email --backup) ;;
+    *) echo "usage: $0 {morning|evening}" >&2; exit 2 ;;
+esac
 
-log() { echo "$(date '+%H:%M:%S')  $*" | tee -a "$LOGFILE"; }
+echo "=== $(date '+%Y-%m-%d %H:%M:%S')  routine: $MODE  python: $PYTHON ===" \
+    | tee -a "$LOGFILE"
+"$PYTHON" cli.py "${ARGS[@]}" 2>&1 | tee -a "$LOGFILE"
+rc=${PIPESTATUS[0]}
+echo "=== exit $rc ===" | tee -a "$LOGFILE"
 
-# Markets are closed on weekends — skip unless forced.
-DOW=$(date +%u)  # 1=Mon … 7=Sun
-if [ "$DOW" -ge 6 ] && [ "${QUANT_FORCE:-}" != "1" ]; then
-    echo "$(date '+%H:%M:%S')  weekend — skipping (set QUANT_FORCE=1 to override)" >> "$LOGFILE"
-    exit 0
-fi
-
-log "=== Quant routine ($MODE) — $(date '+%Y-%m-%d %H:%M') ==="
-log "index=$INDEX  email=$EMAIL  python=$PYTHON"
-
-# ── 1. Ingest ────────────────────────────────────────────
-if [ "$MODE" = "quick" ]; then
-    log "▸ quick refresh: news + prices only"
-    "$PYTHON" cli.py ingest --index "$INDEX" --sources news,prices >> "$LOGFILE" 2>&1
-else
-    log "▸ full ingest (all sources)"
-    "$PYTHON" cli.py ingest --index "$INDEX" --full >> "$LOGFILE" 2>&1
-fi
-log "✓ ingest done"
-
-# ── 2. Run screens for all strategies ────────────────────
-log "▸ running screens"
-for strat in $("$PYTHON" -c "
-from quant import strategies as ST
-for k in ST.ALL_STRATEGIES: print(k)
-"); do
-    log "  ▸ $strat"
-    "$PYTHON" cli.py screen --universe "$INDEX" --strategy "$strat" >> "$LOGFILE" 2>&1 || \
-        log "  ⚠ $strat failed (continuing)"
-done
-log "✓ screens done"
-
-# ── 3. Build and email the daily report ──────────────────
-log "▸ building report"
-"$PYTHON" cli.py report --kind daily --email "$EMAIL" >> "$LOGFILE" 2>&1
-log "✓ report emailed to $EMAIL"
-
-# ── 4. Cleanup old logs (keep 14 days) ───────────────────
+# Keep two weeks of logs.
 find "$LOG_DIR" -name 'routine_*.log' -mtime +14 -delete 2>/dev/null || true
 
-log "=== done ==="
+exit "$rc"
