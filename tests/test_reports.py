@@ -116,7 +116,7 @@ def test_weekend_digest_is_news_only(store):
     # Nothing priced or ranked on a closed day.
     for absent in ('Market snapshot', 'Consensus picks', '1D return'):
         assert absent not in html
-    assert 'Your watchlist' in html
+    assert 'Your portfolio &amp; watchlist' in html
     assert path.endswith('news_digest_2026-11-07.html')
 
 

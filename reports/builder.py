@@ -29,14 +29,18 @@ from sqlalchemy import text
 import config
 from core import db
 from core import market_calendar as MC
+from data import earnings as ER
+from data import macro as MACRO
 from data import news as NEWS
 from data import policy as POL
 from data import yahoo
 from data.universe import UniverseSpec
 from quant import custom as CU
 from quant import engine as ENG
+from quant import portfolio as PF
 from quant import research as RS
 from quant import strategies as ST
+from quant import track as TRACK
 
 log = logging.getLogger(__name__)
 
@@ -502,6 +506,28 @@ def _monthly_stability(as_of: date,
 # CONTEXT: DATES, FRESHNESS, WATCHLIST
 # ─────────────────────────────────────────────
 
+def _safe(fn, default=None):
+    """
+    Run an optional section's gatherer; on failure log and return `default`.
+
+    One broken add-on (a missing table, a provider hiccup) must not cost the
+    whole email — the brief is still worth sending without that section.
+    """
+    try:
+        return fn()
+    except Exception as exc:                       # noqa: BLE001
+        log.warning('report section skipped: %s: %s', type(exc).__name__, exc)
+        return default
+
+
+def _first_session_of_week(d: date) -> bool:
+    """True on the first trading day of an ISO week (usually Monday)."""
+    if not MC.is_trading_day(d):
+        return False
+    prev = MC.previous_trading_day(d)
+    return prev.isocalendar()[:2] != d.isocalendar()[:2]
+
+
 def _fmt_day(d) -> str:
     """'Fri Nov 6' — portable (no %-d)."""
     d = pd.to_datetime(d).date()
@@ -938,6 +964,153 @@ def _render_policy(policy_df: pd.DataFrame | None) -> str:
     return ''.join(parts)
 
 
+def _render_alerts(alerts: list[dict] | None) -> str:
+    if not alerts:
+        return ''
+    icon = {'risk': '🔴', 'watch': '🟠', 'info': '🔵'}
+    rows = ''.join(
+        f'<div style="margin-bottom:6px">{icon.get(a["level"], "•")} '
+        f'<span class="tk">{_esc(a["ticker"])}</span> {_esc(a["text"])}</div>'
+        for a in alerts[:25])
+    return f'<h2>🚨 Alerts</h2><div class="card">{rows}</div>'
+
+
+def _fmt_money(v) -> str:
+    if v is None or not np.isfinite(v):
+        return '—'
+    return f'{"-" if v < 0 else ""}${abs(v):,.0f}'
+
+
+def _render_portfolio(h: pd.DataFrame | None, s: dict | None,
+                      n_strategies: int) -> str:
+    if h is None or h.empty:
+        return ''
+    s = s or {}
+    color = lambda v: '#38ef7d' if v >= 0 else '#ff6b6b'     # noqa: E731
+    cards = [
+        _metric_card(_fmt_money(s.get('market_value')), 'Market value', '#00d4ff'),
+        _metric_card(_fmt_money(s.get('day_pnl')), 'Last session',
+                     color(s.get('day_pnl') or 0)),
+        _metric_card(_fmt_money(s.get('pnl')), 'Unrealised P&amp;L',
+                     color(s.get('pnl') or 0)),
+        _metric_card(f'{s.get("pnl_pct", 0):+.1%}' if np.isfinite(s.get('pnl_pct', np.nan))
+                     else '—', 'On cost', color(s.get('pnl_pct') or 0)),
+    ]
+    head = ('<tr><th>Ticker</th><th>Shares</th><th>Avg cost</th><th>Last</th>'
+            '<th>1D</th><th>P&amp;L</th><th>Weight</th><th>Stop</th>'
+            '<th>Target</th><th>Top-20 in</th><th>Signals</th></tr>')
+    rows = []
+    for t, r in h.iterrows():
+        def lvl(v, dist):
+            if not np.isfinite(v):
+                return '—'
+            d = f' <span class="muted">({dist:+.1%})</span>' if np.isfinite(dist) else ''
+            return f'{v:,.2f}{d}'
+        n_top = int(r['n_top']) if pd.notna(r.get('n_top')) else 0
+        votes = r.get('votes')
+        rows.append(
+            f'<tr><td class="tk">{_esc(t)}</td>'
+            f'<td class="num">{r["shares"]:,.4g}</td>'
+            f'<td class="num">{r["avg_cost"]:,.2f}</td>'
+            f'<td class="num">{r["last"]:,.2f}</td>'
+            f'<td class="num">{_color_pct(r["day_chg"])}</td>'
+            f'<td class="num">{_color_pct(r["pnl_pct"])} '
+            f'<span class="muted">{_fmt_money(r["pnl"])}</span></td>'
+            f'<td class="num">{r["weight"]:.0%}</td>'
+            f'<td class="num">{lvl(r["stop"], -r["to_stop"] if np.isfinite(r["to_stop"]) else np.nan)}</td>'
+            f'<td class="num">{lvl(r["target"], r["to_target"])}</td>'
+            f'<td class="muted">{n_top}/{n_strategies}</td>'
+            f'<td class="muted">{_esc(votes) if isinstance(votes, str) else "—"}</td></tr>')
+    return ('<h2>💼 Your portfolio</h2>'
+            f'<div class="metric-grid">{"".join(cards)}</div>'
+            f'<table><thead>{head}</thead><tbody>{"".join(rows)}</tbody></table>'
+            '<p class="muted">Price return on the raw close against your cost; '
+            'splits applied, dividends not included.</p>')
+
+
+def _render_macro(snap: pd.DataFrame | None, flags: list | None) -> str:
+    if (snap is None or snap.empty) and not flags:
+        return ''
+    parts = ['<h2>🌐 Macro &amp; regime</h2>']
+    if flags:
+        icon = {'ok': '🟢', 'watch': '🟠', 'risk': '🔴'}
+        parts.append('<div class="card">' + ''.join(
+            f'<div style="margin-bottom:4px">{icon.get(l, "•")} {_esc(t)}</div>'
+            for l, t in flags) + '</div>')
+    if snap is not None and not snap.empty:
+        def fmt(v, unit, sign=False):
+            if not np.isfinite(v):
+                return '—'
+            body = f'{v:+.2f}' if sign else f'{v:.2f}'
+            return body + ('%' if unit == '%' and not sign else
+                           'pp' if unit in ('%', 'pp') else '')
+        rows = ''.join(
+            f'<tr><td>{_esc(r["label"])}</td>'
+            f'<td class="num">{fmt(r["value"], r["unit"])}</td>'
+            f'<td class="num">{fmt(r["chg_1w"], r["unit"], True)}</td>'
+            f'<td class="num">{fmt(r["chg_1m"], r["unit"], True)}</td>'
+            f'<td class="muted">{_fmt_day(r["date"])}</td></tr>'
+            for _i, r in snap.iterrows())
+        parts.append('<table><thead><tr><th>Series</th><th>Level</th><th>1W</th>'
+                     f'<th>1M</th><th>As of</th></tr></thead><tbody>{rows}</tbody></table>'
+                     '<p class="muted">Source: FRED. Context only — none of this '
+                     'changes a score.</p>')
+    return ''.join(parts)
+
+
+def _render_earnings(er: pd.DataFrame | None, held: set | None = None,
+                     watch: set | None = None, title: str = '📅 Earnings ahead'
+                     ) -> str:
+    if er is None or er.empty:
+        return ''
+    held, watch = held or set(), watch or set()
+    rows = []
+    for _i, e in er.head(40).iterrows():
+        tag = ('<span class="tag neg">held</span>' if e['ticker'] in held else
+               '<span class="tag">watch</span>' if e['ticker'] in watch else '')
+        when = {'bmo': 'before open', 'amc': 'after close'}.get(e['time'], '—')
+        est = e.get('eps_estimate')
+        rows.append(
+            f'<tr><td class="tk">{_esc(e["ticker"])}</td><td>{tag}</td>'
+            f'<td>{_fmt_day(e["report_date"])}</td><td class="muted">{when}</td>'
+            f'<td class="num">{f"{est:.2f}" if est is not None and np.isfinite(est) else "—"}</td>'
+            f'<td class="muted">{"confirmed" if e["confirmed"] else "estimated"}</td></tr>')
+    return (f'<h2>{title}</h2><table><thead><tr><th>Ticker</th><th></th><th>Date</th>'
+            '<th>When</th><th>EPS est.</th><th>Source</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table>'
+            '<p class="muted">Estimated dates come from the company’s own filing '
+            'cadence (8-K Item 2.02) and can be off by days.</p>')
+
+
+def _render_track(tr: pd.DataFrame | None) -> str:
+    if tr is None or tr.empty:
+        return ''
+    rows = []
+    for _i, r in tr.iterrows():
+        rows.append(
+            f'<tr><td>{_esc(r["name"])}</td><td>{r["horizon"]}</td>'
+            f'<td class="num">{r["cohorts"]} '
+            f'<span class="muted">(~{r["independent"]} indep.)</span></td>'
+            f'<td class="num">{_color_pct(r["mean_pick_return"])}</td>'
+            f'<td class="num">{_color_pct(r["mean_excess"])}</td>'
+            f'<td class="num">{r["hit_rate"]:.0%}</td>'
+            f'<td class="num">{r["mean_ic"]:+.3f}</td></tr>'
+            if np.isfinite(r['mean_ic']) else
+            f'<tr><td>{_esc(r["name"])}</td><td>{r["horizon"]}</td>'
+            f'<td class="num">{r["cohorts"]}</td>'
+            f'<td class="num">{_color_pct(r["mean_pick_return"])}</td>'
+            f'<td class="num">{_color_pct(r["mean_excess"])}</td>'
+            f'<td class="num">{r["hit_rate"]:.0%}</td><td class="num">—</td></tr>')
+    return ('<h2>📈 Live track record</h2>'
+            '<p class="muted" style="margin-top:0">What each strategy’s top-10 '
+            'picks did after the screens this routine actually stored, bought at '
+            'the next close. Overlapping daily cohorts are not independent — '
+            'judge by the “indep.” count, not the cohort count.</p>'
+            '<table><thead><tr><th>Strategy</th><th>Horizon</th><th>Cohorts</th>'
+            '<th>Picks</th><th>vs SPY</th><th>Beat SPY</th><th>Rank IC</th></tr>'
+            f'</thead><tbody>{"".join(rows)}</tbody></table>')
+
+
 def render_daily(payload: dict, news_df: pd.DataFrame | None = None,
                  policy_df: pd.DataFrame | None = None,
                  bench: dict | None = None) -> str:
@@ -957,18 +1130,27 @@ def render_daily(payload: dict, news_df: pd.DataFrame | None = None,
     if payload.get('calendar_note'):
         parts.append(f'<div class="note">🗓️ {_esc(payload["calendar_note"])}</div>')
 
+    parts.append(_render_alerts(payload.get('alerts')))
+
     # Index performance
     if bench:
         parts.append('<h2>Market snapshot</h2>')
         parts.append(_render_bench(bench))
+    parts.append(_render_macro(payload.get('macro'), payload.get('regime')))
 
+    parts.append(_render_portfolio(payload.get('portfolio'),
+                                   payload.get('portfolio_summary'),
+                                   payload['n_strategies']))
     parts.append(_render_watchlist(payload.get('watchlist_table'),
                                    payload['n_strategies']))
     watch_news = payload.get('watch_news')
     if watch_news is not None and not watch_news.empty:
-        parts.append('<h2>Watchlist news (last 3 days)</h2><div class="card">')
+        parts.append('<h2>News on your names (last 3 days)</h2><div class="card">')
         parts.extend(_article_html(r) for _i, r in watch_news.iterrows())
         parts.append('</div>')
+    parts.append(_render_earnings(payload.get('earnings'),
+                                  payload.get('earnings_held'),
+                                  payload.get('earnings_watch')))
 
     consensus = payload['consensus']
     signal_dist = payload.get('signal_dist', {})
@@ -1108,6 +1290,7 @@ def render_daily(payload: dict, news_df: pd.DataFrame | None = None,
 
     # Policy (filtered and expanded)
     parts.append(_render_policy(policy_df))
+    parts.append(_render_track(payload.get('track')))
 
     # Data availability warnings
     warnings = payload.get('data_warnings', [])
@@ -1310,6 +1493,8 @@ def render_monthly(payload: dict, stability: list[dict] | None = None,
                 parts.append('<h2>Sector distribution</h2>'
                              f'<div class="card">{chips}</div>')
 
+    parts.append(_render_track(payload.get('track')))
+
     # Backtest metrics (if provided)
     if backtest_metrics:
         pretty = {
@@ -1471,8 +1656,8 @@ def render_news_digest(d: dict) -> str:
         parts.append('</div>')
 
     if d['watchlist']:
-        section('⭐ Your watchlist', d['watch_news'], 20,
-                empty='No new coverage of your watchlist in this window.')
+        section('⭐ Your portfolio &amp; watchlist', d['watch_news'], 20,
+                empty='No new coverage of your names in this window.')
     section('🎯 Current picks in the news', d['pick_news'], 15,
             blurb='Names that two or more strategies rank in their top 20 '
                   '(from the last session’s screens).')
@@ -1492,6 +1677,7 @@ def render_news_digest(d: dict) -> str:
         }))
 
     parts.append(_render_policy(policy))
+    parts.append(_render_earnings(d.get('earnings'), title='📅 Reporting soon'))
 
     if not news.empty:
         counts = pd.Series([t for ts in news['tickers'] for t in ts]).value_counts()
@@ -1571,12 +1757,22 @@ def build_report(strategy: str | None = None, kind: str = 'daily',
         kind = auto_kind(as_of)
     if kind not in REPORT_KINDS:
         raise ValueError(f'unknown report kind {kind!r}; expected {REPORT_KINDS}')
-    watchlist = list(config.WATCHLIST if watchlist is None else watchlist)
+    watchlist = list(PF.watchlist() if watchlist is None else watchlist)
     spec_json = universe.to_json() if isinstance(universe, UniverseSpec) else universe
+    try:
+        held = PF.holdings(as_of) if kind != 'monthly' else pd.DataFrame()
+    except Exception as exc:                       # noqa: BLE001
+        log.warning('portfolio valuation failed: %s', exc)
+        held = pd.DataFrame()
+    held_names = list(held.index) if not held.empty else []
 
     if kind == 'news':
-        digest = gather_digest(as_of, now=now, watchlist=watchlist,
+        digest = gather_digest(as_of, now=now,
+                               watchlist=sorted(set(watchlist) | set(held_names)),
                                spec_json=spec_json)
+        digest['earnings'] = _safe(lambda: ER.upcoming(
+            sorted(set(watchlist) | set(held_names) | set(digest['picks'])),
+            as_of, days=10))
         html_out = render_news_digest(digest)
         period_start = digest['last_session']
         filename = f'news_digest_{as_of}.html'
@@ -1589,13 +1785,37 @@ def build_report(strategy: str | None = None, kind: str = 'daily',
             payload['freshness_warnings'] = freshness_warnings(
                 as_of, payload.get('data_through'))
             payload['calendar_note'] = _calendar_note(as_of) if kind == 'daily' else None
-            if watchlist:
+            only_watch = [t for t in watchlist if t not in held_names]
+            if only_watch:
                 payload['watchlist_table'] = watchlist_summary(
-                    watchlist, payload.get('combined'), as_of)
-                wn = NEWS.news_asof(watchlist, as_of, lookback_days=3)
+                    only_watch, payload.get('combined'), as_of)
+            followed = sorted(set(watchlist) | set(held_names))
+            if followed:
+                wn = NEWS.news_asof(followed, as_of, lookback_days=3)
                 if not wn.empty:
                     payload['watch_news'] = (wn.sort_values('published', ascending=False)
                                              .groupby('ticker').head(3))
+            if kind == 'daily':
+                if not held.empty:
+                    ranks = watchlist_summary(held_names, payload.get('combined'), as_of)
+                    payload['portfolio'] = held.join(
+                        ranks[['best_rank', 'best_strategy', 'n_top', 'votes']])
+                    payload['portfolio_summary'] = PF.summary(held)
+                payload['alerts'] = _safe(lambda: PF.alerts(
+                    as_of, held, watchlist, spec_json), [])
+                consensus_top = (payload['consensus'][payload['consensus']['n_strategies'] >= 2]
+                                 ['ticker'].head(20).tolist()
+                                 if not payload['consensus'].empty else [])
+                payload['earnings'] = _safe(lambda: ER.upcoming(
+                    sorted(set(followed) | set(consensus_top)), as_of, days=14))
+                payload['earnings_held'] = set(held_names)
+                payload['earnings_watch'] = set(watchlist)
+                snap = _safe(lambda: MACRO.snapshot(as_of), pd.DataFrame())
+                payload['macro'] = snap
+                payload['regime'] = _safe(lambda: MACRO.regime(as_of, snap), [])
+                if _first_session_of_week(as_of):
+                    payload['track'] = _safe(lambda: TRACK.summary(
+                        as_of=as_of, spec_json=spec_json), pd.DataFrame())
             consensus = payload['consensus']
             tickers = (consensus[consensus['n_strategies'] >= 2]['ticker']
                        .head(20).tolist()) if not consensus.empty else []
@@ -1614,6 +1834,9 @@ def build_report(strategy: str | None = None, kind: str = 'daily',
             period_start = MC.previous_trading_day(as_of)
         else:
             stability = _monthly_stability(as_of)
+            if 'error' not in payload:
+                payload['track'] = _safe(lambda: TRACK.summary(
+                    as_of=as_of, spec_json=spec_json), pd.DataFrame())
             html_out = render_monthly(payload, stability, backtest_metrics,
                                       bench)
             period_start = as_of - timedelta(days=compare_days)

@@ -107,6 +107,21 @@ Most of the engineering here is about not fooling yourself.
 
 **Predictive power is reported, not just returns.** Every backtest shows rank IC alongside CAGR, and the UI flags it when the correlation is near zero — which means any outperformance came from a few positions rather than from the ranking working.
 
+### How the backtests trade
+
+| | Long horizon (`run_backtest`) | Mid horizon (`run_trade_backtest`) |
+|---|---|---|
+| Signal | after the close of a real session — the last session of each month/quarter, never a weekend date | after the close of the last session of each month |
+| Entry | the close one session later (`execution_lag=1`) | market orders at the next open; pullback limits only if a later bar trades down to them within 5 sessions, else the order expires |
+| Exit | the next rebalance fill | stop (checked first), target, or time stop — never on the signal day's own bar; a gap through the stop fills at the open |
+| Capital | weights sum to 1; turnover measured against *drifted* weights | gross exposure capped at 100%; a name already held or on order is not bought twice |
+| Curve | marked to market daily | marked to market daily (open losses count in the drawdown) |
+| Costs | commission + slippage on every unit traded | the same, on entry and exit |
+
+Sharpe is the textbook mean excess return over volatility; Sortino uses downside deviation; the risk-free rate is the average 3-month T-bill over the backtest window (from FRED), not a fixed 5%. The IC research forward returns start at the signal close.
+
+**One limitation the code cannot fix:** the free price source has no history for delisted tickers. Point-in-time membership puts companies that later failed or were acquired back into the universe, but with no prices they cannot pass the liquidity filter, so they are never picked. The availability check refuses windows where that gap is large; it is still worth knowing that older results lean optimistic.
+
 ---
 
 ## Data sources — all free, no keys
@@ -120,6 +135,8 @@ Most of the engineering here is about not fooling yourself.
 | **Yahoo chart API** | Daily OHLCV | ✅ full history |
 | **Wikimedia pageviews** | Retail attention proxy | ✅ full daily history |
 | **Federal Register** | Rules and executive orders, mapped to sectors | ✅ full history |
+| **FRED** (keyless CSV, or API with `FRED_API_KEY`) | T-bills, Treasuries, curve, high-yield spread, VIX, Fed funds | ✅ full history |
+| **Nasdaq calendar** (or Finnhub with `FINNHUB_API_KEY`) | Upcoming earnings dates; estimates from 8-K Item 2.02 cadence otherwise | ⚠️ forward only |
 | Yahoo / Google News RSS | Company coverage, sentiment, direction extraction | ⚠️ **forward only** |
 
 The last row is the honest exception: free news APIs return only recent items, so news signals work live from day one but cannot be backfilled. Everything else carries a filing or publication date and is backtestable immediately — which is why the strategies lean on filings rather than headlines.
@@ -212,8 +229,8 @@ build, email — and the **NYSE calendar** decides what goes out:
 
 | Day | Email |
 |---|---|
-| Trading day (incl. 1 p.m. half-days) | **Full brief** — screens for every strategy as of the last completed session, compared with the session before it, plus market snapshot, watchlist, consensus picks, signal shifts, news and policy |
-| Weekend, or an NYSE holiday (Thanksgiving, Good Friday, Juneteenth, …) | **News-only digest** — what was published since the last close: watchlist news, news on current picks, material events, 8-K filings, policy. No prices, ranks or signals, because nothing traded |
+| Trading day (incl. 1 p.m. half-days) | **Full brief** — alerts on your positions, market snapshot, macro regime, your portfolio and watchlist, earnings in the next two weeks, screens for every strategy as of the last completed session compared with the session before it, consensus picks, signal shifts, news and policy. On the first session of each week: the live track record |
+| Weekend, or an NYSE holiday (Thanksgiving, Good Friday, Juneteenth, …) | **News-only digest** — what was published since the last close: news on your portfolio and watchlist, news on current picks, material events, 8-K filings, policy, and who reports soon. No prices, ranks or signals, because nothing traded |
 
 Holidays are computed by rule (and one-off closures are listed in
 `core/market_calendar.py`), so nothing needs updating each year. A report
@@ -276,9 +293,45 @@ re-run of every screen, which is usually most of the file.
 
 ---
 
-## The six tabs
+## Portfolio, watchlist and alerts
+
+Tell the terminal what you own and what you follow; the daily email then
+leads with it.
+
+```bash
+python3 cli.py watch add AMD XOM --note "semis / energy"
+python3 cli.py portfolio add NVDA 20 160 --date 2026-07-01 --stop 150 --target 320
+python3 cli.py portfolio set NVDA --stop 175          # trail the stop up
+python3 cli.py portfolio                              # holdings, P&L, alerts
+python3 cli.py portfolio close NVDA --price 310       # or omit --price: last close
+python3 cli.py portfolio import lots.csv              # ticker,shares,cost_basis[,opened,stop,target]
+```
+
+Or use the **💼 Portfolio** tab. Each purchase is a lot, so adding to a
+position keeps both cost bases. P&L is price return on the raw close against
+your cost, restated through any split since you bought. Alerts: stop or
+target touched, within 3% of the stop, an unusually large one-day move for
+that stock, earnings within a week, and a holding that most strategies now
+rate Sell/Avoid.
+
+```bash
+python3 cli.py track       # live track record: what each strategy's stored picks did next
+python3 cli.py earnings    # upcoming reports for your names (--index SPY for all)
+python3 cli.py macro       # rates, credit, VIX and regime flags
+```
+
+The **live track record** is the honest counterpart to a backtest: every
+screen the routine stores is a dated prediction, graded against what prices
+did afterwards (bought at the next close, versus SPY, with rank IC). Daily
+cohorts overlap, so it reports how many *independent* periods the numbers
+rest on.
+
+---
+
+## The tabs
 
 **Screen** — universe builder and ranked results; the horizon toggle changes what the page is for.
+**Portfolio** — your positions with P&L and alert levels, watchlist, alerts, earnings dates, macro regime, and the live track record.
 **Compare** — two run dates, rank migration, entrants and dropouts, signal changes.
 **Research** — backtest with equity curve, drawdown, and the rank-IC honesty panel.
 **Intel** — company direction, 8-K events, insider activity, and a policy panel.
@@ -294,9 +347,12 @@ config.py            tunables, sector map, SEC tag map, agency→sector map
 cli.py               headless interface (cron-able)
 app.py               Dash entry point
 core/                db.py (SQLAlchemy schema), http.py (throttle + cache)
-data/                members, yahoo, sec, classify, news, policy, altdata, universe
+core/                market_calendar.py (NYSE sessions), maintenance.py (backups)
+data/                members, yahoo, sec, classify, news, policy, altdata,
+                     universe, macro (FRED), earnings (calendar)
 quant/               fundamentals, factors, transforms, strategies,
-                     tradeplan, signals/engine, risk, backtest, research
+                     tradeplan, signals/engine, risk, backtest, research,
+                     portfolio (your positions), track (live track record)
 nlp/                 sentiment (Loughran-McDonald), extract, summarize
 reports/             builder (HTML), email
 ui/                  theme, components, layout, pages/
@@ -326,7 +382,8 @@ The suite covers the transforms against hand-computed values, Wilder RSI against
 - **News cannot be backfilled** (above). It accumulates forward.
 - **SIC → GICS is approximate.** Alphabet lands in Information Technology rather than Communication Services, for instance.
 - **`yfinance.info` is unreliable.** Market cap and forward P/E fall back to SEC-derived estimates when it is throttled; the app is built not to depend on it.
-- **Backtests ignore borrow costs, taxes, and market impact**, and assume you can transact at the closing price.
+- **Backtests ignore borrow costs, taxes, and market impact.** Long-horizon fills are at the close one session after the signal.
+- **Delisted tickers have no price history** from the free source, so names that later failed cannot be picked in a historical backtest (see *How the backtests trade*).
 
 ---
 

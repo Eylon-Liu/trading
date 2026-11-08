@@ -1,4 +1,4 @@
-"""Application shell — header and the six tabs."""
+"""Application shell — header and the tabs."""
 
 from __future__ import annotations
 
@@ -7,11 +7,12 @@ from dash import dcc, html
 
 from ui import components as C
 from ui import theme as TH
-from ui.pages import (builder, compare, data, intel, methodology, reports,
-                      research, screen)
+from ui.pages import (builder, compare, data, intel, methodology, portfolio,
+                      reports, research, screen)
 
 TABS = [
     ('tab-screen', '🎯 Screen', screen),
+    ('tab-portfolio', '💼 Portfolio', portfolio),
     ('tab-intel', '🔎 Intel', intel),
     ('tab-compare', '🔄 Compare', compare),
     ('tab-reports', '📄 Reports', reports),

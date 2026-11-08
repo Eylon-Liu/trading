@@ -95,7 +95,7 @@ def layout() -> html.Div:
     Output('rep-status', 'children'), Output('rep-preview', 'children'),
     Output('rep-history', 'children'),
     Input('rep-button', 'n_clicks'),
-    State('rep-kind', 'value'), State('rep-strategy', 'value'),
+    State('rep-kind', 'value'), State('rep-strategy', 'data'),
     State('rep-email', 'value'),
     prevent_initial_call=True,
 )

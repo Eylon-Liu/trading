@@ -109,6 +109,12 @@ SOURCES: dict[str, Source] = {
                          key_mode='global'),
     'attention':  Source('attention', 'Wikipedia pageviews', 24, False,
                          key_mode='global'),
+    'macro':      Source('macro', 'FRED macro series', 12, False,
+                         key_mode='global',
+                         note='Rates, credit spreads, VIX; no key needed.'),
+    'earnings':   Source('earnings', 'Earnings calendar', 12, False,
+                         key_mode='global',
+                         note='Upcoming report dates for the universe.'),
 }
 
 ESSENTIAL = [k for k, s in SOURCES.items() if s.essential]
@@ -368,8 +374,28 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
         return SourceResult(name, 'fetched', rows=rows, stale_keys=1,
                             total_keys=1)
 
+    if name == 'macro':
+        due = stale_keys(name, ['fred'], force=force)
+        if not due:
+            return SourceResult(name, 'fresh', total_keys=1)
+        from data import macro
+        emit(f'refreshing {src.label}')
+        rows = macro.update_macro()
+        return SourceResult(name, 'fetched', rows=rows, stale_keys=1,
+                            total_keys=1)
+
     if not tickers:
         return SourceResult(name, 'skipped', detail='empty universe')
+
+    if name == 'earnings':
+        due = stale_keys(name, ['calendar'], force=force)
+        if not due:
+            return SourceResult(name, 'fresh', total_keys=1)
+        from data import earnings
+        emit(f'refreshing {src.label}')
+        rows = earnings.update_earnings(tickers)
+        return SourceResult(name, 'fetched', rows=rows, stale_keys=1,
+                            total_keys=1)
 
     # ── per-ticker sources ───────────────────────────────────────
     if name == 'prices':

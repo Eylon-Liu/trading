@@ -410,7 +410,9 @@ def cmd_daily(args) -> int:
     report_id = builder.report_id_for(kind, today)
     session = MC.last_completed_session()
     spec = parse_spec(index)
-    watch = config.WATCHLIST
+    from quant import portfolio as PF
+    watch = PF.watchlist()
+    held = PF.lots('open')['ticker'].unique().tolist()
 
     reason = MC.closed_reason(today)
     print(f'▸ {today:%a %Y-%m-%d} · '
@@ -435,11 +437,11 @@ def cmd_daily(args) -> int:
         return 0
 
     if kind == 'news':
-        sources = ['news', 'policy']
+        sources = ['news', 'policy', 'earnings']
     elif args.mode == 'full':
         sources = None                          # every source
     else:
-        sources = ['prices', 'news', 'policy']
+        sources = ['prices', 'news', 'policy', 'macro', 'earnings']
 
     if args.dry_run:
         print(f'  dry run: would ingest {sources or "all sources"}, '
@@ -455,7 +457,7 @@ def cmd_daily(args) -> int:
         except Exception as exc:                   # noqa: BLE001
             print(f'⚠️  could not resolve {index} members: {exc}')
             tickers = []
-        tickers = sorted(set(tickers) | set(watch))
+        tickers = sorted(set(tickers) | set(watch) | set(held))
         print(f'▸ ingest {", ".join(sources) if sources else "all sources"} '
               f'for {len(tickers)} names')
         try:
@@ -604,6 +606,151 @@ def cmd_status(args) -> int:
 
 
 # ─────────────────────────────────────────────
+# PORTFOLIO, WATCHLIST, TRACK RECORD, CALENDARS
+# ─────────────────────────────────────────────
+
+def _fmt_pct(v) -> str:
+    import numpy as np
+    return f'{v:+.1%}' if v is not None and np.isfinite(v) else '—'
+
+
+def cmd_watch(args) -> int:
+    from quant import portfolio as PF
+    db.init_db()
+    if args.action == 'add':
+        names = PF.watch_add(args.tickers, note=args.note)
+        print(f'✅  watching {", ".join(names)}')
+    elif args.action == 'remove':
+        n = PF.watch_remove(args.tickers)
+        print(f'🗑  removed {n}')
+    wl = PF.watchlist_table()
+    env_only = sorted(set(config.WATCHLIST) - set(wl['ticker']))
+    if wl.empty and not env_only:
+        print('watchlist is empty — `python cli.py watch add AAPL MSFT`')
+        return 0
+    for _i, r in wl.iterrows():
+        print(f'  {r["ticker"]:8} {r["note"] or ""}')
+    for t in env_only:
+        print(f'  {t:8} (from QUANT_WATCHLIST in .env)')
+    return 0
+
+
+def cmd_portfolio(args) -> int:
+    from quant import portfolio as PF
+    db.init_db()
+    a = args.action
+    if a == 'add':
+        if args.shares is None or args.cost is None:
+            print('usage: portfolio add TICKER SHARES COST [--date --stop --target]')
+            return 1
+        lot = PF.add_lot(args.ticker, args.shares, args.cost, opened=args.date,
+                         stop=args.stop, target=args.target,
+                         strategy=args.strategy, note=args.note)
+        print(f'✅  added {args.ticker.upper()} lot {lot}')
+    elif a == 'close':
+        n = PF.close(args.ticker, exit_price=args.price, closed=args.date)
+        print(f'✅  closed {n} lot(s)' if n else '❌  no open lot matches')
+        if not n:
+            return 1
+    elif a == 'set':
+        n = PF.set_levels(args.ticker, stop=args.stop, target=args.target)
+        print(f'✅  updated {n} lot(s)')
+    elif a == 'import':
+        n = PF.import_csv(args.ticker)
+        print(f'✅  imported {n} lot(s) from {args.ticker}')
+    elif a == 'remove':
+        n = PF.delete_lot(args.ticker)
+        print(f'🗑  deleted {n} lot(s)')
+
+    if a in ('show', 'add', 'close', 'set', 'import', 'remove'):
+        h = PF.holdings()
+        if h.empty:
+            print('no open positions — `python cli.py portfolio add AAPL 10 185.50`')
+        else:
+            view = h[['shares', 'avg_cost', 'last', 'day_chg', 'pnl', 'pnl_pct',
+                      'weight', 'stop', 'target']].copy()
+            for c in ('day_chg', 'pnl_pct', 'weight'):
+                view[c] = view[c].map(_fmt_pct)
+            print(view.round(2).to_string())
+            sm = PF.summary(h)
+            money = lambda v: f'${v:,.0f}' if v == v else '—'      # noqa: E731
+            print(f'\nvalue {money(sm["market_value"])}  ·  P&L {money(sm["pnl"])} '
+                  f'({_fmt_pct(sm["pnl_pct"])})  ·  last session {money(sm["day_pnl"])}'
+                  + (f'  ·  {sm["unpriced"]} without a stored price — run ingest'
+                     if sm['unpriced'] else ''))
+        if args.lots:
+            print('\nlots:')
+            print(PF.lots('open')[['lot_id', 'ticker', 'shares', 'cost_basis', 'opened',
+                                   'stop', 'target', 'note']].to_string(index=False))
+    if a in ('show', 'alerts'):
+        al = PF.alerts()
+        print('\nalerts:' if al else '\nno alerts')
+        icon = {'risk': '🔴', 'watch': '🟠', 'info': '🔵'}
+        for x in al:
+            print(f'  {icon[x["level"]]} {x["ticker"]:6} {x["text"]}')
+    return 0
+
+
+def cmd_track(args) -> int:
+    from data.universe import parse_spec
+    from quant import track
+    db.init_db()
+    spec_json = parse_spec(args.index).to_json() if args.index else None
+    tr = track.summary(lookback_days=args.days, top_n=args.top, spec_json=spec_json)
+    if tr.empty:
+        print('no completed cohorts yet — the routine needs to have stored '
+              'screens at least a week ago')
+        return 0
+    view = tr[['name', 'horizon', 'cohorts', 'independent', 'mean_pick_return',
+               'mean_excess', 'hit_rate', 'mean_ic']].copy()
+    for c in ('mean_pick_return', 'mean_excess', 'hit_rate'):
+        view[c] = view[c].map(_fmt_pct)
+    view['mean_ic'] = view['mean_ic'].round(3)
+    print(view.to_string(index=False))
+    print('\nPicks bought at the close after each stored screen. Daily cohorts '
+          'overlap; trust "independent", not "cohorts".')
+    return 0
+
+
+def cmd_earnings(args) -> int:
+    from data import earnings as ER
+    from data import members
+    from quant import portfolio as PF
+    db.init_db()
+    names = set(PF.watchlist()) | set(PF.lots('open')['ticker'])
+    if args.index:
+        names |= set(members.latest_members(args.index.upper()))
+    if args.refresh:
+        print(f'▸ refreshing calendar for {len(names)} names')
+        ER.update_earnings(sorted(names))
+    er = ER.upcoming(sorted(names), days=args.days)
+    if er.empty:
+        print('nothing scheduled — add names with `watch add`, or pass --index SPY')
+        return 0
+    er['report_date'] = er['report_date'].dt.date
+    print(er[['ticker', 'report_date', 'time', 'source', 'eps_estimate',
+              'days_until']].to_string(index=False))
+    return 0
+
+
+def cmd_macro(args) -> int:
+    from data import macro
+    db.init_db()
+    if args.refresh:
+        print(f'▸ fetched {macro.update_macro()} observations')
+    snap = macro.snapshot(date.today())
+    if snap.empty:
+        print('no macro data yet — run `python cli.py macro --refresh`')
+        return 0
+    print(snap[['label', 'value', 'chg_1w', 'chg_1m', 'date']].round(2).to_string(index=False))
+    print()
+    icon = {'ok': '🟢', 'watch': '🟠', 'risk': '🔴'}
+    for lvl, txt in macro.regime(date.today(), snap):
+        print(f'{icon[lvl]} {txt}')
+    return 0
+
+
+# ─────────────────────────────────────────────
 # PARSER
 # ─────────────────────────────────────────────
 
@@ -695,6 +842,47 @@ def build_parser() -> argparse.ArgumentParser:
     dbp.add_argument('--no-backup', action='store_true',
                      help='clean: skip the safety backup')
     dbp.set_defaults(func=cmd_db)
+
+    wt = sub.add_parser('watch', help='watchlist: add | remove | list')
+    wt.add_argument('action', choices=['add', 'remove', 'list'])
+    wt.add_argument('tickers', nargs='*')
+    wt.add_argument('--note')
+    wt.set_defaults(func=cmd_watch)
+
+    pf = sub.add_parser(
+        'portfolio', help='your positions: show | add | close | set | alerts | '
+                          'import | remove')
+    pf.add_argument('action', choices=['show', 'add', 'close', 'set', 'alerts',
+                                       'import', 'remove'], nargs='?', default='show')
+    pf.add_argument('ticker', nargs='?',
+                    help='ticker (add/close/set), lot id (close/remove), or CSV path (import)')
+    pf.add_argument('shares', nargs='?', type=float)
+    pf.add_argument('cost', nargs='?', type=float, help='cost per share')
+    pf.add_argument('--date', help='open/close date, YYYY-MM-DD')
+    pf.add_argument('--stop', type=float, help='alert level (set -1 to clear)')
+    pf.add_argument('--target', type=float, help='alert level (set -1 to clear)')
+    pf.add_argument('--price', type=float, help='close: exit price (default last close)')
+    pf.add_argument('--strategy', help='which screen it came from')
+    pf.add_argument('--note')
+    pf.add_argument('--lots', action='store_true', help='also list individual lots')
+    pf.set_defaults(func=cmd_portfolio)
+
+    tr = sub.add_parser('track', help='live track record of stored screens')
+    tr.add_argument('--index', default=config.QUANT_INDEX,
+                    help='only runs on this universe (default QUANT_INDEX)')
+    tr.add_argument('--days', type=int, default=400, help='lookback in days')
+    tr.add_argument('--top', type=int, default=10, help='picks per run')
+    tr.set_defaults(func=cmd_track)
+
+    er = sub.add_parser('earnings', help='upcoming earnings for your names')
+    er.add_argument('--days', type=int, default=21)
+    er.add_argument('--index', help='also include an index, e.g. SPY')
+    er.add_argument('--refresh', action='store_true', help='fetch the calendar first')
+    er.set_defaults(func=cmd_earnings)
+
+    mc = sub.add_parser('macro', help='rates, credit, VIX and regime flags (FRED)')
+    mc.add_argument('--refresh', action='store_true', help='fetch from FRED first')
+    mc.set_defaults(func=cmd_macro)
 
     sch = sub.add_parser('schedule',
                          help='print an ingest schedule matched to each source')

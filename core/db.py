@@ -325,6 +325,49 @@ custom_strategies = Table(
     Column('updated_at', DateTime),
 )
 
+# Upcoming earnings dates from a calendar provider. Estimated dates (from the
+# filing cadence) are computed on read, never stored, so a row here is always
+# a provider's published date.
+earnings_calendar = Table(
+    'earnings_calendar', metadata,
+    Column('ticker', String, primary_key=True),
+    Column('report_date', Date, primary_key=True),
+    Column('time', String),               # bmo | amc | unknown
+    Column('source', String),             # nasdaq | finnhub
+    Column('fiscal_period', String),
+    Column('eps_estimate', Float),
+    Column('fetched_at', DateTime),
+    Index('ix_earnings_date', 'report_date'),
+)
+
+# Names you follow. Distinct from positions: watching costs nothing and
+# carries no price levels.
+watchlist = Table(
+    'watchlist', metadata,
+    Column('ticker', String, primary_key=True),
+    Column('note', Text),
+    Column('added_at', DateTime),
+)
+
+# Your own holdings. One row per lot, so adding to a position later keeps
+# both cost bases; the portfolio view aggregates lots per ticker.
+positions = Table(
+    'positions', metadata,
+    Column('lot_id', String, primary_key=True),
+    Column('ticker', String, index=True),
+    Column('shares', Float),
+    Column('cost_basis', Float),          # per share, in the trade currency
+    Column('opened', Date),
+    Column('stop', Float),                # optional alert levels
+    Column('target', Float),
+    Column('strategy', String),           # which screen it came from, if any
+    Column('note', Text),
+    Column('status', String, index=True), # open | closed
+    Column('closed', Date),
+    Column('exit_price', Float),
+    Column('updated_at', DateTime),
+)
+
 ingest_log = Table(
     'ingest_log', metadata,
     Column('source', String, primary_key=True),

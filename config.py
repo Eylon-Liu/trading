@@ -95,6 +95,9 @@ RATE_LIMITS = {
     'news.google.com': 2.0,
     'www.federalregister.gov': 5.0,
     'api.stlouisfed.org': 5.0,
+    'fred.stlouisfed.org': 2.0,
+    'api.nasdaq.com': 1.0,
+    'finnhub.io': 1.0,
     '_default': 3.0,
 }
 
@@ -109,6 +112,8 @@ CACHE_TTL_SECONDS = {
     'news': 60 * 30,
     'policy': 60 * 60 * 6,
     'members': 60 * 60 * 24 * 7,
+    'macro': 60 * 60 * 6,
+    'earnings': 60 * 60 * 12,
     '_default': 60 * 60,
 }
 
@@ -235,7 +240,7 @@ REBALANCE_OPTIONS = {'M': 'Monthly', 'Q': 'Quarterly', 'SA': 'Semi-Annual', 'A':
 
 BENCHMARK_TICKER = 'SPY'
 RISK_FREE_SERIES = 'DGS3MO'      # FRED 3-month T-bill
-RISK_FREE_RATE = 0.05             # annualised fallback; update when FRED pipeline lands
+RISK_FREE_RATE = 0.05             # annual fallback when no FRED T-bill data is stored
 TRANSACTION_COST_BPS = 10.0      # one-way, per trade
 SLIPPAGE_BPS = 5.0
 DEFAULT_PORTFOLIO_SIZE = 20
