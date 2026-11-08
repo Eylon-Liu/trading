@@ -140,6 +140,7 @@ def fetch(
     use_cache: bool = True,
     ttl: int | None = None,
     timeout: int | None = None,
+    retries: int | None = None,
 ) -> bytes | None:
     """
     Fetch a URL with rate limiting, caching, and retry.
@@ -161,7 +162,10 @@ def fetch(
     bucket = _bucket_for(host)
     last_error: str | None = None
 
-    for attempt in range(config.HTTP_MAX_RETRIES):
+    # `retries` lets a caller that polls many URLs of one fragile host cap the
+    # cost of a host that is down: 4 attempts x 30s each, across 15 calendar
+    # days, would stall a morning run for half an hour.
+    for attempt in range(config.HTTP_MAX_RETRIES if retries is None else max(1, retries)):
         bucket.acquire()
         try:
             resp = _session().get(

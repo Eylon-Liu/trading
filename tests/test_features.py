@@ -218,3 +218,61 @@ def test_track_record_grades_stored_runs(fresh_db):
     assert row['hit_rate'] == 1.0
     assert row['mean_ic'] == pytest.approx(1.0)
     assert row['independent'] < row['cohorts']
+
+
+# ── earnings fallbacks ───────────────────────────────────────────
+
+class _FakeTicker:
+    calendars: dict = {}
+
+    def __init__(self, t):
+        self.t = t
+
+    @property
+    def calendar(self):
+        return self.calendars.get(self.t, {})
+
+
+def test_yahoo_fills_followed_names_when_nasdaq_is_down(fresh_db, monkeypatch):
+    import sys
+    import types
+    monkeypatch.setattr(config, 'FINNHUB_API_KEY', None)
+    calls = []
+    monkeypatch.setattr(ER.http, 'fetch_json',
+                        lambda *a, **k: calls.append(1) or None)
+    d1 = date.today() + timedelta(days=6)
+    _FakeTicker.calendars = {
+        'AAPL': {'Earnings Date': [d1], 'Earnings Average': 1.6},
+        'MSFT': {'Earnings Date': [d1, d1 + timedelta(days=4)]},
+    }
+    monkeypatch.setitem(sys.modules, 'yfinance',
+                        types.SimpleNamespace(Ticker=_FakeTicker))
+    ER.update_earnings(['AAPL', 'MSFT', 'XOM'], followed=['AAPL', 'MSFT'])
+
+    assert len(calls) <= 3, 'a dead Nasdaq must be abandoned quickly'
+    assert ER.LAST_STATUS['nasdaq'] == 'failed'
+    up = ER.upcoming(['AAPL', 'MSFT'], days=14).set_index('ticker')
+    assert bool(up.loc['AAPL', 'confirmed']) is True
+    assert up.loc['AAPL', 'eps_estimate'] == pytest.approx(1.6)
+    assert bool(up.loc['MSFT', 'confirmed']) is False      # Yahoo's date range
+
+
+def test_yahoo_is_skipped_for_names_nasdaq_listed(fresh_db, monkeypatch):
+    import sys
+    import types
+    monkeypatch.setattr(config, 'FINNHUB_API_KEY', None)
+    d = next(x for x in (date.today() + timedelta(days=i) for i in range(1, 8))
+             if MC.is_trading_day(x))
+    monkeypatch.setattr(ER.http, 'fetch_json', lambda url, params=None, **k: (
+        {'data': {'rows': [{'symbol': 'AAPL', 'time': 'time-after-hours'}]}}
+        if params and params.get('date') == str(d) else {'data': {'rows': None}}))
+    asked = []
+
+    class T(_FakeTicker):
+        def __init__(self, t):
+            asked.append(t)
+            super().__init__(t)
+    monkeypatch.setitem(sys.modules, 'yfinance', types.SimpleNamespace(Ticker=T))
+    ER.update_earnings(['AAPL'], followed=['AAPL'])
+    assert asked == []
+    assert ER.upcoming(['AAPL'], days=10)['time'].tolist() == ['amc']
