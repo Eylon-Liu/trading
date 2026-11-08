@@ -134,25 +134,33 @@ def summary(cohorts: pd.DataFrame | None = None, **kw) -> pd.DataFrame:
         return pd.DataFrame()
     from quant import strategies as ST
 
-    def name(k):
+    def info(k):
         try:
-            return ST.get(k).name
+            st = ST.get(k)
+            return st.name, bool(st.invert)
         except Exception:                          # noqa: BLE001
-            return k
+            return k, False
 
     out = []
     for (strat, horizon), g in df.groupby(['strategy', 'horizon']):
         span = (pd.to_datetime(g['run_date']).max()
                 - pd.to_datetime(g['run_date']).min()).days * 252 / 365
         h = int(g['sessions'].iloc[0])
+        label, avoid = info(strat)
+        # An avoid list works when its names *lag*: count those cohorts as
+        # hits, and flip the IC sign so positive means right for every row.
+        hits = (g['excess'] < 0) if avoid else (g['excess'] > 0)
+        ic = float(g['ic'].mean()) if g['ic'].notna().any() else np.nan
         out.append({
-            'strategy': strat, 'name': name(strat), 'horizon': horizon,
+            'strategy': strat,
+            'name': f'{label} (avoid list)' if avoid else label,
+            'horizon': horizon, 'avoid': avoid,
             'sessions': h, 'cohorts': len(g),
             'independent': max(1, int(round(span / h)) + 1),
             'mean_pick_return': float(g['pick_return'].mean()),
             'mean_excess': float(g['excess'].mean()),
-            'hit_rate': float((g['excess'] > 0).mean()),
-            'mean_ic': float(g['ic'].mean()) if g['ic'].notna().any() else np.nan,
+            'hit_rate': float(hits.mean()),
+            'mean_ic': -ic if avoid and np.isfinite(ic) else ic,
             'first': g['run_date'].min(), 'last': g['run_date'].max(),
         })
     order = {k: i for i, k in enumerate(HORIZONS)}

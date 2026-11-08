@@ -184,11 +184,14 @@ NOTES: dict[str, StrategyNote] = {
     ),
 
     'earnings_drift': StrategyNote(
-        differentiator='Event-driven rather than price-driven: it keys off a '
-                       'recent results filing, not a chart pattern.',
+        differentiator='Event-driven rather than price-driven: it ranks on '
+                       'how the market reacted to the latest results (the '
+                       'three-day return around the 8-K, net of the market), '
+                       'not on a chart pattern.',
         benefit='Post-earnings announcement drift is among the most persistent '
-                'documented anomalies, and the 8-K item code identifies the '
-                'event deterministically rather than by parsing text.',
+                'documented anomalies, and the 8-K item code dates the event '
+                'deterministically rather than by parsing text. Names with no '
+                'report in the last 63 days are not scored at all.',
         drawback='The window is short and crowded. The effect has weakened as '
                  'it has become widely known and traded.',
         risk='Concentrated event risk — one disappointing follow-up quarter '

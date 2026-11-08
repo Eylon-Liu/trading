@@ -331,7 +331,10 @@ def update_filings(tickers: list[str], forms: tuple[str, ...] =
                     'primary_doc': (recent.get('primaryDocument') or [''] * n)[i],
                 })
 
-                if form.startswith('8-K') and items:
+                # Original 8-Ks only. An 8-K/A amends a filing already counted;
+                # deriving events from it made an amended results release
+                # weeks later look like a second earnings announcement.
+                if form == '8-K' and items:
                     for code in {c.strip() for c in items.split(',') if c.strip()}:
                         mapped = config.EIGHTK_ITEMS.get(code)
                         if not mapped:

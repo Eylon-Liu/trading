@@ -201,21 +201,28 @@ def _long_term_signal(row: pd.Series) -> tuple[str, float, str]:
     Raw factor values (ROIC, Piotroski, D/E, etc.) are already weighted into
     the composite, so re-scoring them here would double-count and can promote
     a mediocre-composite name into "Buy."
+
+    Tiers come from the composite's *percentile* in the screened universe.
+    They used to be absolute cut-offs (composite > 1.0 = "top decile"), but the
+    composite is an average of z-scores whose spread shrinks with every extra,
+    partly independent factor: an eleven-factor strategy almost never cleared
+    1.0 while a five-factor momentum blend cleared it routinely. Buy counts
+    were not comparable across strategies and "top decile" was often untrue.
     """
     score, reasons = 0.0, []
-    comp = row.get('composite', np.nan)
+    pct = row.get('composite_pct', np.nan)
 
-    if np.isfinite(comp):
-        if comp > 1.0:
+    if pct is not None and np.isfinite(pct):
+        if pct >= 0.90:
             score += 3; reasons.append('Top-decile composite')
-        elif comp > 0.5:
-            score += 2; reasons.append('Strong composite')
-        elif comp > 0:
-            score += 1; reasons.append('Above-average composite')
-        elif comp > -0.5:
-            score -= 1; reasons.append('Below-average composite')
+        elif pct >= 0.75:
+            score += 2; reasons.append('Top-quartile composite')
+        elif pct >= 0.50:
+            score += 1; reasons.append('Above-median composite')
+        elif pct >= 0.25:
+            score -= 1; reasons.append('Below-median composite')
         else:
-            score -= 2; reasons.append('Weak composite')
+            score -= 2; reasons.append('Bottom-quartile composite')
 
     ma200 = row.get('PCT_VS_MA200')
     if ma200 is not None and np.isfinite(ma200):
@@ -252,16 +259,17 @@ def _mid_term_signal(row: pd.Series) -> tuple[str, float, str]:
     they are not re-scored here.
     """
     score, reasons = 0.0, []
-    comp = row.get('composite', np.nan)
+    pct = row.get('composite_pct', np.nan)
 
-    if np.isfinite(comp):
-        if comp > 1.0:
-            score += 3; reasons.append('Top-ranked setup')
-        elif comp > 0.5:
+    # Percentile tiers, for the reason given in _long_term_signal.
+    if pct is not None and np.isfinite(pct):
+        if pct >= 0.90:
+            score += 3; reasons.append('Top-decile setup')
+        elif pct >= 0.75:
             score += 2; reasons.append('Strong setup')
-        elif comp > 0:
+        elif pct >= 0.50:
             score += 1; reasons.append('Positive setup')
-        elif comp > -0.3:
+        elif pct >= 0.30:
             score -= 0.5; reasons.append('Marginal setup')
         else:
             score -= 2; reasons.append('Weak setup')
@@ -293,14 +301,53 @@ def _mid_term_signal(row: pd.Series) -> tuple[str, float, str]:
     return label, score, '; '.join(reasons)
 
 
+def _avoid_signal(row: pd.Series) -> tuple[str, float, str]:
+    """
+    Grade a name on an avoid list (an inverted strategy).
+
+    Rank 1 there is the *worst* name, so its signals must say avoid. Graded
+    with the long/mid labels, the deteriorating-quality list used to tell you
+    to "🟢 Enter — full size" on exactly the companies it had flagged, and
+    the daily brief counted them as Buy signals in the consensus.
+    """
+    pct = row.get('composite_pct', np.nan)
+    reasons = []
+    pf = row.get('PIOTROSKI_F')
+    if pf is not None and np.isfinite(pf) and pf <= 3:
+        reasons.append(f'Piotroski {pf:.0f}/9')
+    ma = row.get('PCT_VS_MA200')
+    if ma is not None and np.isfinite(ma) and ma < 0:
+        reasons.append(f'{ma*100:.0f}% below 200-day')
+    ins = row.get('INSIDER_NET_BUY')
+    if ins is not None and np.isfinite(ins) and ins < -0.3:
+        reasons.append('Insiders net sellers')
+    for col, text in (('EVENT_MANAGEMENT', 'Management change filed'),
+                      ('EVENT_RESTRUCTURING', 'Restructuring filed')):
+        v = row.get(col)
+        if v is not None and np.isfinite(v) and v > 0:
+            reasons.append(text)
+    acc = row.get('ACCRUALS')
+    if acc is not None and np.isfinite(acc) and acc > 0.05:
+        reasons.append('Earnings well ahead of cash flow')
+    if pct is not None and np.isfinite(pct) and pct >= 0.90:
+        return '🔴 Avoid — deteriorating', -3.0, '; '.join(reasons)
+    if pct is not None and np.isfinite(pct) and pct >= 0.75:
+        return '🟠 Caution — weakening', -1.5, '; '.join(reasons)
+    return '⚪ No flag', 0.0, '; '.join(reasons)
+
+
 def generate_signals(scores: pd.DataFrame, raw: pd.DataFrame,
-                     horizon: str) -> pd.DataFrame:
+                     horizon: str, invert: bool = False) -> pd.DataFrame:
     """Attach horizon-appropriate signal, score and reasoning."""
     if scores.empty:
         return scores
 
     merged = scores.join(raw.drop(columns=['sector'], errors='ignore'), how='left')
-    fn = _mid_term_signal if horizon == 'mid' else _long_term_signal
+    merged['composite_pct'] = merged['composite'].rank(pct=True)
+    if invert:
+        fn = _avoid_signal
+    else:
+        fn = _mid_term_signal if horizon == 'mid' else _long_term_signal
 
     results = [fn(row) for _i, row in merged.iterrows()]
     scores = scores.copy()
@@ -420,7 +467,8 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                          pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report, warnings)
 
-    scores = generate_signals(scores, raw_eligible, strategy.horizon)
+    scores = generate_signals(scores, raw_eligible, strategy.horizon,
+                              invert=strategy.invert)
     scores = scores.dropna(subset=['composite'])
     scores['rank'] = range(1, len(scores) + 1)
 
@@ -432,7 +480,8 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
             scores[col] = raw_eligible[col].reindex(scores.index)
 
     plans = pd.DataFrame()
-    if strategy.needs_trade_plan:
+    # An avoid list gets no long entry, stop or target.
+    if strategy.needs_trade_plan and not strategy.invert:
         shortlist = scores.head(top_n)
         plans = TP.build_plans(
             raw_eligible.loc[raw_eligible.index.intersection(shortlist.index)],

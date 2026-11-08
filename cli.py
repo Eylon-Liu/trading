@@ -314,14 +314,18 @@ def cmd_backtest(args) -> int:
     spec = parse_spec(args.universe) if args.universe else UniverseSpec(preset='SPY')
     strat = ST.get(args.strategy)
 
-    if strat.horizon == 'mid':
-        print(f'▸ mid-horizon backtest (stop/target aware): {strat.name}')
-        res = BT.run_trade_backtest(spec, args.strategy, args.start, args.end,
-                                    n_positions=args.top)
-    else:
-        print(f'▸ long-horizon backtest: {strat.name}')
-        res = BT.run_backtest(spec, args.strategy, args.start, args.end,
-                              n_holdings=args.top, rebalance=args.rebalance)
+    try:
+        if strat.horizon == 'mid':
+            print(f'▸ mid-horizon backtest (stop/target aware): {strat.name}')
+            res = BT.run_trade_backtest(spec, args.strategy, args.start, args.end,
+                                        n_positions=args.top)
+        else:
+            print(f'▸ long-horizon backtest: {strat.name}')
+            res = BT.run_backtest(spec, args.strategy, args.start, args.end,
+                                  n_holdings=args.top, rebalance=args.rebalance)
+    except (ValueError, BT.DegradedBacktest) as exc:
+        print(f'❌  {exc}')
+        return 1
 
     if not res.metrics:
         print('❌  backtest produced no results')
@@ -722,13 +726,17 @@ def cmd_earnings(args) -> int:
         names |= set(members.latest_members(args.index.upper()))
     if args.refresh:
         print(f'▸ refreshing calendar for {len(names)} names')
-        ER.update_earnings(sorted(names))
+        n = ER.update_earnings(sorted(names))
+        for src, st in ER.LAST_STATUS.items():
+            print(f'  {src:8} {st}')
+        print(f'  {n} date(s) stored')
     er = ER.upcoming(sorted(names), days=args.days)
     if er.empty:
         print('nothing scheduled — add names with `watch add`, or pass --index SPY')
         return 0
     er['report_date'] = er['report_date'].dt.date
-    print(er[['ticker', 'report_date', 'time', 'source', 'eps_estimate',
+    er['status'] = er['confirmed'].map({True: 'confirmed', False: 'estimated'})
+    print(er[['ticker', 'report_date', 'time', 'source', 'status', 'eps_estimate',
               'days_until']].to_string(index=False))
     return 0
 

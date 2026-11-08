@@ -69,6 +69,7 @@ _register(
 )
 _register('insider_txns', 'INSIDER_NET_BUY', 'INSIDER_CLUSTER')
 _register('corporate_events', 'EVENT_INTENSITY_90D', 'EVENT_RESULTS',
+          'EARNINGS_REACTION',
           'EVENT_MANAGEMENT', 'EVENT_RESTRUCTURING', 'EVENT_STRATEGY')
 _register('attention', 'ATTENTION_Z')
 _register('profile_snapshots', 'FORWARD_PE', 'TRAILING_PE')

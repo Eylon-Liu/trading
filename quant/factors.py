@@ -114,9 +114,50 @@ def _vectorized_atr(high: pd.DataFrame, low: pd.DataFrame,
     return result.replace([np.inf, -np.inf], np.nan)
 
 
+def earnings_reaction(px: pd.DataFrame, events: pd.DataFrame | None,
+                      as_of: date, benchmark: str,
+                      window_days: int = 63) -> pd.Series:
+    """
+    Pure: market-adjusted return over the three sessions around the latest
+    results filing (8-K Item 2.02) in the last `window_days`.
+
+    This is the earnings-announcement return that post-earnings drift is
+    measured on: stocks keep drifting in the direction of their reaction for
+    weeks. The window runs from the close before the filing day to the close
+    after it, which covers a release before the open and one after the close
+    alike. On the filing day itself only the bars already printed are used.
+
+    `px` must already be cut at `as_of`.
+    """
+    if events is None or events.empty or px.empty or benchmark not in px.columns:
+        return pd.Series(dtype=float)
+    cutoff = pd.Timestamp(as_of)
+    filed = pd.to_datetime(events['filed'])
+    ev = events[(events['item_code'].astype(str) == '2.02') & (filed <= cutoff)
+                & (filed >= cutoff - pd.Timedelta(days=window_days))]
+    if ev.empty:
+        return pd.Series(dtype=float)
+    latest = pd.to_datetime(ev['filed']).groupby(ev['ticker']).max()
+    idx, bench = px.index, px[benchmark]
+    out = {}
+    for t, f in latest.items():
+        if t not in px.columns:
+            continue
+        p_f = int(idx.searchsorted(f, side='left'))
+        start, end = p_f - 1, min(p_f + 1, len(idx) - 1)
+        if start < 0 or end <= start:
+            continue
+        s0, s1 = px[t].iloc[start], px[t].iloc[end]
+        b0, b1 = bench.iloc[start], bench.iloc[end]
+        if np.isfinite([s0, s1, b0, b1]).all() and s0 > 0 and b0 > 0:
+            out[t] = (s1 / s0 - 1.0) - (b1 / b0 - 1.0)
+    return pd.Series(out, dtype=float)
+
+
 def price_factors(tickers: list[str], as_of: date | str,
                   benchmark: str | None = None,
-                  _bt_ohlc: tuple | None = None) -> pd.DataFrame:
+                  _bt_ohlc: tuple | None = None,
+                  _events: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Every price-derived factor, computed only from bars at or before `as_of`.
     """
@@ -214,6 +255,12 @@ def price_factors(tickers: list[str], as_of: date | str,
         out['ATR_PCT'] = out['ATR_14'] / last.reindex(out.index)
 
     out['PRICE'] = last.reindex(out.index)
+
+    # ── earnings reaction (needs results filings) ─────────────────
+    events = _events if _events is not None else sec.events_asof(
+        list(out.index), as_of, lookback_days=70)
+    out['EARNINGS_REACTION'] = earnings_reaction(
+        px, events, as_of, benchmark).reindex(out.index)
     return out
 
 
@@ -596,7 +643,8 @@ def build_all(tickers: list[str], as_of: date | str,
     bt_close = _bt_ohlc[3] if _bt_ohlc is not None else None
 
     def _build_price():
-        return price_factors(tickers, as_of, _bt_ohlc=_bt_ohlc)
+        return price_factors(tickers, as_of, _bt_ohlc=_bt_ohlc,
+                             _events=_bt_events)
 
     def _build_fund():
         return fundamental_factors(tickers, as_of,
@@ -713,6 +761,7 @@ FACTOR_DIRECTION: dict[str, bool] = {
     'NET_MARGIN': True, 'OPERATING_MARGIN': True, 'ASSET_TURNOVER': True,
     'CURRENT_RATIO': True, 'PIOTROSKI_F': True, 'FCF_CONVERSION': True,
     'EVENT_RESULTS': True,          # a recent results filing opens the drift window
+    'EARNINGS_REACTION': True,      # drift continues in the reaction's direction
     'ACCRUALS': False, 'DEBT_TO_EQUITY': False, 'NET_DEBT_TO_EQUITY': False,
     'REVENUE_GROWTH_1Y': True, 'REVENUE_CAGR_3Y': True,
     'EARNINGS_GROWTH_1Y': True, 'EQUITY_CAGR_3Y': True, 'EPS_CAGR_3Y': True,

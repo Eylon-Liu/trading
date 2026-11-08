@@ -235,6 +235,13 @@ def dedupe_news() -> dict[str, int]:
     return {'deleted': len(drop), 'rekeyed': len(rekey)}
 
 
+def delete_amended_events() -> int:
+    """Corporate events derived from 8-K/A amendments (see data.sec)."""
+    return db.execute("""
+        DELETE FROM corporate_events WHERE accession IN (
+            SELECT accession FROM sec_filings WHERE form != '8-K')""")
+
+
 def dedupe_reports() -> int:
     """One history row per report file, keeping the newest and its email stamp."""
     rows = db.read_sql("""
@@ -309,6 +316,7 @@ def clean(vacuum: bool = False, factor_detail_days: int | None = None) -> dict:
     out['duplicate_news'] = news['deleted']
     out['news_rekeyed'] = news['rekeyed']
     out['duplicate_reports'] = dedupe_reports()
+    out['amended_8k_events'] = delete_amended_events()
     if factor_detail_days:
         out['pruned_factor_rows'] = prune_factor_detail(factor_detail_days)
     optimize(vacuum=vacuum)

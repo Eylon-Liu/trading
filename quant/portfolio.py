@@ -308,10 +308,12 @@ def strategy_view(tickers: list[str], as_of: date,
             continue
         sc = RB._run_scores(run['run_id'])
         sc = sc[sc['ticker'].isin(tickers)]
+        avoid = RB._is_avoid(key)
         for _i, r in sc.iterrows():
             rows.append({'ticker': r['ticker'], 'strategy': key,
                          'strategy_name': RB._strategy_name(key),
                          'rank': r['rank'], 'signal': r['signal'],
+                         'reasons': r.get('reasons'), 'avoid': avoid,
                          'bucket': RB._signal_bucket(r['signal'])})
     return pd.DataFrame(rows)
 
@@ -391,14 +393,23 @@ def alerts(as_of: date | None = None, h: pd.DataFrame | None = None,
                                 + (' — you hold it' if e['ticker'] in held else '')})
 
         view = strategy_view(names, as_of, spec_json)
+        held_set = set(h.index) if h is not None and not h.empty else set()
         if not view.empty:
             for t, g in view.groupby('ticker'):
-                sells = int((g['bucket'] == 'Sell').sum())
-                buys = int((g['bucket'] == 'Buy').sum())
-                if sells > buys and sells >= 2 and t in (h.index if h is not None and not h.empty else []):
+                ranked = g[~g['avoid']]
+                sells = int((ranked['bucket'] == 'Sell').sum())
+                buys = int((ranked['bucket'] == 'Buy').sum())
+                if sells > buys and sells >= 2 and t in held_set:
                     out.append({'level': 'watch', 'ticker': t,
                                 'text': f'{sells} strategies now rate it Sell/Avoid '
                                         f'(vs {buys} Buy)'})
+                flagged = g[g['avoid'] & g['signal'].fillna('').str.contains('Avoid')]
+                for _i, f in flagged.iterrows():
+                    why = f' — {f["reasons"]}' if f.get('reasons') else ''
+                    out.append({'level': 'watch' if t in held_set else 'info',
+                                'ticker': t,
+                                'text': f'On the {f["strategy_name"]} avoid list '
+                                        f'(#{int(f["rank"])}){why}'})
 
     order = {'risk': 0, 'watch': 1, 'info': 2}
     return sorted(out, key=lambda a: (order[a['level']], a['ticker']))

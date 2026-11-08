@@ -268,6 +268,9 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     that comes back is then not the strategy you configured.
     """
     strategy = ST.get(strategy_key)
+    if strategy.invert:
+        raise ValueError(f'{strategy.name} is an avoid list; a long-only '
+                         f'backtest of it is meaningless.')
     start = pd.to_datetime(start).date()
     end = pd.to_datetime(end or date.today()).date()
     rebalance = rebalance or ST.HORIZONS[strategy.horizon]['rebalance']
@@ -722,6 +725,10 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     of equity, and a name already held or on order is not bought again.
     """
     strategy = ST.get(strategy_key)
+    if strategy.invert:
+        raise ValueError(f'{strategy.name} is an avoid list (rank 1 is the worst '
+                         f'name); a long-only backtest of it is meaningless. Its '
+                         f'live track record grades it the right way round.')
     if strategy.horizon != 'mid':
         raise ValueError(f'{strategy_key} is a long-horizon strategy; '
                          f'use run_backtest instead')

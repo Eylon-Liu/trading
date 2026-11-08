@@ -73,6 +73,14 @@ def _all_strategy_keys() -> list[str]:
     return keys
 
 
+def _is_avoid(key: str) -> bool:
+    """True for an inverted strategy — a list of names to avoid, worst first."""
+    try:
+        return bool(ST.get(key).invert)
+    except Exception:                              # noqa: BLE001
+        return False
+
+
 def _latest_run(strategy: str, on_or_before: date,
                 spec_json: str | None = None) -> pd.Series | None:
     """
@@ -220,6 +228,7 @@ def _gather_cross_strategy(as_of: date, compare_days: int = 1,
     data_warnings: list[str] = []
     prior_dates: set[date] = set()
 
+    avoid_rows: list[pd.DataFrame] = []
     for key in _all_strategy_keys():
         run = _latest_run(key, as_of, spec_json)
         if run is None:
@@ -229,6 +238,14 @@ def _gather_cross_strategy(as_of: date, compare_days: int = 1,
             continue
         scores = _run_scores(run['run_id'])
         if scores.empty:
+            continue
+        if _is_avoid(key):
+            # An avoid list ranks the worst names first. Counting its top 20
+            # as "agreement" put flagged companies into the consensus picks.
+            top = scores.head(15).copy()
+            top['strategy'] = key
+            top['strategy_name'] = _strategy_name(key)
+            avoid_rows.append(top)
             continue
         scores = scores.copy()
         scores['strategy'] = key
@@ -331,6 +348,8 @@ def _gather_cross_strategy(as_of: date, compare_days: int = 1,
         'signal_dist': signal_dist,
         'data_warnings': data_warnings,
         'data_through': max(s['run_date'] for s in strategies_used),
+        'avoid': (pd.concat(avoid_rows, ignore_index=True)
+                  if avoid_rows else pd.DataFrame()),
     }
 
     # DOD / MOM consensus changes — only compare strategies present on
@@ -458,6 +477,8 @@ def _monthly_stability(as_of: date,
     window_start = as_of - timedelta(days=35)
     results = []
     for key in _all_strategy_keys():
+        if _is_avoid(key):
+            continue
         runs = db.read_sql("""
             SELECT run_id, as_of FROM runs
             WHERE strategy = :s AND as_of BETWEEN :start AND :end
@@ -681,6 +702,8 @@ def _current_picks(as_of: date, spec_json: str | None,
     """Consensus names from the latest stored runs — no re-screening."""
     rows = []
     for key in _all_strategy_keys():
+        if _is_avoid(key):
+            continue
         run = _latest_run(key, as_of, spec_json)
         if run is None:
             continue
@@ -1082,6 +1105,38 @@ def _render_earnings(er: pd.DataFrame | None, held: set | None = None,
             'cadence (8-K Item 2.02) and can be off by days.</p>')
 
 
+def _render_avoid(av: pd.DataFrame | None, held: set | None = None,
+                  picks: set | None = None, watch: set | None = None) -> str:
+    """Names the avoid-list strategies flag, with any overlap called out."""
+    if av is None or av.empty:
+        return ''
+    held, picks, watch = held or set(), picks or set(), watch or set()
+    av = av[av['signal'].fillna('').str.contains('Avoid|Caution')]
+    if av.empty:
+        return ''
+    rows = []
+    for _i, r in av.iterrows():
+        flags = []
+        if r['ticker'] in held:
+            flags.append('<span class="tag neg">you hold it</span>')
+        if r['ticker'] in watch:
+            flags.append('<span class="tag">watchlist</span>')
+        if r['ticker'] in picks:
+            flags.append('<span class="tag">also a consensus pick</span>')
+        rows.append(
+            f'<tr><td class="tk">{_esc(r["ticker"])}</td>'
+            f'<td class="num">{int(r["rank"])}</td><td>{_esc(r["signal"])}</td>'
+            f'<td class="muted" style="font-size:.76rem">{_esc(r.get("reasons") or "")}</td>'
+            f'<td>{" ".join(flags)}</td></tr>')
+    names = ', '.join(sorted(set(av['strategy_name'])))
+    return (f'<h2>⚠️ Avoid list — {_esc(names)}</h2>'
+            '<p class="muted" style="margin-top:0">Worst-first: weakening '
+            'fundamentals and trend together. Not counted in the consensus; '
+            'listed so a name you hold or watch is not a surprise.</p>'
+            '<table><thead><tr><th>Ticker</th><th>Rank</th><th>Signal</th>'
+            f'<th>Why</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
+
+
 def _render_track(tr: pd.DataFrame | None) -> str:
     if tr is None or tr.empty:
         return ''
@@ -1095,7 +1150,7 @@ def _render_track(tr: pd.DataFrame | None) -> str:
             f'<td class="num">{_color_pct(r["mean_excess"])}</td>'
             f'<td class="num">{r["hit_rate"]:.0%}</td>'
             f'<td class="num">{r["mean_ic"]:+.3f}</td></tr>'
-            if np.isfinite(r['mean_ic']) else
+            if pd.notna(r['mean_ic']) else
             f'<tr><td>{_esc(r["name"])}</td><td>{r["horizon"]}</td>'
             f'<td class="num">{r["cohorts"]}</td>'
             f'<td class="num">{_color_pct(r["mean_pick_return"])}</td>'
@@ -1105,9 +1160,12 @@ def _render_track(tr: pd.DataFrame | None) -> str:
             '<p class="muted" style="margin-top:0">What each strategy’s top-10 '
             'picks did after the screens this routine actually stored, bought at '
             'the next close. Overlapping daily cohorts are not independent — '
-            'judge by the “indep.” count, not the cohort count.</p>'
+            'judge by the “indep.” count, not the cohort count. “Worked” is the '
+            'share of cohorts that beat SPY — or, for an avoid list, that lagged '
+            'it; rank IC is signed so that positive always means the list '
+            'pointed the right way.</p>'
             '<table><thead><tr><th>Strategy</th><th>Horizon</th><th>Cohorts</th>'
-            '<th>Picks</th><th>vs SPY</th><th>Beat SPY</th><th>Rank IC</th></tr>'
+            '<th>Picks</th><th>vs SPY</th><th>Worked</th><th>Rank IC</th></tr>'
             f'</thead><tbody>{"".join(rows)}</tbody></table>')
 
 
@@ -1281,6 +1339,13 @@ def render_daily(payload: dict, news_df: pd.DataFrame | None = None,
             if chips:
                 parts.append('<h2>Sector concentration (consensus picks)</h2>'
                              f'<div class="card">{chips}</div>')
+
+    if not consensus.empty:
+        pick_set = set(consensus[consensus['n_strategies'] >= 2]['ticker'])
+    else:
+        pick_set = set()
+    parts.append(_render_avoid(payload.get('avoid'), payload.get('earnings_held'),
+                               pick_set, payload.get('earnings_watch')))
 
     # News
     if news_df is not None and not news_df.empty:

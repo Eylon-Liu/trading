@@ -107,6 +107,21 @@ Most of the engineering here is about not fooling yourself.
 
 **Predictive power is reported, not just returns.** Every backtest shows rank IC alongside CAGR, and the UI flags it when the correlation is near zero — which means any outperformance came from a few positions rather than from the ranking working.
 
+### How signals are graded
+
+Each strategy's composite is an average of sector-relative z-scores, so its
+spread depends on how many factors it blends. Buy / Hold / Sell tiers are
+therefore set on the composite's **percentile** within the screened universe
+(top decile, top quartile, above median, …), which makes a "Buy" mean the same
+thing in an eleven-factor strategy as in a five-factor one.
+
+**Deteriorating Quality is an avoid list.** Rank 1 is the *worst* name. It
+gets avoid/caution labels and no trade plan, it is kept out of the daily
+brief's consensus and Buy counts, it appears in its own "Avoid list" section
+(flagging anything you hold or watch), a holding that lands on it raises an
+alert, and its live track record counts it as working when its names *lag*
+the market.
+
 ### How the backtests trade
 
 | | Long horizon (`run_backtest`) | Mid horizon (`run_trade_backtest`) |
@@ -136,7 +151,7 @@ Sharpe is the textbook mean excess return over volatility; Sortino uses downside
 | **Wikimedia pageviews** | Retail attention proxy | ✅ full daily history |
 | **Federal Register** | Rules and executive orders, mapped to sectors | ✅ full history |
 | **FRED** (keyless CSV, or API with `FRED_API_KEY`) | T-bills, Treasuries, curve, high-yield spread, VIX, Fed funds | ✅ full history |
-| **Nasdaq calendar** (or Finnhub with `FINNHUB_API_KEY`) | Upcoming earnings dates; estimates from 8-K Item 2.02 cadence otherwise | ⚠️ forward only |
+| **Earnings calendar** — Nasdaq's public calendar; Yahoo (via yfinance) for your portfolio and watchlist names it misses; Finnhub first if `FINNHUB_API_KEY` is set | Upcoming report dates. Anything still missing is estimated from the company's own 8-K Item 2.02 cadence and labelled as an estimate | ⚠️ forward only |
 | Yahoo / Google News RSS | Company coverage, sentiment, direction extraction | ⚠️ **forward only** |
 
 The last row is the honest exception: free news APIs return only recent items, so news signals work live from day one but cannot be backfilled. Everything else carries a filing or publication date and is backtestable immediately — which is why the strategies lean on filings rather than headlines.

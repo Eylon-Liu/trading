@@ -208,3 +208,17 @@ def test_vacuum_leaves_pooled_connections_transactional(fresh_db):
             conn.exec_driver_sql("DELETE FROM runs")
             raise RuntimeError('abort mid-transaction')
     assert _count(fresh_db, 'runs') == 1
+
+
+def test_events_from_8k_amendments_are_removed(fresh_db):
+    fresh_db.upsert(fresh_db.sec_filings, [
+        {'accession': 'orig', 'ticker': 'AAA', 'form': '8-K', 'filing_date': date(2026, 10, 22)},
+        {'accession': 'amend', 'ticker': 'AAA', 'form': '8-K/A', 'filing_date': date(2026, 11, 20)}])
+    fresh_db.upsert(fresh_db.corporate_events, [
+        {'ticker': 'AAA', 'filed': date(2026, 10, 22), 'accession': 'orig',
+         'item_code': '2.02', 'category': 'results'},
+        {'ticker': 'AAA', 'filed': date(2026, 11, 20), 'accession': 'amend',
+         'item_code': '2.02', 'category': 'results'}])
+    assert M.delete_amended_events() == 1
+    left = fresh_db.read_sql('SELECT accession FROM corporate_events')
+    assert left['accession'].tolist() == ['orig']

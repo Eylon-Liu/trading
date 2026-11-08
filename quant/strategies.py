@@ -97,16 +97,21 @@ STYLE_PROXIES: dict[str, list[tuple[str, str]]] = {
         ('EPS_CAGR_3Y', 'EPS CAGR (3Y)'),
     ],
     'momentum': [
-        ('RETURN_1M', '1-month total return'),
-        ('RETURN_6M', '6-month total return'),
+        ('MOM_12_1', 'Momentum 12-1 (skips last month)'),
         ('MOM_6_1', 'Momentum 6-1 (skips last month)'),
+        ('RETURN_6M', '6-month total return'),
+        ('RETURN_1M', '1-month total return (reverses — see note)'),
     ],
 }
 
+# The momentum default was RETURN_1M. One-month returns are the textbook
+# *reversal* horizon — last month's winners tend to give some of it back — which
+# is exactly why 12-1 momentum skips the latest month. As the default momentum
+# leg of a quarterly-rebalanced, long-horizon screen it pointed the wrong way.
 DEFAULT_STYLE_PROXIES: dict[str, str] = {
     'value': 'EARNINGS_YIELD',
     'growth': 'REVENUE_GROWTH_1Y',
-    'momentum': 'RETURN_1M',
+    'momentum': 'MOM_12_1',
 }
 
 STYLE_FACTORS_KEY = 'style_factors'
@@ -190,8 +195,13 @@ LONG_TERM = {
         # put two-thirds of the strategy on one signal counted three times,
         # which is a concentrated momentum bet wearing a diversified label.
         # One medium-horizon measure, one short, and the quality overlay.
+        #
+        # RETURN_1M (+0.8) is gone as well. Over one month, returns *reverse*
+        # rather than persist, so on a quarterly rebalance it rewarded the very
+        # names most likely to give back their last month. 12-1 momentum is the
+        # standard construction precisely because it skips that month.
         weights={
-            'RETURN_6M': 1.5, 'RETURN_1M': 0.8,
+            'MOM_12_1': 1.5,
             'ROIC': 0.8, 'ACCRUALS': 0.6, 'NET_DEBT_TO_EQUITY': 0.4,
         },
         filters={'min_market_cap': 2e9},
@@ -281,12 +291,19 @@ MID_TERM = {
     ),
     'earnings_drift': Strategy(
         key='earnings_drift', name='Post-Earnings Drift', horizon='mid',
-        description='Recent results filings plus positive price reaction (PEAD).',
+        description='Names whose latest results drew a strong positive reaction (PEAD).',
         thesis='Prices under-react to earnings news; exit at the target or when '
                'the drift window closes.',
+        # This used to have no measure of the reaction at all. EVENT_RESULTS
+        # only says a results 8-K was filed in the last 90 days — true of
+        # nearly every company every quarter — and RETURN_3M / MOM_6_1 are
+        # plain momentum. The drift literature sorts on the announcement
+        # return itself, which EARNINGS_REACTION now measures; names without
+        # a report in the last 63 days fall below the coverage floor and are
+        # not scored, which is the point.
         weights={
-            'EVENT_RESULTS': 1.0, 'MOM_6_1': 1.0, 'RETURN_3M': 1.2,
-            'EARNINGS_GROWTH_1Y': 1.0, 'PCT_VS_MA50': 0.8,
+            'EARNINGS_REACTION': 2.0, 'EARNINGS_GROWTH_1Y': 0.8,
+            'MOM_6_1': 0.6, 'PCT_VS_MA50': 0.4,
         },
         filters={'min_above_ma200': 1},
         setup='momentum',

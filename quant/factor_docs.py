@@ -342,6 +342,19 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'Presence only — the code says results were filed, not whether they '
         'beat or missed. The price reaction carries that information.'),
 
+    'EARNINGS_REACTION': FactorDoc(
+        'EARNINGS_REACTION', 'Earnings Announcement Return', 'Price',
+        'EARNINGS_REACTION = (P[t+1] / P[t-1] - 1) - (SPY[t+1] / SPY[t-1] - 1)\n'
+        '                    t = latest 8-K item 2.02 filing in the last 63 days',
+        'Adjusted closes; SEC submissions item codes', 'higher',
+        'How the market judged the latest results, net of the market that '
+        'day. Post-earnings-announcement drift: prices keep moving in the '
+        'direction of the initial reaction for weeks, because investors '
+        'under-react to earnings news.',
+        'Missing for names with no results filing in the last 63 days — the '
+        'drift has largely run its course by then, and those names are left '
+        'out of the drift screen rather than scored on stale news.'),
+
     'EVENT_MANAGEMENT': FactorDoc(
         'EVENT_MANAGEMENT', '8-K Management Changes', 'Alt Data',
         'EVENT_MANAGEMENT = count of 8-K filings carrying item 5.02\n'
