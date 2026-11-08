@@ -35,14 +35,31 @@ log = logging.getLogger(__name__)
 
 def forward_returns(tickers: list[str], as_of: date, horizon_months: int
                     ) -> pd.Series:
-    """Total return over the next `horizon_months`, for IC work."""
+    """
+    Total return over the next `horizon_months`, for IC work.
+
+    Measured from the last close at or before `as_of` — the moment the score
+    was computed — to the last close inside the horizon.
+
+    The start used to be the first bar of a window opened seven days *before*
+    `as_of`, so up to a week of returns that had already happened when the
+    score was computed counted as "forward". Every momentum and trend factor
+    is built from exactly those returns, which inflated their IC and made
+    the decay curve start from a number no strategy could have earned.
+    """
+    as_of = pd.to_datetime(as_of).date()
     end = as_of + timedelta(days=int(horizon_months * 30.44))
-    px = yahoo.price_history(tickers, start=as_of - timedelta(days=7),
+    px = yahoo.price_history(tickers, start=as_of - timedelta(days=10),
                              end=end, field='adj_close')
-    if px.empty or len(px) < 2:
+    if px.empty:
         return pd.Series(dtype=float)
     px = px.ffill()
-    return (px.iloc[-1] / px.iloc[0] - 1.0).replace([np.inf, -np.inf], np.nan)
+    before = px.loc[:pd.Timestamp(as_of)]
+    after = px.loc[pd.Timestamp(as_of) + pd.Timedelta(days=1):]
+    if before.empty or after.empty:
+        return pd.Series(dtype=float)
+    return (after.iloc[-1] / before.iloc[-1] - 1.0).replace(
+        [np.inf, -np.inf], np.nan)
 
 
 def information_coefficient(scores: pd.Series, fwd: pd.Series,

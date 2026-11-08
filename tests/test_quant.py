@@ -502,38 +502,46 @@ def test_validate_flags_impossible_ratios():
 # SHARPE / SORTINO with risk-free rate
 # ─────────────────────────────────────────────
 
-def test_sharpe_subtracts_risk_free_rate():
-    """Sharpe must be (CAGR - Rf) / vol, not CAGR / vol."""
+def test_sharpe_is_mean_excess_over_volatility():
+    """Textbook Sharpe: annualised mean periodic excess return / volatility."""
+    rng = np.random.RandomState(7)
+    idx = pd.date_range('2020-01-31', periods=121, freq='ME')
+    equity = pd.Series(np.cumprod(np.r_[1.0, 1 + 0.008 + 0.04 * rng.randn(120)]),
+                       index=idx)
+    rf = 0.03
+    m = BT.compute_metrics(equity, rf=rf)
+
+    rets = equity.pct_change().dropna()
+    years = (idx[-1] - idx[0]).days / 365.25
+    ppy = len(rets) / years
+    rf_p = (1 + rf) ** (1 / ppy) - 1
+    expected = (rets - rf_p).mean() / rets.std() * np.sqrt(ppy)
+    assert m['sharpe'] == pytest.approx(expected, rel=1e-9)
+    assert m['sharpe'] < BT.compute_metrics(equity, rf=0.0)['sharpe'], \
+        'subtracting Rf must reduce Sharpe'
+
+
+def test_sortino_uses_downside_deviation():
+    """Downside deviation counts every period, gains as zero — not the std
+    of the losing periods alone."""
+    rng = np.random.RandomState(42)
+    idx = pd.date_range('2020-01-31', periods=121, freq='ME')
+    equity = pd.Series(np.cumprod(np.r_[1.0, 1 + 0.005 + 0.03 * rng.randn(120)]),
+                       index=idx)
+    rf = 0.02
+    m = BT.compute_metrics(equity, rf=rf)
+    rets = equity.pct_change().dropna()
+    ppy = len(rets) / ((idx[-1] - idx[0]).days / 365.25)
+    ex = rets - ((1 + rf) ** (1 / ppy) - 1)
+    dd = np.sqrt((np.minimum(ex, 0) ** 2).mean())
+    assert m['sortino'] == pytest.approx(ex.mean() / dd * np.sqrt(ppy), rel=1e-9)
+
+
+def test_default_risk_free_comes_from_config():
     import config
     idx = pd.date_range('2020-01-31', periods=61, freq='ME')
     equity = pd.Series(1.01 ** np.arange(61), index=idx)
-    m = BT.compute_metrics(equity)
-    cagr = m['cagr']
-    vol = m['volatility']
-    rf = config.RISK_FREE_RATE
-    expected_sharpe = (cagr - rf) / vol if vol > 0 else 0.0
-    assert m['sharpe'] == pytest.approx(expected_sharpe, rel=1e-6)
-    assert m['sharpe'] < cagr / vol, 'subtracting Rf must reduce Sharpe'
-
-
-def test_sortino_subtracts_risk_free_rate():
-    """Sortino must be (CAGR - Rf) / downside_vol."""
-    import config
-    rng = np.random.RandomState(42)
-    idx = pd.date_range('2020-01-31', periods=120, freq='ME')
-    equity = pd.Series(np.cumprod(1 + 0.005 + 0.03 * rng.randn(120)), index=idx)
-    m = BT.compute_metrics(equity)
-    rf = config.RISK_FREE_RATE
-    assert m['sortino'] != 0.0
-    # Recompute from scratch
-    rets = equity.pct_change().dropna()
-    years = max((equity.index[-1] - equity.index[0]).days / 365.25, 1e-9)
-    cagr = float((equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1.0)
-    ppy = len(rets) / years
-    downside = rets[rets < 0]
-    dvol = float(downside.std() * np.sqrt(ppy))
-    expected = (cagr - rf) / dvol
-    assert m['sortino'] == pytest.approx(expected, rel=1e-6)
+    assert BT.compute_metrics(equity)['risk_free'] == config.RISK_FREE_RATE
 
 
 def test_sharpe_zero_vol_returns_zero():

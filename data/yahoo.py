@@ -563,6 +563,44 @@ def adjusted_ohlc(tickers: list[str], start: date | str | None = None,
     return high, low, adj
 
 
+def adjusted_bars(tickers: list[str], start=None, end=None
+                  ) -> dict[str, pd.DataFrame]:
+    """
+    Open, high, low and close as wide date x ticker frames, all on the
+    adjusted-close basis — what a bar-by-bar trade simulation needs. The
+    open is required to fill market orders and to price a gap through a
+    stop honestly (at the open, not at the stop).
+    """
+    if not tickers:
+        e = pd.DataFrame()
+        return {'open': e, 'high': e, 'low': e, 'close': e}
+    ph = ','.join(f':t{i}' for i in range(len(tickers)))
+    params: dict = {f't{i}': t for i, t in enumerate(tickers)}
+    clauses = [f'ticker IN ({ph})']
+    if start:
+        clauses.append('date >= :start')
+        params['start'] = str(pd.to_datetime(start).date())
+    if end:
+        clauses.append('date <= :end')
+        params['end'] = str(pd.to_datetime(end).date())
+    raw = db.read_sql(
+        f'SELECT ticker, date, open, high, low, close, adj_close FROM prices '
+        f'WHERE {" AND ".join(clauses)} ORDER BY date', params,
+        parse_dates=['date'])
+    if raw.empty:
+        e = pd.DataFrame()
+        return {'open': e, 'high': e, 'low': e, 'close': e}
+    raw['ratio'] = (raw['adj_close'] / raw['close'].replace(0, np.nan)).fillna(1.0)
+    out = {}
+    for col in ('open', 'high', 'low'):
+        raw[f'a_{col}'] = raw[col] * raw['ratio']
+        out[col] = raw.pivot_table(index='date', columns='ticker',
+                                   values=f'a_{col}', aggfunc='last')
+    out['close'] = raw.pivot_table(index='date', columns='ticker',
+                                   values='adj_close', aggfunc='last')
+    return out
+
+
 def _ohlc_raw(tickers: list[str], start=None, end=None) -> pd.DataFrame:
     """Single SQL read for high, low, close, adj_close — replaces 4 queries."""
     if not tickers:

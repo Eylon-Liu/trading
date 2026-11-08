@@ -5,15 +5,25 @@ Two execution models, matching the two horizons:
 
   long  Periodic rebalance into the top-N ranked names, equal or inverse-vol
         weighted, held until the next rebalance. Exit is a re-rank, not a price.
-  mid   Every entry carries a stop, a target and a time stop, and the path is
-        walked bar by bar so a position can be closed between rebalances.
-        Backtesting a stop-based strategy with month-end snapshots would score
-        trades that a real stop would have closed weeks earlier.
+  mid   Every entry carries a stop, a target and a time stop. The portfolio is
+        simulated session by session: orders fill only if the market actually
+        reaches them, exits are checked on every bar, capital is finite, and
+        the equity curve is marked to market daily.
 
 The look-ahead discipline is structural rather than advisory: at each
 rebalance date the engine calls the same scoring path the live screen uses,
-gated to that date. Nothing filed later is visible, so a backtest cannot use
-information the strategy could not have had.
+gated to that date. Nothing filed later is visible, and trades are filled no
+earlier than the session *after* the signal was computed.
+
+Execution conventions (both models)
+  * Signals are computed after the close of a real trading session — never a
+    calendar date that happens to be a weekend.
+  * Long horizon: fills at the close `execution_lag` sessions later (1).
+  * Mid horizon: market orders fill at the next session's open; pullback
+    limits fill only when a later bar trades down to them, within
+    `fill_window` sessions, or the order expires unfilled.
+  * A stop that the market gaps through fills at the open, not at the stop.
+  * Costs (commission + slippage) are charged on every trade, both sides.
 """
 
 from __future__ import annotations
@@ -101,6 +111,110 @@ class BacktestResult:
 
 
 # ─────────────────────────────────────────────
+# SHARED: SESSIONS, PRE-LOADING, SCORING
+# ─────────────────────────────────────────────
+
+def rebalance_positions(sessions: pd.DatetimeIndex, rebalance: str) -> list[int]:
+    """
+    Index positions of the rebalance sessions: the first session, then the
+    last session of each period (month, quarter, half-year, year) after it.
+
+    Calendar period-ends were used before. When one fell on a weekend the
+    period ended at Friday's close and the next began at Monday's, so the
+    return between them belonged to neither period and silently vanished.
+    """
+    if len(sessions) == 0:
+        return []
+    s = pd.Series(range(len(sessions)), index=sessions)
+    if rebalance == 'Q':
+        key = sessions.year * 10 + sessions.quarter
+    elif rebalance == 'SA':
+        key = sessions.year * 10 + (sessions.month > 6).astype(int)
+    elif rebalance == 'A':
+        key = sessions.year
+    else:
+        key = sessions.year * 100 + sessions.month
+    last = s.groupby(np.asarray(key)).max().tolist()
+    return sorted({0, *[p for p in last if p > 0]})
+
+
+@dataclass
+class _Preload:
+    tickers: list[str]
+    facts: pd.DataFrame
+    version: str
+    splits: pd.DataFrame
+    ohlc: tuple
+    insiders: pd.DataFrame
+    events: pd.DataFrame
+
+
+def _preload(spec: UniverseSpec, start: date, end: date,
+             rebalance: str = 'M') -> _Preload:
+    """Everything the scoring path needs, read once for the whole window."""
+    tickers: set[str] = set(spec.resolve(start))
+    for ts in pd.date_range(start, end, freq=REBALANCE_FREQ.get(rebalance, 'ME')):
+        tickers.update(spec.resolve(ts.date()))
+    names = sorted(tickers)
+    facts = sec.facts_asof(names, end) if names else pd.DataFrame()
+    splits = yahoo.split_factors(names) if names else pd.DataFrame()
+    if not facts.empty:
+        facts = adjust_shares_for_splits(facts, splits)
+    lookback = int(config.TRADING_DAYS['3Y'] * 1.6)
+    ohlc = yahoo.bulk_ohlc(names, start=start - timedelta(days=lookback), end=end)
+    insiders = sec.insiders_asof(names, end,
+                                 lookback_days=(end - start).days + 180) \
+        if names else pd.DataFrame()
+    events = sec.events_asof(names, end, lookback_days=(end - start).days + 90) \
+        if names else pd.DataFrame()
+    return _Preload(names, facts, factorcache.data_version(), splits, ohlc,
+                    insiders, events)
+
+
+class _Scorer:
+    """Runs the live scoring path at successive dates, reusing prior work."""
+
+    def __init__(self, spec, strategy_key, pre: _Preload):
+        self.spec, self.key, self.pre = spec, strategy_key, pre
+        self.prev_fund = None
+        self.prev_d0: date | None = None
+
+    def run(self, d0: date, top_n: int, plan_params=None):
+        facts = self.pre.facts
+        facts_d0 = facts[facts['filed'] <= pd.Timestamp(d0)] if not facts.empty \
+            else None
+        changed = None
+        if self.prev_d0 is not None and not facts.empty:
+            new = facts[(facts['filed'] > pd.Timestamp(self.prev_d0))
+                        & (facts['filed'] <= pd.Timestamp(d0))]
+            changed = set(new['ticker'].unique())
+        result = EN.run(self.spec, self.key, as_of=d0, top_n=top_n,
+                        persist=False, plan_params=plan_params,
+                        _bt_facts=facts_d0,
+                        _bt_data_version=self.pre.version,
+                        _bt_prev_fund=self.prev_fund,
+                        _bt_changed_tickers=changed,
+                        _bt_splits=self.pre.splits,
+                        _bt_splits_applied=True,
+                        _bt_ohlc=self.pre.ohlc,
+                        _bt_insiders=self.pre.insiders,
+                        _bt_events=self.pre.events)
+        self.prev_fund = result._fund_raw
+        self.prev_d0 = d0
+        return result
+
+
+def _risk_free(start: date, end: date) -> float:
+    """Average 3-month T-bill yield over the window; the config rate if unknown."""
+    try:
+        from data import macro
+        return macro.risk_free_rate(start, end)
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('risk-free lookup failed (%s) — using config rate', exc)
+        return config.RISK_FREE_RATE
+
+
+# ─────────────────────────────────────────────
 # WEIGHTING
 # ─────────────────────────────────────────────
 
@@ -134,9 +248,19 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                  rebalance: str | None = None,
                  weighting: str = 'equal',
                  cost_bps: float | None = None,
-                 strict: bool = True) -> BacktestResult:
+                 strict: bool = True,
+                 execution_lag: int = 1) -> BacktestResult:
     """
     Walk forward, re-scoring at each rebalance with only the data of that date.
+
+    The signal is computed after the close of a rebalance session; trades fill
+    at the close `execution_lag` sessions later (default 1). Filling at the
+    very close the signal was computed from assumes you could see that close
+    and trade on it in the same instant — and lets a filing published after
+    the bell on the signal day count as tradeable that day.
+
+    The equity curve is marked to market daily, so drawdown, volatility and
+    Sharpe reflect what happened between rebalances, not only at them.
 
     `strict` (the default) refuses to return a number when the data cannot
     support the strategy at a rebalance date — see `DegradedBacktest`. Pass
@@ -149,143 +273,125 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     rebalance = rebalance or ST.HORIZONS[strategy.horizon]['rebalance']
     n_holdings = n_holdings or ST.HORIZONS[strategy.horizon]['default_holdings']
     cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
-    round_trip = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
+    # Charged on every unit of weight traded, buys and sells alike.
+    one_way = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
+    lag = max(0, int(execution_lag))
 
     _require_honest_window(spec, strategy_key, start, strict)
 
-    dates = pd.date_range(start, end, freq=REBALANCE_FREQ.get(rebalance, 'ME'))
-    if len(dates) < 2:
+    pre = _preload(spec, start, end, rebalance)
+    adj_close_all = pre.ohlc[0].ffill() if not pre.ohlc[0].empty else pd.DataFrame()
+    if adj_close_all.empty:
+        raise ValueError('no stored prices for this universe and window')
+
+    sessions = adj_close_all.index[(adj_close_all.index >= pd.Timestamp(start))
+                                   & (adj_close_all.index <= pd.Timestamp(end))]
+    signal_pos = rebalance_positions(sessions, rebalance)
+    if len(signal_pos) < 2 or signal_pos[0] + lag >= len(sessions) - 1:
         raise ValueError('backtest window too short for the rebalance frequency')
+    dates = [sessions[p] for p in signal_pos]
+    log.info('backtest %s | %s -> %s | %d rebalances | top %d | lag %d',
+             strategy.name, start, end, len(dates), n_holdings, lag)
 
-    log.info('backtest %s | %s -> %s | %d rebalances | top %d',
-             strategy.name, start, end, len(dates), n_holdings)
+    scorer = _Scorer(spec, strategy_key, pre)
+    prev_w = pd.Series(dtype=float)        # drifted weights held going in
+    curve: list[pd.Series] = []
+    equity_now = 1.0
+    turnover_log, holdings_log, trades, ics = [], [], [], []
 
-    # ── pre-fetch: load everything once for the entire backtest window ──
-    all_tickers: set[str] = set()
-    for ts in dates:
-        all_tickers.update(spec.resolve(ts.date()))
-    all_tickers_sorted = sorted(all_tickers)
-    facts_full = sec.facts_asof(all_tickers_sorted, dates[-1].date())
-    dv = factorcache.data_version()
-    splits = yahoo.split_factors(all_tickers_sorted) if all_tickers_sorted else pd.DataFrame()
-    facts_full = adjust_shares_for_splits(facts_full, splits)
+    for k, p0 in enumerate(signal_pos):
+        d0 = sessions[p0].date()
+        # Hold from this rebalance's fill to the next one's fill.
+        p_in = p0 + lag
+        p_out = (min(signal_pos[k + 1] + lag, len(sessions) - 1)
+                 if k + 1 < len(signal_pos) else len(sessions) - 1)
+        if p_in >= p_out:
+            break
 
-    # Prices: one SQL read for the entire window (lookback + forward).
-    price_lookback = int(config.TRADING_DAYS['3Y'] * 1.6)
-    price_start = start - timedelta(days=price_lookback)
-    bt_ohlc = yahoo.bulk_ohlc(all_tickers_sorted, start=price_start, end=end)
-    adj_close_all = bt_ohlc[0].ffill() if not bt_ohlc[0].empty else pd.DataFrame()
-    log.info('pre-loaded prices: %d tickers, %d bars',
-             len(adj_close_all.columns) if not adj_close_all.empty else 0,
-             len(adj_close_all))
-
-    # Insiders and events: one read each covering the full lookback.
-    ins_start = start - timedelta(days=180)
-    bt_insiders = sec.insiders_asof(all_tickers_sorted, dates[-1].date(),
-                                     lookback_days=(dates[-1].date() - ins_start).days)
-    evt_start = start - timedelta(days=90)
-    bt_events = sec.events_asof(all_tickers_sorted, dates[-1].date(),
-                                 lookback_days=(dates[-1].date() - evt_start).days)
-
-    prev_fund: pd.DataFrame | None = None
-    prev_d0: date | None = None
-
-    prev_w = pd.Series(dtype=float)
-    equity, turnover_log, holdings_log, trades, ics = [1.0], [], [], [], []
-    equity_dates = [dates[0].date()]
-    degraded_dates: list = []
-
-    for i in range(len(dates) - 1):
-        d0, d1 = dates[i].date(), dates[i + 1].date()
-
-        facts_d0 = facts_full[facts_full['filed'] <= pd.Timestamp(d0)]
-        if prev_d0 is not None:
-            new_filings = facts_full[
-                (facts_full['filed'] > pd.Timestamp(prev_d0))
-                & (facts_full['filed'] <= pd.Timestamp(d0))]
-            changed = set(new_filings['ticker'].unique())
-        else:
-            changed = None
-
-        result = EN.run(spec, strategy_key, as_of=d0,
-                        top_n=n_holdings, persist=False,
-                        _bt_facts=facts_d0,
-                        _bt_data_version=dv,
-                        _bt_prev_fund=prev_fund,
-                        _bt_changed_tickers=changed,
-                        _bt_splits=splits,
-                        _bt_splits_applied=True,
-                        _bt_ohlc=bt_ohlc,
-                        _bt_insiders=bt_insiders,
-                        _bt_events=bt_events)
-        prev_fund = result._fund_raw
-        prev_d0 = d0
+        result = scorer.run(d0, n_holdings)
         if strict and result.degraded:
             raise DegradedBacktest(
                 f'{strategy.key} cannot be honestly backtested at {d0}: '
                 + '; '.join(result.warnings)
                 + '  (pass strict=False to measure the degraded variant anyway)')
-        degraded_dates.extend([d0] * bool(result.degraded))
-        if result.scores.empty:
-            equity.append(equity[-1]); equity_dates.append(d1)
-            continue
 
-        vols = result.scores.get('VOL_1Y')
-        w = _weights(result.scores, n_holdings, weighting, vols)
+        seg_index = sessions[p_in:p_out + 1]
+        w = pd.Series(dtype=float)
+        if not result.scores.empty:
+            w = _weights(result.scores, n_holdings, weighting,
+                         result.scores.get('VOL_1Y'))
+        seg = pd.DataFrame(index=seg_index)
+        if not w.empty:
+            # A name with no price at the fill is not bought; its share is cash.
+            seg = adj_close_all.reindex(columns=w.index).loc[seg_index]
+            priced = (seg.iloc[0].notna() & (seg.iloc[0] > 0)).to_numpy()
+            w, seg = w[priced], seg.loc[:, priced]
+
+        if curve:
+            # The fill bar closed the previous segment; it opens this one
+            # with the post-cost value instead of appearing twice.
+            curve[-1] = curve[-1].iloc[:-1]
+
         if w.empty:
-            equity.append(equity[-1]); equity_dates.append(d1)
+            traded = float(prev_w.abs().sum())
+            equity_now *= 1.0 - traded * one_way
+            curve.append(pd.Series(equity_now, index=seg_index))
+            prev_w = pd.Series(dtype=float)
             continue
 
-        # Forward return from pre-loaded prices (no SQL per rebalance).
-        if not adj_close_all.empty:
-            avail = adj_close_all.columns.intersection(w.index)
-            px = adj_close_all.loc[pd.Timestamp(d0):pd.Timestamp(d1), avail]
-        else:
-            px = pd.DataFrame()
-        if px.empty or len(px) < 2:
-            equity.append(equity[-1]); equity_dates.append(d1)
-            continue
-        period_ret = (px.iloc[-1] / px.iloc[0] - 1.0).reindex(w.index).fillna(0.0)
+        rel = seg.ffill() / seg.iloc[0]
+        cash_w = max(0.0, 1.0 - float(w.sum()))
+        port_rel = rel.mul(w, axis=1).sum(axis=1) + cash_w
 
-        gross = float((w * period_ret).sum())
+        traded = float(w.subtract(prev_w, fill_value=0.0).abs().sum())
+        start_value = equity_now * (1.0 - traded * one_way)
+        seg_curve = start_value * port_rel
+        curve.append(seg_curve)
+        equity_now = float(seg_curve.iloc[-1])
+        if k > 0:
+            turnover_log.append(traded)
 
-        traded = float((w.subtract(prev_w, fill_value=0.0)).abs().sum())
-        cost = traded * round_trip
-        equity.append(equity[-1] * (1.0 + gross - cost))
-        equity_dates.append(d1)
-        turnover_log.append(traded)
+        prior = prev_w
+        period_ret = rel.iloc[-1] - 1.0
+        # Weights drift with prices until the next rebalance; turnover is
+        # measured against what is actually held then, not the old targets.
+        prev_w = (w * rel.iloc[-1]) / float(port_rel.iloc[-1])
 
-        # Rank IC from pre-loaded prices (no SQL per rebalance).
-        if len(result.scores) >= 8 and not adj_close_all.empty:
-            ic_tickers = adj_close_all.columns.intersection(result.scores.index)
-            all_px = adj_close_all.loc[pd.Timestamp(d0):pd.Timestamp(d1), ic_tickers]
-            if not all_px.empty and len(all_px) >= 2:
-                fwd = all_px.iloc[-1] / all_px.iloc[0] - 1.0
-                pair = pd.concat([result.scores['composite'], fwd], axis=1).dropna()
-                pair.columns = ['score', 'fwd']
-                if len(pair) >= 8:
-                    ics.append({'date': d1,
-                                'ic': pair['score'].corr(pair['fwd'], method='spearman')})
+        # Rank IC over the same holding window, across every scored name.
+        if len(result.scores) >= 8:
+            cols = adj_close_all.columns.intersection(result.scores.index)
+            px = adj_close_all.loc[seg_index, cols]
+            fwd = px.iloc[-1] / px.iloc[0] - 1.0
+            pair = pd.concat([result.scores['composite'], fwd], axis=1).dropna()
+            pair.columns = ['score', 'fwd']
+            if len(pair) >= 8:
+                ics.append({'date': seg_index[-1].date(),
+                            'ic': pair['score'].corr(pair['fwd'], method='spearman')})
 
         for t, weight in w.items():
             holdings_log.append({'date': d0, 'ticker': t, 'weight': weight,
-                                 'period_return': period_ret.get(t, 0.0)})
-        for t in set(w.index) - set(prev_w.index):
-            trades.append({'date': d0, 'ticker': t, 'action': 'buy',
-                           'weight': w[t]})
-        for t in set(prev_w.index) - set(w.index):
-            trades.append({'date': d0, 'ticker': t, 'action': 'sell',
-                           'weight': prev_w[t]})
-        prev_w = w
+                                 'period_return': float(period_ret.get(t, 0.0))})
+        fill_day = seg_index[0].date()
+        for t in set(w.index) - set(prior.index):
+            trades.append({'date': fill_day, 'ticker': t, 'action': 'buy',
+                           'weight': float(w[t])})
+        for t in set(prior.index) - set(w.index):
+            trades.append({'date': fill_day, 'ticker': t, 'action': 'sell',
+                           'weight': float(prior[t])})
 
-    eq = pd.Series(equity, index=pd.to_datetime(equity_dates), name='strategy')
-    bench = _benchmark_curve(dates[0].date(), dates[-1].date(), eq.index)
+    eq = pd.concat(curve) if curve else pd.Series(dtype=float)
+    eq = eq[~eq.index.duplicated(keep='last')]
+    eq.name = 'strategy'
+    bench = (_benchmark_curve(eq.index[0].date(), eq.index[-1].date(), eq.index)
+             if len(eq) else pd.Series(dtype=float))
 
-    metrics = compute_metrics(eq, bench)
+    rf = _risk_free(start, end)
+    metrics = compute_metrics(eq, bench, rf=rf)
     metrics['turnover'] = float(np.mean(turnover_log)) * _periods_per_year(rebalance) \
         if turnover_log else 0.0
-    metrics['n_rebalances'] = len(dates) - 1
+    metrics['n_rebalances'] = len(dates)
     metrics['avg_holdings'] = n_holdings
+    metrics['execution_lag'] = lag
 
     ic_series = pd.Series(dtype=float)
     if ics:
@@ -328,7 +434,10 @@ def run_buy_and_hold(spec: UniverseSpec, strategy_key, start: date | str,
     what a real buy-and-hold portfolio does — a winner becoming an outsized
     share of the portfolio is a result, not an error to be corrected.
 
-    Costs are charged once, on entry.
+    Scored at `start`; bought at the close of the next session. Costs are
+    charged once, on entry. A pick with no price on the entry day is dropped
+    and its cash shared among the rest — it used to be bought with NaN shares
+    and its slice of the starting cash silently disappeared.
     """
     start = pd.to_datetime(start).date()
     end = pd.to_datetime(end or date.today()).date()
@@ -347,11 +456,13 @@ def run_buy_and_hold(spec: UniverseSpec, strategy_key, start: date | str,
             f'{start}: ' + '; '.join(result.warnings))
 
     picks = result.scores.head(n_holdings)
-    px = yahoo.price_history(list(picks.index), start=start, end=end,
-                             field='adj_close')
+    px = yahoo.price_history(list(picks.index), start=start + timedelta(days=1),
+                             end=end, field='adj_close')
     if px.empty:
         raise ValueError(f'no price history for {list(picks.index)}')
-    px = px.ffill().dropna(axis=1, how='all')
+    px = px.ffill()
+    entry_row = px.iloc[0]
+    px = px.loc[:, entry_row.notna() & (entry_row > 0)]
     if px.empty:
         raise ValueError('no usable price history for the picks')
 
@@ -362,11 +473,11 @@ def run_buy_and_hold(spec: UniverseSpec, strategy_key, start: date | str,
     eq = values.sum(axis=1)
     eq.name = 'strategy'
 
-    bench = _benchmark_curve(start, end, eq.index)
+    bench = _benchmark_curve(eq.index[0].date(), end, eq.index)
     if not bench.empty:
         bench = bench / bench.iloc[0] * initial_cash
 
-    metrics = compute_metrics(eq, bench)
+    metrics = compute_metrics(eq, bench, rf=_risk_free(start, end))
     metrics.update({
         'initial_cash': initial_cash,
         'final_cash': float(eq.iloc[-1]),
@@ -437,19 +548,178 @@ def compare_buy_and_hold(spec: UniverseSpec, strategy_keys: list,
 # MID-HORIZON BACKTEST  (stop / target aware)
 # ─────────────────────────────────────────────
 
+def simulate_trades(bars: dict[str, pd.DataFrame], signals: dict,
+                    params: TP.PlanParams, one_way: float,
+                    fill_window: int = 5, max_gross_pct: float = 100.0
+                    ) -> tuple[pd.Series, pd.DataFrame, dict]:
+    """
+    Session-by-session portfolio simulation of trade plans.
+
+    `bars` holds adjusted open/high/low/close wide frames over the sessions to
+    simulate; `signals` maps a session Timestamp to the plans produced after
+    that session's close (a frame indexed by ticker, best first, with entry,
+    entry_type, stop, target and weight_pct).
+
+    Returns (daily equity starting at 1.0, closed trades, stats).
+
+    What the previous version got wrong, and this one does not:
+      * every plan was assumed filled at its entry price — including pullback
+        limits set below the market that price never came back to;
+      * the bar walk began *on the signal day*, so that day's range, which
+        happened before the signal existed, could trigger a stop or target;
+      * positions overlapped across monthly scans with no capital limit, so
+        exposure could reach several hundred percent;
+      * P&L was booked only at exits, so open losses never showed in the
+        drawdown;
+      * a gap through the stop was filled at the stop instead of the open.
+    """
+    o, h, l, c = bars['open'], bars['high'], bars['low'], bars['close']
+    sessions = c.index
+    closes_ff = c.ffill()
+    cash = 1.0
+    positions: dict[str, dict] = {}
+    pending: dict[str, dict] = {}
+    closed: list[dict] = []
+    equity = []
+    stats = {'orders': 0, 'filled': 0, 'expired': 0, 'skipped_capacity': 0,
+             'skipped_gap_below_stop': 0}
+    exposure = []
+
+    def value_of(i: int) -> float:
+        row = closes_ff.iloc[i]
+        return cash + sum(p['shares'] * float(row.get(t, p['entry']))
+                          for t, p in positions.items())
+
+    def close_position(t: str, price: float, reason: str, i: int) -> None:
+        nonlocal cash
+        p = positions.pop(t)
+        cash += p['shares'] * price * (1.0 - one_way)
+        gross = price / p['entry'] - 1.0
+        risk = (p['entry'] - p['stop']) / p['entry']
+        closed.append({
+            'signal_date': p['signal_date'], 'entry_date': p['entry_date'],
+            'exit_date': sessions[i].date(), 'ticker': t,
+            'entry': round(p['entry'], 4), 'exit': round(price, 4),
+            'stop': p['stop'], 'target': p['target'], 'reason': reason,
+            'weight': p['weight'], 'gross_return': gross,
+            'net_return': (1 + gross) * (1 - one_way) / (1 + one_way) - 1,
+            'r_multiple': gross / risk if risk > 0 else np.nan,
+            'days_held': i - p['bar'],
+        })
+
+    for i, day in enumerate(sessions):
+        eq_prev = equity[-1] if equity else 1.0
+
+        # 1. fills — orders placed after an earlier close
+        for t, order in list(pending.items()):
+            if i > order['expires']:
+                stats['expired'] += 1
+                del pending[t]
+                continue
+            op, lo_ = o.at[day, t] if t in o else np.nan, l.at[day, t] if t in l else np.nan
+            if not (np.isfinite(op) and np.isfinite(lo_)):
+                continue
+            if order['entry_type'] == 'market':
+                fill = op
+            elif op <= order['entry']:
+                fill = op                       # opened below the limit
+            elif lo_ <= order['entry']:
+                fill = order['entry']
+            else:
+                continue
+            del pending[t]
+            if fill <= order['stop']:
+                # Already through the stop before we were in: the setup is
+                # invalid, and nobody enters a trade below its own stop.
+                stats['skipped_gap_below_stop'] += 1
+                continue
+            invested = sum(p['shares'] * float(closes_ff.iloc[max(i - 1, 0)].get(t2, p['entry']))
+                           for t2, p in positions.items())
+            room = max(0.0, max_gross_pct / 100.0 * eq_prev - invested)
+            want = order['weight'] * eq_prev
+            alloc = min(want, room, cash / (1.0 + one_way))
+            if alloc < params.min_weight_pct / 100.0 * eq_prev:
+                stats['skipped_capacity'] += 1
+                continue
+            shares = alloc / fill
+            cash -= alloc * (1.0 + one_way)
+            positions[t] = {'shares': shares, 'entry': fill, 'stop': order['stop'],
+                            'target': order['target'], 'bar': i,
+                            'limit': order['entry_type'] != 'market',
+                            'entry_date': day.date(), 'signal_date': order['signal_date'],
+                            'weight': alloc / eq_prev}
+            stats['filled'] += 1
+
+        # 2. exits — stop first: within one bar the order is unknowable, so
+        #    assume the worse outcome.
+        for t, p in list(positions.items()):
+            op = o.at[day, t] if t in o else np.nan
+            hi = h.at[day, t] if t in h else np.nan
+            lo_ = l.at[day, t] if t in l else np.nan
+            cl = c.at[day, t] if t in c else np.nan
+            if not np.isfinite(cl):
+                continue
+            fresh = p['bar'] == i
+            if not fresh and np.isfinite(op) and op <= p['stop']:
+                close_position(t, op, 'stop', i)
+            elif np.isfinite(lo_) and lo_ <= p['stop']:
+                close_position(t, p['stop'], 'stop', i)
+            elif not fresh and np.isfinite(op) and op >= p['target']:
+                close_position(t, op, 'target', i)
+            elif (np.isfinite(hi) and hi >= p['target']
+                  and not (fresh and p['limit'])):
+                close_position(t, p['target'], 'target', i)
+            elif i - p['bar'] >= params.time_stop_days:
+                close_position(t, cl, 'time', i)
+
+        # 3. mark to market
+        v = value_of(i)
+        equity.append(v)
+        exposure.append((v - cash) / v if v > 0 else 0.0)
+
+        # 4. new signals after this close → orders from the next session
+        plans = signals.get(day)
+        if plans is not None and not plans.empty:
+            for t, plan in plans.iterrows():
+                if t in positions or t in pending or t not in c.columns:
+                    continue
+                pending[t] = {'entry': float(plan['entry']),
+                              'entry_type': str(plan.get('entry_type', 'market')),
+                              'stop': float(plan['stop']),
+                              'target': float(plan['target']),
+                              'weight': float(plan['weight_pct']) / 100.0,
+                              'expires': i + fill_window,
+                              'signal_date': day.date()}
+                stats['orders'] += 1
+
+    # Anything still open is closed at the last close of the window.
+    last = len(sessions) - 1
+    for t in list(positions):
+        px = float(closes_ff.iloc[last].get(t, positions[t]['entry']))
+        close_position(t, px, 'end', last)
+    if equity:
+        equity[-1] = cash
+
+    stats['avg_exposure'] = float(np.mean(exposure)) if exposure else 0.0
+    stats['fill_rate'] = stats['filled'] / stats['orders'] if stats['orders'] else 0.0
+    return (pd.Series(equity, index=sessions, name='strategy'),
+            pd.DataFrame(closed), stats)
+
+
 def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
                        start: date | str, end: date | str | None = None,
                        n_positions: int = 10,
                        params: TP.PlanParams | None = None,
-                       cost_bps: float | None = None) -> BacktestResult:
+                       cost_bps: float | None = None,
+                       fill_window: int = 5,
+                       max_gross_pct: float = 100.0) -> BacktestResult:
     """
-    Backtest a mid-term strategy honouring its own exit rules.
+    Backtest a mid-term strategy honouring its own entry and exit rules.
 
-    At each monthly scan the engine builds plans, then walks daily bars to see
-    whether the stop, the target, or the time stop was reached first. When a
-    single day trades through both stop and target, daily bars cannot reveal
-    the order, so the stop is assumed — the pessimistic read, chosen so the
-    results are not flattered by an ambiguity.
+    Scans after the last session of each month; the resulting plans become
+    orders for the following sessions and the portfolio is simulated bar by
+    bar (see `simulate_trades`). Gross exposure never exceeds `max_gross_pct`
+    of equity, and a name already held or on order is not bought again.
     """
     strategy = ST.get(strategy_key)
     if strategy.horizon != 'mid':
@@ -460,131 +730,37 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     end = pd.to_datetime(end or date.today()).date()
     params = params or TP.PlanParams()
     cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
-    round_trip = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
+    one_way = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
 
-    scan_dates = pd.date_range(start, end, freq='ME')
-    trades: list[dict] = []
-
-    # ── pre-fetch: load everything once for the entire window ──
-    all_tickers_mid: set[str] = set()
-    for ts in scan_dates:
-        all_tickers_mid.update(spec.resolve(ts.date()))
-    all_tickers_mid_sorted = sorted(all_tickers_mid)
-    facts_full_mid = sec.facts_asof(all_tickers_mid_sorted, scan_dates[-1].date()) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-    dv_mid = factorcache.data_version()
-    splits_mid = yahoo.split_factors(all_tickers_mid_sorted) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-    if not facts_full_mid.empty:
-        facts_full_mid = adjust_shares_for_splits(facts_full_mid, splits_mid)
-
-    price_lookback_mid = int(config.TRADING_DAYS['3Y'] * 1.6)
-    bt_ohlc_mid = yahoo.bulk_ohlc(all_tickers_mid_sorted,
-                                   start=start - timedelta(days=price_lookback_mid),
-                                   end=end + timedelta(days=int(params.time_stop_days * 1.5)))
-    ins_start_mid = start - timedelta(days=180)
-    bt_insiders_mid = sec.insiders_asof(
-        all_tickers_mid_sorted, scan_dates[-1].date(),
-        lookback_days=(scan_dates[-1].date() - ins_start_mid).days) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-    bt_events_mid = sec.events_asof(
-        all_tickers_mid_sorted, scan_dates[-1].date(),
-        lookback_days=(scan_dates[-1].date() - (start - timedelta(days=90))).days) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-
-    prev_fund_mid: pd.DataFrame | None = None
-    prev_d0_mid: date | None = None
-
-    for ts in scan_dates:
-        d0 = ts.date()
-        facts_d0_mid = facts_full_mid[facts_full_mid['filed'] <= pd.Timestamp(d0)] \
-            if not facts_full_mid.empty else pd.DataFrame()
-        if prev_d0_mid is not None and not facts_full_mid.empty:
-            new_mid = facts_full_mid[
-                (facts_full_mid['filed'] > pd.Timestamp(prev_d0_mid))
-                & (facts_full_mid['filed'] <= pd.Timestamp(d0))]
-            changed_mid = set(new_mid['ticker'].unique())
-        else:
-            changed_mid = None
-
-        result = EN.run(spec, strategy_key, as_of=d0, top_n=n_positions,
-                        persist=False, plan_params=params,
-                        _bt_facts=facts_d0_mid if not facts_d0_mid.empty else None,
-                        _bt_data_version=dv_mid,
-                        _bt_prev_fund=prev_fund_mid,
-                        _bt_changed_tickers=changed_mid,
-                        _bt_splits=splits_mid,
-                        _bt_splits_applied=True,
-                        _bt_ohlc=bt_ohlc_mid,
-                        _bt_insiders=bt_insiders_mid,
-                        _bt_events=bt_events_mid)
-        prev_fund_mid = result._fund_raw
-        prev_d0_mid = d0
-        if result.plans.empty:
-            continue
-
-        horizon_end = min(end, d0 + timedelta(days=int(params.time_stop_days * 1.5)))
-        tickers = list(result.plans.index)
-        # Adjusted OHLC: raw highs/lows sit on a different basis to the
-        # adjusted price the plan levels were derived from.
-        highs, lows, closes = yahoo.adjusted_ohlc(tickers, start=d0, end=horizon_end)
-        if closes.empty:
-            continue
-
-        for t in tickers:
-            if t not in closes.columns:
-                continue
-            plan = result.plans.loc[t]
-            entry, stop, target = (float(plan['entry']), float(plan['stop']),
-                                   float(plan['target']))
-
-            hi = highs[t].dropna() if t in highs.columns else pd.Series(dtype=float)
-            lo = lows[t].dropna() if t in lows.columns else pd.Series(dtype=float)
-            cl = closes[t].dropna()
-            if cl.empty:
-                continue
-
-            exit_price, exit_reason, exit_date = None, 'time', cl.index[-1].date()
-            for day in cl.index:
-                day_low = lo.get(day, np.nan)
-                day_high = hi.get(day, np.nan)
-                if np.isfinite(day_low) and day_low <= stop:
-                    exit_price, exit_reason, exit_date = stop, 'stop', day.date()
-                    break
-                if np.isfinite(day_high) and day_high >= target:
-                    exit_price, exit_reason, exit_date = target, 'target', day.date()
-                    break
-            if exit_price is None:
-                exit_price = float(cl.iloc[-1])
-
-            gross = exit_price / entry - 1.0
-            net = gross - 2 * round_trip
-            risk = (entry - stop) / entry
-            trades.append({
-                'entry_date': d0, 'exit_date': exit_date, 'ticker': t,
-                'entry': entry, 'exit': round(exit_price, 2),
-                'reason': exit_reason, 'weight': float(plan['weight_pct']) / 100.0,
-                'gross_return': gross, 'net_return': net,
-                'r_multiple': (gross / risk) if risk > 0 else np.nan,
-                'days_held': (exit_date - d0).days,
-            })
-
-    trades_df = pd.DataFrame(trades)
-    if trades_df.empty:
+    pre = _preload(spec, start, end, 'M')
+    bars = yahoo.adjusted_bars(pre.tickers, start=start, end=end)
+    if bars['close'].empty:
         return BacktestResult(pd.Series(dtype=float), pd.Series(dtype=float),
                               pd.DataFrame(), pd.DataFrame(),
-                              {'note': 'no trades generated'}, [])
+                              {'note': 'no stored prices in the window'}, [])
+    sessions = bars['close'].index
+    scan_pos = rebalance_positions(sessions, 'M')
 
-    # Equity curve: sum weighted P&L by exit date.
-    trades_df = trades_df.sort_values('exit_date')
-    daily = (trades_df.assign(contrib=trades_df['net_return'] * trades_df['weight'])
-                      .groupby('exit_date')['contrib'].sum())
-    eq = (1.0 + daily).cumprod()
-    eq.index = pd.to_datetime(eq.index)
-    eq = pd.concat([pd.Series([1.0], index=[pd.Timestamp(start)]), eq])
+    scorer = _Scorer(spec, strategy_key, pre)
+    signals: dict = {}
+    for p in scan_pos:
+        d0 = sessions[p]
+        result = scorer.run(d0.date(), n_positions, plan_params=params)
+        if result.plans.empty:
+            continue
+        order = [t for t in result.scores.index if t in result.plans.index]
+        signals[d0] = result.plans.loc[order].head(n_positions)
 
-    bench = _benchmark_curve(start, end, eq.index)
-    metrics = compute_metrics(eq, bench)
+    eq, trades_df, stats = simulate_trades(bars, signals, params, one_way,
+                                           fill_window, max_gross_pct)
+    scan_dates = [sessions[p].date() for p in scan_pos]
+    if trades_df.empty:
+        return BacktestResult(eq, pd.Series(dtype=float), pd.DataFrame(),
+                              pd.DataFrame(),
+                              {'note': 'no trades filled', **stats}, scan_dates)
+
+    bench = _benchmark_curve(eq.index[0].date(), eq.index[-1].date(), eq.index)
+    metrics = compute_metrics(eq, bench, rf=_risk_free(start, end))
     wins = trades_df['net_return'] > 0
     metrics.update({
         'n_trades': int(len(trades_df)),
@@ -594,23 +770,34 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
         'avg_r': float(trades_df['r_multiple'].mean()),
         'avg_days_held': float(trades_df['days_held'].mean()),
         'exit_mix': trades_df['reason'].value_counts().to_dict(),
+        **stats,
     })
-    if metrics['avg_loss'] != 0:
-        metrics['profit_factor'] = abs(
-            (metrics['avg_win'] * wins.sum()) /
-            (metrics['avg_loss'] * (~wins).sum())) if (~wins).any() else np.inf
+    gains = trades_df.loc[wins, 'net_return'].sum()
+    losses = trades_df.loc[~wins, 'net_return'].sum()
+    metrics['profit_factor'] = float(gains / abs(losses)) if losses < 0 else np.inf
 
     return BacktestResult(equity=eq, benchmark=bench, holdings=pd.DataFrame(),
                           trades=trades_df, metrics=metrics,
-                          rebalance_dates=[d.date() for d in scan_dates])
+                          rebalance_dates=scan_dates)
 
 
 # ─────────────────────────────────────────────
 # METRICS
 # ─────────────────────────────────────────────
 
-def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> dict:
-    """Standard performance statistics for an equity curve."""
+def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None,
+                    rf: float | None = None) -> dict:
+    """
+    Standard performance statistics for an equity curve.
+
+    Sharpe is the mean periodic excess return over its standard deviation,
+    annualised — the textbook definition. (CAGR over volatility, used before,
+    understates by roughly half the variance and penalises volatile
+    strategies twice.) Sortino divides by the downside *deviation* below the
+    risk-free rate, counting every period, rather than by the standard
+    deviation of the losing periods alone. `rf` is annual; it defaults to
+    config.RISK_FREE_RATE.
+    """
     if equity is None or len(equity) < 2:
         return {}
 
@@ -624,13 +811,15 @@ def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> di
     cagr = float((eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1.0)
 
     ppy = len(rets) / years
-    vol = float(rets.std() * np.sqrt(ppy)) if len(rets) > 1 else 0.0
-    rf = config.RISK_FREE_RATE
-    sharpe = float((cagr - rf) / vol) if vol > 0 else 0.0
+    rf = config.RISK_FREE_RATE if rf is None else float(rf)
+    rf_p = (1.0 + rf) ** (1.0 / ppy) - 1.0
+    excess = rets - rf_p
+    sd = float(rets.std()) if len(rets) > 1 else 0.0
+    vol = sd * np.sqrt(ppy)
+    sharpe = float(excess.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
 
-    downside = rets[rets < 0]
-    dvol = float(downside.std() * np.sqrt(ppy)) if len(downside) > 1 else 0.0
-    sortino = float((cagr - rf) / dvol) if dvol > 0 else 0.0
+    downside = np.sqrt(float((np.minimum(excess, 0.0) ** 2).mean()))
+    sortino = float(excess.mean() / downside * np.sqrt(ppy)) if downside > 0 else 0.0
 
     dd = eq / eq.cummax() - 1.0
     max_dd = float(dd.min())
@@ -641,12 +830,14 @@ def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> di
         'calmar': float(cagr / abs(max_dd)) if max_dd < 0 else 0.0,
         'best_period': float(rets.max()), 'worst_period': float(rets.min()),
         'hit_rate': float((rets > 0).mean()), 'years': years,
+        'risk_free': rf,
     }
 
     if benchmark is not None and len(benchmark) > 1:
         b = benchmark.reindex(eq.index).ffill().dropna()
         if len(b) > 1:
-            b_cagr = float((b.iloc[-1] / b.iloc[0]) ** (1 / years) - 1.0)
+            b_years = max((b.index[-1] - b.index[0]).days / 365.25, 1e-9)
+            b_cagr = float((b.iloc[-1] / b.iloc[0]) ** (1 / b_years) - 1.0)
             out['benchmark_cagr'] = b_cagr
             out['excess_cagr'] = cagr - b_cagr
             joined = pd.concat([rets, b.pct_change()], axis=1).dropna()
@@ -655,6 +846,9 @@ def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> di
                 te = float(active.std() * np.sqrt(ppy))
                 out['tracking_error'] = te
                 out['information_ratio'] = float(active.mean() * ppy / te) if te > 0 else 0.0
+                bvar = float(joined.iloc[:, 1].var())
+                if bvar > 0:
+                    out['beta'] = float(joined.iloc[:, 0].cov(joined.iloc[:, 1]) / bvar)
     return out
 
 
