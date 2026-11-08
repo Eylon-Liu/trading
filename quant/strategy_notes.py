@@ -86,6 +86,27 @@ NOTES: dict[str, StrategyNote] = {
                    'specific combination selected.',
     ),
 
+    'ai_earnings': StrategyNote(
+        differentiator='The only strategy driven by reading text: a language '
+                       'model grades each new earnings release, and that grade '
+                       'is the main factor.',
+        benefit='Sees what ratios cannot — a guidance raise buried in the '
+                'release, a weak segment behind a headline beat, margin '
+                'commentary — and states its reasoning, so a pick comes with '
+                'an argument you can check.',
+        drawback='Covers only names that reported recently and were reviewed, '
+                 'so the list is short and turns over each earnings season. '
+                 'Every review is a paid model call.',
+        risk='No backtest can validate it: a model asked about an old quarter '
+             'already knows what happened next, so reviews are never back-'
+             'dated. Its edge is unproven until the live track record has '
+             'several quarters. Models can be confidently wrong.',
+        best_when='Right after earnings season, when most names have a fresh '
+                  'review.',
+        worst_when='Late in a quarter, when the reviews are two months old and '
+                   'the market has moved on.',
+    ),
+
     'shareholder_yield': StrategyNote(
         differentiator='Counts buybacks alongside dividends, so it sees the '
                        'whole of capital returned rather than only the taxable '
@@ -244,6 +265,28 @@ NOTES: dict[str, StrategyNote] = {
         best_when='Steady trending markets.',
         worst_when='Volatility regime shifts, where past volatility misleads.',
         horizon_note='Weeks to months.',
+    ),
+
+    'consensus': StrategyNote(
+        differentiator='Scores names by how many *independent* strategy '
+                       'families rank them in their top 20% — quality & value, '
+                       'momentum & trend, insider buying, earnings reaction, '
+                       'and the AI earnings review — rather than by factors.',
+        benefit='Agreement across different kinds of evidence is harder to get '
+                'by luck than a high score on one. Correlated strategies are '
+                'grouped so they vote once, and the avoid list can veto.',
+        drawback='Agreement is rare, so the strongest list is short, and it '
+                 'favours names that are good on everything over names that '
+                 'are exceptional on one thing.',
+        risk='If the families are not really independent in a given market, '
+             'agreement is just a crowded trade. Run `cli.py consensus-test` '
+             'to check that more agreement actually meant higher returns on '
+             'your universe before trusting it.',
+        best_when='Holding for quarters, where waiting for several signals to '
+                  'line up costs little.',
+        worst_when='Sharp regime turns, when the trend family flips first and '
+                   'the slower fundamental families still say yes.',
+        horizon_note='Quarters; exit when agreement falls away.',
     ),
 
     'quality_breakdown': StrategyNote(

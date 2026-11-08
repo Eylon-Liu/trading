@@ -340,6 +340,34 @@ earnings_calendar = Table(
     Index('ix_earnings_date', 'report_date'),
 )
 
+# LLM reviews of earnings releases, one per 8-K results filing.
+#
+# `assessed_on` is the day the model produced the review, and it is the only
+# date a point-in-time read may use. A review written today about last
+# year's release would be written by a model that already knows how the
+# stock did afterwards — so reviews are never back-dated, and the factor built
+# on them has history only from the day the routine started writing them.
+llm_reviews = Table(
+    'llm_reviews', metadata,
+    Column('accession', String, primary_key=True),
+    Column('ticker', String, index=True),
+    Column('filed', Date),
+    Column('assessed_on', Date, index=True),
+    Column('model', String),
+    Column('version', Integer),
+    Column('score', Float),              # overall, -2 .. +2
+    Column('conviction', String),        # low | medium | high
+    Column('verdict', String),           # buy | accumulate | hold | avoid
+    Column('quarter_quality', Float),    # -2 .. +2
+    Column('outlook', Float),            # -2 .. +2
+    Column('guidance', String),          # raised | maintained | lowered | withdrawn | none
+    Column('valuation_view', String),    # cheap | fair | expensive | unclear
+    Column('summary', Text),
+    Column('detail_json', Text),
+    Column('created_at', DateTime),
+    Index('ix_llm_reviews_pit', 'ticker', 'assessed_on'),
+)
+
 # Names you follow. Distinct from positions: watching costs nothing and
 # carries no price levels.
 watchlist = Table(

@@ -541,6 +541,15 @@ def alt_factors(tickers: list[str], as_of: date | str,
     if att is not None:
         out['ATTENTION_Z'] = att.reindex(out.index)
 
+    # ── LLM earnings reviews (point-in-time on the day written) ───
+    try:
+        from nlp import earnings_review as ERV
+        view = ERV.view_factor(tickers, as_of)
+        if not view.empty:
+            out['LLM_EARNINGS_VIEW'] = view.reindex(out.index)
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('LLM earnings view unavailable: %s', exc)
+
     return out
 
 
@@ -762,6 +771,7 @@ FACTOR_DIRECTION: dict[str, bool] = {
     'CURRENT_RATIO': True, 'PIOTROSKI_F': True, 'FCF_CONVERSION': True,
     'EVENT_RESULTS': True,          # a recent results filing opens the drift window
     'EARNINGS_REACTION': True,      # drift continues in the reaction's direction
+    'LLM_EARNINGS_VIEW': True,      # model's buy/avoid judgement, -2..+2
     'ACCRUALS': False, 'DEBT_TO_EQUITY': False, 'NET_DEBT_TO_EQUITY': False,
     'REVENUE_GROWTH_1Y': True, 'REVENUE_CAGR_3Y': True,
     'EARNINGS_GROWTH_1Y': True, 'EQUITY_CAGR_3Y': True, 'EPS_CAGR_3Y': True,

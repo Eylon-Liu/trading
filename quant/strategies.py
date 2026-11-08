@@ -62,6 +62,17 @@ class Strategy:
     setup: str = 'momentum'                       # informs the trade plan
     thesis: str = ''
     invert: bool = False                          # rank worst-first (avoid lists)
+    # A meta-strategy scores names by *agreement between other strategies*
+    # instead of weighting factors (see quant/consensus.py). Each family is a
+    # group of correlated strategies and casts one vote.
+    components: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    factor_votes: dict[str, str] = field(default_factory=dict)  # family -> factor
+    veto: tuple[str, ...] = ()                    # avoid lists that cost a vote
+    vote_pct: float = 0.80                        # family percentile that counts as a vote
+
+    @property
+    def is_meta(self) -> bool:
+        return bool(self.components)
 
     @property
     def factors(self) -> list[str]:
@@ -236,6 +247,22 @@ LONG_TERM = {
             'NET_DEBT_TO_EQUITY': 0.5,
         },
     ),
+    'ai_earnings': Strategy(
+        key='ai_earnings', name='AI Earnings Review', horizon='long',
+        description='Names whose latest results an LLM judged worth buying, '
+                    'checked against quality and the market\'s own reaction.',
+        thesis='A model reads each new earnings release — guidance, segment '
+               'trends, margin commentary that no ratio captures — and grades '
+               'it for a 6-18 month holder. The market reaction and two quality '
+               'gauges keep a persuasive release from outranking the numbers. '
+               'Only names reviewed in the last 120 days are scored. Forward-'
+               'only: judge it by its live track record, not a backtest.',
+        weights={
+            'LLM_EARNINGS_VIEW': 2.0, 'EARNINGS_REACTION': 0.8,
+            'ROIC': 0.5, 'FCF_YIELD': 0.5,
+        },
+        filters={'min_market_cap': 2e9},
+    ),
     'shareholder_yield': Strategy(
         key='shareholder_yield', name='Total Shareholder Yield', horizon='long',
         description='All cash returned to owners — dividends plus buybacks.',
@@ -360,7 +387,37 @@ MID_TERM = {
 }
 
 
-ALL_STRATEGIES: dict[str, Strategy] = {**LONG_TERM, **MID_TERM}
+# ─────────────────────────────────────────────
+# META — agreement between strategies
+# ─────────────────────────────────────────────
+
+META = {
+    'consensus': Strategy(
+        key='consensus', name='Multi-Strategy Consensus', horizon='long',
+        description='Names that several independent strategy families rank '
+                    'near the top at the same time.',
+        thesis='Agreement between methods that look at different evidence — '
+               'business quality and valuation, price trend, insider buying, '
+               'the earnings reaction, and an AI read of the latest results — '
+               'is better evidence than any single score. Correlated strategies '
+               'are grouped into families and each family casts one vote, so '
+               'three momentum variants agreeing count once, not three times. '
+               'A name on the Deteriorating Quality avoid list loses a vote. '
+               'Exit when agreement falls away.',
+        weights={},
+        components={
+            'Quality & value': ('buffett', 'shareholder_yield'),
+            'Momentum & trend': ('quality_momentum', 'momentum_trend',
+                                 'relative_strength'),
+            'Insider buying': ('insider_conviction', 'insider_cluster'),
+            'Earnings reaction': ('earnings_drift',),
+        },
+        factor_votes={'AI earnings review': 'LLM_EARNINGS_VIEW'},
+        veto=('quality_breakdown',),
+    ),
+}
+
+ALL_STRATEGIES: dict[str, Strategy] = {**LONG_TERM, **MID_TERM, **META}
 
 
 # ─────────────────────────────────────────────
@@ -406,13 +463,18 @@ def by_horizon(horizon: str) -> dict[str, Strategy]:
     return {k: s for k, s in ALL_STRATEGIES.items() if s.horizon == horizon}
 
 
-def options(horizon: str | None = None, grouped: bool = False) -> list[dict]:
+def options(horizon: str | None = None, grouped: bool = False,
+            include_meta: bool = True) -> list[dict]:
     """Dropdown options for the UI.
 
     With ``grouped=True``, returns option-groups keyed by horizon label so
-    Dash renders them under section headers.
+    Dash renders them under section headers. `include_meta=False` leaves out
+    strategies with no factor weights of their own (the consensus), for
+    places that copy weights.
     """
     pool = ALL_STRATEGIES if horizon is None else by_horizon(horizon)
+    if not include_meta:
+        pool = {k: s for k, s in pool.items() if not s.is_meta}
     if not grouped or horizon is not None:
         return [{'label': s.name, 'value': k} for k, s in sorted(pool.items())]
 
@@ -434,6 +496,7 @@ def summary_table() -> list[dict]:
         'key': s.key, 'name': s.name,
         'horizon': HORIZONS[s.horizon]['label'],
         'description': s.description, 'thesis': s.thesis,
-        'factors': len(s.weights),
-        'trade_plan': 'yes' if s.needs_trade_plan else 'no (thesis-based exit)',
+        'factors': len(s.weights) if not s.is_meta else 0,
+        'trade_plan': ('no (exit when agreement falls away)' if s.is_meta
+                       else 'yes' if s.needs_trade_plan else 'no (thesis-based exit)'),
     } for s in sorted(ALL_STRATEGIES.values(), key=lambda x: (x.horizon, x.key))]

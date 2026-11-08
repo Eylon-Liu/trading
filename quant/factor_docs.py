@@ -355,6 +355,23 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'drift has largely run its course by then, and those names are left '
         'out of the drift screen rather than scored on stale news.'),
 
+    'LLM_EARNINGS_VIEW': FactorDoc(
+        'LLM_EARNINGS_VIEW', 'AI Earnings Review', 'Alt Data',
+        'LLM_EARNINGS_VIEW = score × conviction weight\n'
+        '   score      : model verdict on the latest results, -2 .. +2\n'
+        '   conviction : low 0.5 · medium 0.8 · high 1.0\n'
+        '   latest review written in the last 120 days',
+        'Earnings press release (SEC 8-K Ex. 99) + computed fundamentals, '
+        'market reaction, consensus EPS, headlines; read by the configured LLM',
+        'higher',
+        'A language model reads the actual release — guidance, segment trends, '
+        'margin commentary — which no ratio captures, and judges whether the '
+        'quarter makes the stock worth owning for 6-18 months.',
+        'Forward-only. Reviews are dated the day they are written and never '
+        'back-dated, because a model asked today about an old quarter already '
+        'knows what happened next. No backtest can validate it; the live '
+        'track record does. Opinions vary by model and can be wrong.'),
+
     'EVENT_MANAGEMENT': FactorDoc(
         'EVENT_MANAGEMENT', '8-K Management Changes', 'Alt Data',
         'EVENT_MANAGEMENT = count of 8-K filings carrying item 5.02\n'

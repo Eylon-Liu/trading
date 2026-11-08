@@ -86,6 +86,11 @@ def layout() -> html.Div:
                     lg=6, className='mb-3'),
         ]),
 
+        C.card('🧠 AI earnings reviews', html.Div(id='pf-reviews'),
+               subtitle='LLM read of recent results releases (python cli.py '
+                        'review --run). Opinion, graded by the live track record.',
+               className='mb-3'),
+
         C.card('📈 Live track record', html.Div(id='pf-track'),
                subtitle='What each strategy’s stored top-10 picks did next, '
                         'bought at the following close. Out of sample by '
@@ -169,11 +174,12 @@ def _pct(v):
     Output('pf-holdings', 'children'), Output('pf-alerts', 'children'),
     Output('wl-table', 'children'), Output('pf-earnings', 'children'),
     Output('pf-macro', 'children'), Output('pf-track', 'children'),
+    Output('pf-reviews', 'children'),
     Input('tabs', 'active_tab'), Input('pf-version', 'data'),
 )
 def _render(active_tab, _version):
     if active_tab != 'tab-portfolio':
-        return (no_update,) * 6
+        return (no_update,) * 7
     from data import earnings as ER
     from data import macro
     from quant import portfolio as PF
@@ -278,5 +284,22 @@ def _render(active_tab, _version):
                                'mean_pick_return', 'mean_excess', 'hit_rate',
                                'mean_ic']], page_size=30)
 
+    def reviews_view():
+        from nlp import earnings_review as ERV
+        rv = ERV.latest_reviews(days=30)
+        if rv.empty:
+            return C.placeholder('No reviews yet. With an LLM key in .env the daily '
+                                 'routine reviews new results; or run: python cli.py '
+                                 'review --run')
+        mine = set(PF.watchlist()) | set(PF.lots('open')['ticker'])
+        rv['yours'] = rv['ticker'].isin(mine).map({True: '★', False: ''})
+        rv = rv.sort_values(['yours', 'assessed_on'], ascending=[False, False])
+        view = rv.assign(filed=rv['filed'].dt.date.astype(str),
+                         score=rv['score'].round(1))
+        return C.data_table(view[['yours', 'ticker', 'verdict', 'score', 'conviction',
+                                  'guidance', 'valuation_view', 'filed', 'summary']],
+                            page_size=15, cell_tooltips=['summary'])
+
     return (safe(holdings_view), safe(alerts_view), safe(watch_view),
-            safe(earnings_view), safe(macro_view), safe(track_view))
+            safe(earnings_view), safe(macro_view), safe(track_view),
+            safe(reviews_view))

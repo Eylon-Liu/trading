@@ -72,6 +72,7 @@ _register('corporate_events', 'EVENT_INTENSITY_90D', 'EVENT_RESULTS',
           'EARNINGS_REACTION',
           'EVENT_MANAGEMENT', 'EVENT_RESTRUCTURING', 'EVENT_STRATEGY')
 _register('attention', 'ATTENTION_Z')
+_register('llm_reviews', 'LLM_EARNINGS_VIEW')
 _register('profile_snapshots', 'FORWARD_PE', 'TRAILING_PE')
 
 # Where each source's history lives, and how much lead time a factor needs
@@ -84,6 +85,7 @@ SOURCE_DATE_COLUMN: dict[str, str] = {
     'corporate_events': 'filed',
     'attention': 'date',
     'profile_snapshots': 'snapshot_date',
+    'llm_reviews': 'assessed_on',
 }
 
 # A source with less than this much history cannot support a backtest at all;
@@ -208,6 +210,8 @@ def backtest_window(strategy, preset: str = 'SPY',
 
     strat = ST.get(strategy)
     cov = source_coverage() if coverage is None else coverage
+    if strat.is_meta:
+        return _meta_window(strat, preset, cov)
     by_source = cov.set_index('source') if not cov.empty else pd.DataFrame()
 
     today = date.today()
@@ -253,6 +257,65 @@ def backtest_window(strategy, preset: str = 'SPY',
         return Window(strat.key, None, today,
                       ['no factor in this strategy has a known source'], notes)
     return Window(strat.key, max(starts), today, [], notes)
+
+
+def _family_windows(strat, preset: str, cov: pd.DataFrame
+                    ) -> dict[str, dict[str, Window]]:
+    return {family: {m: backtest_window(m, preset, coverage=cov) for m in members}
+            for family, members in strat.components.items()}
+
+
+def _meta_window(strat, preset: str, cov: pd.DataFrame) -> Window:
+    """
+    A consensus needs at least two families to agree, so it is testable from
+    the date the second family becomes testable. Factor votes (the AI review)
+    are forward-only and never part of a backtest.
+    """
+    today = date.today()
+    firsts, notes = [], []
+    for family, wins in _family_windows(strat, preset, cov).items():
+        ok = [w.earliest for w in wins.values() if w.testable]
+        if ok:
+            firsts.append(min(ok))
+            notes.append(f'{family} from {min(ok)}')
+        else:
+            notes.append(f'{family} not testable')
+    if strat.factor_votes:
+        notes.append(f'{", ".join(strat.factor_votes)}: forward-only, '
+                     f'excluded from backtests')
+    if len(firsts) < 2:
+        return Window(strat.key, None, today,
+                      ['fewer than two strategy families are backtestable'], notes)
+    return Window(strat.key, sorted(firsts)[1], today, [], notes)
+
+
+def meta_members_at(strategy, start: date, preset: str = 'SPY',
+                    coverage: pd.DataFrame | None = None):
+    """
+    The consensus as it can honestly be tested from `start`: members whose
+    data does not reach back that far are dropped (and families left empty
+    with them) for the *whole* run, so a vote count means the same thing on
+    every date of the backtest. Returns (strategy, notes).
+    """
+    import dataclasses
+
+    from quant import strategies as ST
+
+    strat = ST.get(strategy)
+    cov = source_coverage() if coverage is None else coverage
+    kept, notes = {}, []
+    for family, wins in _family_windows(strat, preset, cov).items():
+        members = tuple(m for m, w in wins.items()
+                        if w.testable and w.earliest <= start)
+        dropped = [m for m in wins if m not in members]
+        if members:
+            kept[family] = members
+        if dropped:
+            notes.append(f'{family}: {", ".join(dropped)} not testable from '
+                         f'{start}' + ('' if members else ' — family left out'))
+    if strat.factor_votes:
+        notes.append(f'{", ".join(strat.factor_votes)} left out (forward-only)')
+    return dataclasses.replace(strat, components=kept, factor_votes={}), notes
 
 
 def report(preset: str = 'SPY') -> pd.DataFrame:

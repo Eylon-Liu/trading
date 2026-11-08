@@ -15,9 +15,13 @@ Design rules that follow from that:
     interprets what the quant engine produced; it does not do the arithmetic,
     because a language model is the wrong tool for a TTM sum and the whole
     point of the SEC pipeline is that the figures are auditable.
-  * Nothing it returns is stored as a factor or fed into a score. It is
-    commentary attached to a run, so a hallucination can mislead a reader but
-    cannot silently corrupt a backtest.
+  * Nothing in *this* module is stored as a factor or fed into a score. It
+    is commentary attached to a run, so a hallucination can mislead a reader
+    but cannot silently corrupt a backtest. The one exception lives elsewhere
+    and is explicit: nlp/earnings_review.py stores a dated verdict per
+    results filing, which feeds the LLM_EARNINGS_VIEW factor used by the AI
+    Earnings Review and Multi-Strategy Consensus strategies. Those reviews
+    are never back-dated, so they cannot leak into a backtest either.
 
 Neither a Claude Pro nor a Gemini consumer subscription includes API access;
 both developer APIs are billed separately.

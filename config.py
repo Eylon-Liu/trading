@@ -365,6 +365,11 @@ LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'auto')
 
 LLM_MAX_ARTICLES = int(os.environ.get('LLM_MAX_ARTICLES', '12'))
 
+# Earnings reviews (nlp/earnings_review.py): one LLM call per new results
+# filing. 'auto' runs them whenever an LLM key is configured; 'off' disables.
+QUANT_LLM_REVIEWS = os.environ.get('QUANT_LLM_REVIEWS', 'auto')
+QUANT_LLM_MAX_REVIEWS = int(os.environ.get('QUANT_LLM_MAX_REVIEWS', '25'))
+
 
 def llm_available() -> bool:
     """True when an implemented LLM backend is configured.

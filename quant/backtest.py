@@ -273,6 +273,17 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                          f'backtest of it is meaningless.')
     start = pd.to_datetime(start).date()
     end = pd.to_datetime(end or date.today()).date()
+    meta_notes: list[str] = []
+    if strategy.is_meta:
+        # Only the families whose data reaches back to `start` take part,
+        # for the whole run; forward-only votes (the AI review) never do.
+        strategy, meta_notes = AV.meta_members_at(strategy, start,
+                                                  spec.preset or 'SPY')
+        if len(strategy.components) < 2:
+            raise DegradedBacktest(
+                f'{strategy.name}: fewer than two strategy families are '
+                f'backtestable from {start}: ' + '; '.join(meta_notes))
+        strategy_key = strategy
     rebalance = rebalance or ST.HORIZONS[strategy.horizon]['rebalance']
     n_holdings = n_holdings or ST.HORIZONS[strategy.horizon]['default_holdings']
     cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
@@ -395,6 +406,10 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     metrics['n_rebalances'] = len(dates)
     metrics['avg_holdings'] = n_holdings
     metrics['execution_lag'] = lag
+    if strategy.is_meta:
+        metrics['families_used'] = ', '.join(strategy.components)
+        if meta_notes:
+            metrics['families_note'] = '; '.join(meta_notes)
 
     ic_series = pd.Series(dtype=float)
     if ics:

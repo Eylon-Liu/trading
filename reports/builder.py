@@ -18,6 +18,7 @@ Monthly → what happened *this month*: which strategies called it right,
 from __future__ import annotations
 
 import html as html_lib
+import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -71,6 +72,14 @@ def _all_strategy_keys() -> list[str]:
     except Exception:  # noqa: BLE001
         pass
     return keys
+
+
+def _is_meta(key: str) -> bool:
+    """True for a strategy built from other strategies (the consensus)."""
+    try:
+        return bool(ST.get(key).is_meta)
+    except Exception:                              # noqa: BLE001
+        return False
 
 
 def _is_avoid(key: str) -> bool:
@@ -229,6 +238,7 @@ def _gather_cross_strategy(as_of: date, compare_days: int = 1,
     prior_dates: set[date] = set()
 
     avoid_rows: list[pd.DataFrame] = []
+    consensus_run = pd.DataFrame()
     for key in _all_strategy_keys():
         run = _latest_run(key, as_of, spec_json)
         if run is None:
@@ -238,6 +248,13 @@ def _gather_cross_strategy(as_of: date, compare_days: int = 1,
             continue
         scores = _run_scores(run['run_id'])
         if scores.empty:
+            continue
+        if _is_meta(key):
+            # The consensus is itself a count of agreement; counting it as
+            # one more voter would double-count every strategy inside it.
+            top = scores.head(25).copy()
+            top['strategy_name'] = _strategy_name(key)
+            consensus_run = top
             continue
         if _is_avoid(key):
             # An avoid list ranks the worst names first. Counting its top 20
@@ -350,6 +367,7 @@ def _gather_cross_strategy(as_of: date, compare_days: int = 1,
         'data_through': max(s['run_date'] for s in strategies_used),
         'avoid': (pd.concat(avoid_rows, ignore_index=True)
                   if avoid_rows else pd.DataFrame()),
+        'consensus_run': consensus_run,
     }
 
     # DOD / MOM consensus changes — only compare strategies present on
@@ -477,7 +495,7 @@ def _monthly_stability(as_of: date,
     window_start = as_of - timedelta(days=35)
     results = []
     for key in _all_strategy_keys():
-        if _is_avoid(key):
+        if _is_avoid(key) or _is_meta(key):
             continue
         runs = db.read_sql("""
             SELECT run_id, as_of FROM runs
@@ -539,6 +557,21 @@ def _safe(fn, default=None):
     except Exception as exc:                       # noqa: BLE001
         log.warning('report section skipped: %s: %s', type(exc).__name__, exc)
         return default
+
+
+def _recent_reviews(since: date, as_of: date, held: list[str],
+                    watch: list[str]) -> pd.DataFrame:
+    """LLM reviews written since `since`; your names first, then by score."""
+    rv = db.read_sql("""
+        SELECT * FROM llm_reviews WHERE assessed_on BETWEEN :lo AND :hi
+        ORDER BY assessed_on DESC
+    """, {'lo': str(since), 'hi': str(as_of)}, parse_dates=['filed', 'assessed_on'])
+    if rv.empty:
+        return rv
+    mine = set(held) | set(watch)
+    rv['_mine'] = ~rv['ticker'].isin(mine)
+    rv['_abs'] = -rv['score'].abs()
+    return rv.sort_values(['_mine', '_abs']).drop(columns=['_mine', '_abs'])
 
 
 def _first_session_of_week(d: date) -> bool:
@@ -699,10 +732,23 @@ def digest_window(as_of: date, now: datetime | None = None
 
 def _current_picks(as_of: date, spec_json: str | None,
                    min_agree: int = 2, limit: int = 25) -> list[str]:
-    """Consensus names from the latest stored runs — no re-screening."""
+    """
+    Current picks from the latest stored runs — no re-screening.
+
+    The multi-strategy consensus, when it has a run: names with at least
+    `min_agree` family votes. Otherwise names in `min_agree` top-20 lists.
+    """
+    meta = next((k for k in _all_strategy_keys() if _is_meta(k)), None)
+    if meta:
+        run = _latest_run(meta, as_of, spec_json)
+        if run is not None:
+            sc = _run_scores(run['run_id'])
+            picked = sc[sc['signal_score'] >= min_agree]
+            if not picked.empty:
+                return picked.head(limit)['ticker'].tolist()
     rows = []
     for key in _all_strategy_keys():
-        if _is_avoid(key):
+        if _is_avoid(key) or _is_meta(key):
             continue
         run = _latest_run(key, as_of, spec_json)
         if run is None:
@@ -1105,6 +1151,72 @@ def _render_earnings(er: pd.DataFrame | None, held: set | None = None,
             'cadence (8-K Item 2.02) and can be off by days.</p>')
 
 
+def _render_consensus(cons: pd.DataFrame | None, held: set | None = None,
+                      watch: set | None = None) -> str:
+    """The multi-strategy consensus: names several families agree on."""
+    if cons is None or cons.empty:
+        return ''
+    held, watch = held or set(), watch or set()
+    top = cons[cons['signal_score'] >= 2]
+    if top.empty:
+        return ('<h2>🏆 Multi-strategy consensus</h2><p class="muted">No name has '
+                'two or more strategy families agreeing today.</p>')
+    rows = []
+    for _i, r in top.head(15).iterrows():
+        tag = ('<span class="tag neg">held</span>' if r['ticker'] in held else
+               '<span class="tag">watch</span>' if r['ticker'] in watch else '')
+        rows.append(
+            f'<tr><td class="tk">{_esc(r["ticker"])}</td><td>{tag}</td>'
+            f'<td>{_esc(r.get("sector") or "")}</td>'
+            f'<td>{_esc(r["signal"])}</td>'
+            f'<td class="muted" style="font-size:.74rem">{_esc(r.get("reasons") or "")}</td></tr>')
+    return ('<h2>🏆 Multi-strategy consensus</h2>'
+            '<p class="muted" style="margin-top:0">Names that independent strategy '
+            'families rank in their top 20% at once. Correlated strategies vote '
+            'once per family; the avoid list costs a vote. ✓ = this family votes '
+            'for it, with its percentile.</p>'
+            '<table><thead><tr><th>Ticker</th><th></th><th>Sector</th><th>Agreement</th>'
+            f'<th>Families</th></tr></thead><tbody>{"".join(rows)}</tbody></table>')
+
+
+def _render_reviews(rv: pd.DataFrame | None, held: set | None = None,
+                    watch: set | None = None,
+                    title: str = '🧠 AI earnings reviews') -> str:
+    """New LLM reviews of results releases."""
+    if rv is None or rv.empty:
+        return ''
+    held, watch = held or set(), watch or set()
+    colour = {'buy': 'pos', 'accumulate': 'pos', 'avoid': 'neg'}
+    parts = [f'<h2>{title}</h2><div class="card">'
+             '<p class="muted" style="margin-top:0">A language model read each '
+             'release with the computed figures and judged it for a 6–18 month '
+             'holder. Opinion, not data — it feeds the AI review vote and the AI '
+             'Earnings strategy, and its record is graded live.</p>']
+    for _i, r in rv.head(12).iterrows():
+        try:
+            extra = json.loads(r.get('detail_json') or '{}')
+        except (TypeError, ValueError):
+            extra = {}
+        tag = (' <span class="tag neg">held</span>' if r['ticker'] in held else
+               ' <span class="tag">watch</span>' if r['ticker'] in watch else '')
+        verdict = str(r.get('verdict') or '').lower()
+        pros = '; '.join(extra.get('positives') or [])
+        cons = '; '.join(extra.get('negatives') or [])
+        parts.append(
+            f'<div class="art"><span class="tk">{_esc(r["ticker"])}</span>{tag} '
+            f'<span class="tag {colour.get(verdict, "")}">{_esc(verdict.upper())}</span>'
+            f'<span class="muted">score {r["score"]:+.1f} · {_esc(r.get("conviction"))} '
+            f'conviction · guidance {_esc(r.get("guidance"))} · valuation '
+            f'{_esc(r.get("valuation_view"))}</span>'
+            f'<div class="sum">{_esc(r.get("summary") or "")}</div>'
+            + (f'<div class="meta">＋ {_esc(pros)}</div>' if pros else '')
+            + (f'<div class="meta">－ {_esc(cons)}</div>' if cons else '')
+            + f'<div class="meta">results filed {_fmt_day(r["filed"])} · '
+              f'{_esc(r.get("model") or "")}</div></div>')
+    parts.append('</div>')
+    return ''.join(parts)
+
+
 def _render_avoid(av: pd.DataFrame | None, held: set | None = None,
                   picks: set | None = None, watch: set | None = None) -> str:
     """Names the avoid-list strategies flag, with any overlap called out."""
@@ -1206,6 +1318,12 @@ def render_daily(payload: dict, news_df: pd.DataFrame | None = None,
         parts.append('<h2>News on your names (last 3 days)</h2><div class="card">')
         parts.extend(_article_html(r) for _i, r in watch_news.iterrows())
         parts.append('</div>')
+    parts.append(_render_consensus(payload.get('consensus_run'),
+                                   payload.get('earnings_held'),
+                                   payload.get('earnings_watch')))
+    parts.append(_render_reviews(payload.get('reviews'),
+                                 payload.get('earnings_held'),
+                                 payload.get('earnings_watch')))
     parts.append(_render_earnings(payload.get('earnings'),
                                   payload.get('earnings_held'),
                                   payload.get('earnings_watch')))
@@ -1238,7 +1356,7 @@ def render_daily(payload: dict, news_df: pd.DataFrame | None = None,
         top = consensus[consensus['n_strategies'] >= 2].head(25).copy()
         if not top.empty:
             ret_1d = payload.get('returns_1d')
-            parts.append('<h2>Consensus picks (2+ strategies agree)</h2>')
+            parts.append('<h2>Strategy overlap (2+ strategies rank it top 20)</h2>')
             head = ('<tr><th>Ticker</th><th>Sector</th>'
                     '<th># Agree</th><th>Avg rank</th><th>Best rank</th>'
                     '<th>1D return</th><th>Signals</th><th>Agreement</th></tr>')
@@ -1742,6 +1860,8 @@ def render_news_digest(d: dict) -> str:
         }))
 
     parts.append(_render_policy(policy))
+    parts.append(_render_reviews(d.get('reviews'), set(d.get('held') or []),
+                                 set(d['watchlist'])))
     parts.append(_render_earnings(d.get('earnings'), title='📅 Reporting soon'))
 
     if not news.empty:
@@ -1838,6 +1958,9 @@ def build_report(strategy: str | None = None, kind: str = 'daily',
         digest['earnings'] = _safe(lambda: ER.upcoming(
             sorted(set(watchlist) | set(held_names) | set(digest['picks'])),
             as_of, days=10))
+        digest['held'] = held_names
+        digest['reviews'] = _safe(lambda: _recent_reviews(
+            digest['start'].date(), as_of, held_names, watchlist), pd.DataFrame())
         html_out = render_news_digest(digest)
         period_start = digest['last_session']
         filename = f'news_digest_{as_of}.html'
@@ -1875,6 +1998,9 @@ def build_report(strategy: str | None = None, kind: str = 'daily',
                     sorted(set(followed) | set(consensus_top)), as_of, days=14))
                 payload['earnings_held'] = set(held_names)
                 payload['earnings_watch'] = set(watchlist)
+                payload['reviews'] = _safe(lambda: _recent_reviews(
+                    MC.previous_trading_day(as_of), as_of, held_names, watchlist),
+                    pd.DataFrame())
                 snap = _safe(lambda: MACRO.snapshot(as_of), pd.DataFrame())
                 payload['macro'] = snap
                 payload['regime'] = _safe(lambda: MACRO.regime(as_of, snap), [])

@@ -197,7 +197,43 @@ ANTHROPIC_API_KEY=...     # needs: pip install anthropic
 | **Compare** | What changed between two run dates, and which factors drove the rotation |
 | **Data** | Whether the layer is live, and on which backend |
 
-**It never changes a score, a rank, or a trade level.** Those stay deterministic and reproducible from the formulas in the Methodology tab — the model is handed *computed* figures and asked to interpret them, so a hallucination can mislead a reader but cannot corrupt a backtest. Every panel is labelled with the model that wrote it.
+**The commentary panels never change a score, a rank, or a trade level.** Those stay deterministic and reproducible from the formulas in the Methodology tab — the model is handed *computed* figures and asked to interpret them, so a hallucination can mislead a reader but cannot corrupt a backtest. Every panel is labelled with the model that wrote it.
+
+**The one place AI does enter scoring is opt-in and dated:** the *earnings reviews* below feed the `LLM_EARNINGS_VIEW` factor, which only the AI Earnings Review strategy and one vote of the Multi-Strategy Consensus use. Every other strategy is untouched.
+
+### AI earnings reviews
+
+For each new results filing (8-K Item 2.02) the press release is pulled from EDGAR and read by the configured model together with the computed figures — growth, margins, ROIC, valuation yields, the market's reaction, the consensus EPS estimate and recent headlines. It answers one question for a 6–18 month holder, *is this worth buying?*, as structured JSON: verdict (buy / accumulate / hold / avoid), score −2…+2, conviction, guidance direction, valuation view, and its positives and negatives. The daily brief and the weekend digest show new reviews, your names first.
+
+```bash
+python3 cli.py review --run         # review new results filings (the routine does this daily)
+python3 cli.py review AAPL NVDA     # show stored reviews
+```
+
+Reviews are **dated the day they are written and never back-dated**. A model asked today about a 2023 quarter already knows how the stock did afterwards, so a back-dated review would leak the future into any backtest. The factor therefore has history only from the day the routine started, and whether it adds anything is answered by `python3 cli.py track`, not by a backtest. Cost is bounded: one call per filing, your portfolio and watchlist first, at most `QUANT_LLM_MAX_REVIEWS` (25) per run.
+
+### Multi-strategy consensus — and a test of it
+
+`consensus` ranks names by how many **independent strategy families** put them in their top 20% at once:
+
+| Family | Strategies (vote together, once) |
+|---|---|
+| Quality & value | Buffett Quality, Total Shareholder Yield |
+| Momentum & trend | Quality Momentum, Momentum + Trend, Low-Vol Relative Strength |
+| Insider buying | Insider Conviction, Insider Cluster Buying |
+| Earnings reaction | Post-Earnings Drift |
+| AI earnings review | +1 at a view of +1 or better, −1 at −1 or worse |
+
+Grouping matters: three momentum variants agreeing is one opinion said three times. A screen's hard filter excluding the name counts as a "no"; a name on the Deteriorating Quality avoid list loses a vote; a name needs at least two families scoring it to be ranked. The daily brief shows it as **🏆 Multi-strategy consensus**.
+
+Whether agreement actually predicts returns is an empirical question, so it comes with a test:
+
+```bash
+python3 cli.py consensus-test --start 2021-01-01            # study + backtest
+python3 cli.py consensus-test --start 2021-01-01 --compare  # …next to every member strategy
+```
+
+The **agreement study** groups every ranked name at each date by how many families agreed, and reports its forward return versus SPY (3 months by default), hit rate, and the rank correlation between votes and returns — then says plainly whether more agreement meant higher returns on your universe. The **backtest** runs the consensus walk-forward with the same execution rules as every other strategy. Families whose data does not reach back to `--start` are left out for the whole run, and the AI vote is never part of a backtest.
 
 The app is fully functional without a key: every panel degrades to a stated reason rather than a blank space, and a missing key, an expired key, a rate limit, a network failure and a safety refusal are each handled and logged distinctly.
 
@@ -333,6 +369,8 @@ rate Sell/Avoid.
 python3 cli.py track       # live track record: what each strategy's stored picks did next
 python3 cli.py earnings    # upcoming reports for your names (--index SPY for all)
 python3 cli.py macro       # rates, credit, VIX and regime flags
+python3 cli.py review      # AI earnings reviews (--run to write new ones)
+python3 cli.py consensus-test --start 2021-01-01   # does agreement predict returns?
 ```
 
 The **live track record** is the honest counterpart to a backtest: every

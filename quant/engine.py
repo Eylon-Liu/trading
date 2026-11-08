@@ -452,23 +452,36 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                          pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report)
 
-    eligible = apply_filters(raw, strategy)
-    if len(eligible) == 0:
-        log.warning('all %d names filtered out by %s gates', len(raw), strategy.key)
-        return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
-                         sync_report)
-    log.info('filters: %d/%d names eligible', len(eligible), len(raw))
+    if strategy.is_meta:
+        # Agreement between other strategies, scored on this same factor
+        # frame — the members are re-ranked here, not read from stored runs,
+        # so a backtest date sees only what each member could see then.
+        from quant import consensus as CONS
+        raw_eligible = raw
+        scores, detail, warnings = CONS.score(raw, strategy, as_of)
+        if scores.empty:
+            return RunResult(str(uuid.uuid4()), as_of, strategy,
+                             pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+                             universe, sync_report, warnings)
+        scores = CONS.signals(scores, strategy)
+    else:
+        eligible = apply_filters(raw, strategy)
+        if len(eligible) == 0:
+            log.warning('all %d names filtered out by %s gates', len(raw), strategy.key)
+            return RunResult(str(uuid.uuid4()), as_of, strategy,
+                             pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                             sync_report)
+        log.info('filters: %d/%d names eligible', len(eligible), len(raw))
 
-    raw_eligible = raw.loc[eligible]
-    scores, detail, warnings = score_universe(raw_eligible, strategy, as_of)
-    if scores.empty:
-        return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
-                         sync_report, warnings)
+        raw_eligible = raw.loc[eligible]
+        scores, detail, warnings = score_universe(raw_eligible, strategy, as_of)
+        if scores.empty:
+            return RunResult(str(uuid.uuid4()), as_of, strategy,
+                             pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                             sync_report, warnings)
 
-    scores = generate_signals(scores, raw_eligible, strategy.horizon,
-                              invert=strategy.invert)
+        scores = generate_signals(scores, raw_eligible, strategy.horizon,
+                                  invert=strategy.invert)
     scores = scores.dropna(subset=['composite'])
     scores['rank'] = range(1, len(scores) + 1)
 
@@ -549,7 +562,11 @@ def _persist(run_id: str, as_of: date, spec: UniverseSpec,
             'run_id': run_id, 'as_of': as_of, 'strategy': strategy.key,
             'universe_spec_json': spec_json,
             'universe_tickers': ','.join(universe),
-            'params_json': json.dumps(strategy.weights),
+            'params_json': json.dumps(
+                strategy.weights if not strategy.is_meta else {
+                    'components': {k: list(v) for k, v in strategy.components.items()},
+                    'factor_votes': strategy.factor_votes,
+                    'veto': list(strategy.veto), 'vote_pct': strategy.vote_pct}),
             'universe_n': len(universe), 'created_at': config.utc_now(),
         }], conn=conn)
 

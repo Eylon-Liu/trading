@@ -58,7 +58,7 @@ def layout() -> html.Div:
             dbc.Row([
                 dbc.Col([
                     C.label('Start from'),
-                    dcc.Dropdown(id='bld-source', options=ST.options(),
+                    dcc.Dropdown(id='bld-source', options=ST.options(include_meta=False),
                                  value='buffett', clearable=False),
                 ], lg=5, md=6, className='mb-2'),
                 dbc.Col([

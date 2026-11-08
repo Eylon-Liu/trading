@@ -472,6 +472,10 @@ def cmd_daily(args) -> int:
             print(f'⚠️  ingest failed ({type(exc).__name__}: {exc}) — '
                   f'continuing with stored data')
 
+    # ── 1b. AI earnings reviews of new results filings ───────────
+    if not args.no_llm:
+        _run_reviews(index, watch, held, spec)
+
     # ── 2. screen ────────────────────────────────────────────────
     failed: list[str] = []
     if kind != 'news' and not args.skip_screens:
@@ -741,6 +745,153 @@ def cmd_earnings(args) -> int:
     return 0
 
 
+def _run_reviews(index: str, watch: list[str], held: list[str], spec) -> int:
+    """Review new results filings; your names first, then current picks."""
+    from data import members
+    from nlp import earnings_review as ERV
+    from reports import builder
+    if not ERV.enabled():
+        return 0
+    try:
+        universe = sorted(set(members.latest_members(index)) | set(watch) | set(held))
+        picks = builder._current_picks(date.today(), spec.to_json())
+        done = ERV.review_recent(tickers=universe,
+                                 priority=list(held) + list(watch) + picks,
+                                 progress=lambda m: print(f'  ▸ {m}'))
+    except Exception as exc:                       # noqa: BLE001
+        print(f'⚠️  AI reviews skipped: {type(exc).__name__}: {exc}')
+        return 0
+    if done:
+        print(f'🧠  {len(done)} new AI earnings review(s): '
+              + ', '.join(f'{r["ticker"]} {r["verdict"]}' for r in done))
+    return len(done)
+
+
+def cmd_review(args) -> int:
+    """Run (or list) AI earnings reviews of recent results filings."""
+    from data import members
+    from nlp import earnings_review as ERV
+    from nlp import providers
+    from quant import portfolio as PF
+    db.init_db()
+    if args.run:
+        if not ERV.enabled():
+            print('❌  no LLM configured — set GEMINI_API_KEY or ANTHROPIC_API_KEY '
+                  'in .env (or QUANT_LLM_REVIEWS is off)')
+            return 1
+        names = [t.upper() for t in args.tickers] or sorted(
+            set(members.latest_members(args.index.upper())) | set(PF.watchlist())
+            | set(PF.lots('open')['ticker']))
+        todo = ERV.pending(tickers=names, lookback_days=args.days)
+        print(f'▸ {len(todo)} results filing(s) without a review in the last '
+              f'{args.days} days · model {providers.model_name()}')
+        done = ERV.review_recent(tickers=names, lookback_days=args.days,
+                                 max_reviews=args.max,
+                                 priority=list(PF.lots('open')['ticker']) + PF.watchlist(),
+                                 progress=lambda m: print(f'  ▸ {m}'))
+        print(f'✅  {len(done)} review(s) written')
+    rv = ERV.latest_reviews([t.upper() for t in args.tickers] or None,
+                            days=args.days if not args.run else 120)
+    if rv.empty:
+        print('no reviews stored yet' + ('' if args.run else
+              ' — run `python cli.py review --run`'))
+        return 0
+    for _i, r in rv.head(40).iterrows():
+        print(f'{r["ticker"]:6} {r["verdict"]:10} score {r["score"]:+.1f} '
+              f'({r["conviction"]})  guidance {r["guidance"]:9}  '
+              f'filed {r["filed"].date()}  · {r["summary"][:110]}')
+    return 0
+
+
+def cmd_consensus_test(args) -> int:
+    """
+    Does agreement between strategy families predict returns? Two answers:
+    the agreement study (forward excess return by number of agreeing
+    families) and a walk-forward backtest of the consensus, optionally next
+    to each of its member strategies.
+    """
+    import numpy as np
+
+    from data.universe import parse_spec
+    from quant import availability as AV
+    from quant import backtest as BT
+    from quant import consensus as CONS
+    from quant import strategies as ST
+
+    db.init_db()
+    spec = parse_spec(args.universe or config.QUANT_INDEX)
+    start = pd.to_datetime(args.start).date()
+    strat, notes = AV.meta_members_at('consensus', start, spec.preset or 'SPY')
+    print(f'▸ consensus on {spec.describe()} from {start}')
+    print(f'  families: {", ".join(strat.components) or "none"}')
+    for n in notes:
+        print(f'  note: {n}')
+    if len(strat.components) < 2:
+        print('❌  fewer than two strategy families have data from this start '
+              'date — pick a later --start or ingest more history')
+        return 1
+
+    print(f'\n▸ agreement study: {args.horizon}-month forward return vs SPY, '
+          f'sampled {"monthly" if args.freq == "ME" else "quarterly"}')
+    study = CONS.agreement_study(spec, start, args.end, args.horizon,
+                                 freq=args.freq, strategy_key=strat,
+                                 progress=(lambda m: print(f'  ▸ {m}'))
+                                 if args.verbose else None)
+    b = study['buckets']
+    if b.empty:
+        print('  no dates with enough data')
+    else:
+        view = b[['label', 'mean_excess', 'median_excess', 'hit_rate',
+                  'names', 'periods']].copy()
+        for c in ('mean_excess', 'median_excess', 'hit_rate'):
+            view[c] = view[c].map(lambda v: f'{v:+.2%}' if c != 'hit_rate' else f'{v:.0%}')
+        print(view.to_string(index=False))
+        ic = study['agreement_ic']
+        print(f'\n  agreement IC (Spearman, votes vs forward excess): {ic:+.3f} '
+              f'over {study["dates"]} dates, positive on '
+              f'{study["agreement_ic_hit"]:.0%} of them')
+        ordered = b[b['bucket'] >= 0].sort_values('bucket')['mean_excess'].tolist()
+        rising = len(ordered) > 2 and all(x <= y for x, y in zip(ordered, ordered[1:]))
+        if np.isfinite(ic) and ic > 0.02 and rising:
+            print('  ✅ more agreement meant higher returns, step by step')
+        elif np.isfinite(ic) and ic > 0:
+            print('  🟡 weakly positive — agreement helped on average but not '
+                  'monotonically; treat as a tilt, not a rule')
+        else:
+            print('  ❌ agreement did not predict returns on this universe/window')
+
+    print('\n▸ walk-forward backtest (quarterly rebalance, next-close fills)')
+    keys = [strat] + ([k for fam in strat.components.values() for k in fam]
+                      if args.compare else [])
+    rows = []
+    for k in keys:
+        name = k.name if hasattr(k, 'name') else ST.get(k).name
+        try:
+            if (ST.get(k).horizon == 'mid'):
+                res = BT.run_trade_backtest(spec, k, start, args.end, n_positions=10)
+            else:
+                res = BT.run_backtest(spec, k, start, args.end, n_holdings=args.top,
+                                      rebalance='Q')
+        except (ValueError, BT.DegradedBacktest) as exc:
+            rows.append({'strategy': name, 'note': str(exc)[:70]})
+            continue
+        m = res.metrics
+        rows.append({'strategy': name, 'cagr': m.get('cagr'),
+                     'vs_spy': m.get('excess_cagr'), 'sharpe': m.get('sharpe'),
+                     'max_dd': m.get('max_drawdown'), 'mean_ic': m.get('mean_ic')})
+    out = pd.DataFrame(rows)
+    for c in ('cagr', 'vs_spy', 'max_dd'):
+        if c in out:
+            out[c] = out[c].map(lambda v: f'{v:+.1%}' if isinstance(v, float) and v == v else '—')
+    for c in ('sharpe', 'mean_ic'):
+        if c in out:
+            out[c] = out[c].map(lambda v: f'{v:+.2f}' if isinstance(v, float) and v == v else '—')
+    print(out.fillna('').to_string(index=False))
+    print('\nThe AI review vote is forward-only and is not part of any backtest; '
+          'its value shows up in `python cli.py track`.')
+    return 0
+
+
 def cmd_macro(args) -> int:
     from data import macro
     db.init_db()
@@ -834,6 +985,8 @@ def build_parser() -> argparse.ArgumentParser:
     dly.add_argument('--skip-screens', action='store_true')
     dly.add_argument('--backup', action='store_true',
                      help='back up the database afterwards (keeps 5)')
+    dly.add_argument('--no-llm', action='store_true',
+                     help='skip the AI earnings reviews this run')
     dly.add_argument('--dry-run', action='store_true',
                      help='print what would happen and exit')
     dly.set_defaults(func=cmd_daily)
@@ -891,6 +1044,30 @@ def build_parser() -> argparse.ArgumentParser:
     mc = sub.add_parser('macro', help='rates, credit, VIX and regime flags (FRED)')
     mc.add_argument('--refresh', action='store_true', help='fetch from FRED first')
     mc.set_defaults(func=cmd_macro)
+
+    rv = sub.add_parser('review', help='AI earnings reviews of recent results filings')
+    rv.add_argument('tickers', nargs='*', help='limit to these tickers')
+    rv.add_argument('--run', action='store_true',
+                    help='review filings that have none yet (otherwise just list)')
+    rv.add_argument('--days', type=int, default=10, help='filings from the last N days')
+    rv.add_argument('--max', type=int, default=None,
+                    help='cap on new reviews (default QUANT_LLM_MAX_REVIEWS)')
+    rv.add_argument('--index', default=config.QUANT_INDEX)
+    rv.set_defaults(func=cmd_review)
+
+    ct = sub.add_parser('consensus-test',
+                        help='does multi-strategy agreement predict returns? '
+                             '(agreement study + backtest)')
+    ct.add_argument('--universe', help=f'default QUANT_INDEX ({config.QUANT_INDEX})')
+    ct.add_argument('--start', default=str(date.today() - timedelta(days=365 * 4)))
+    ct.add_argument('--end')
+    ct.add_argument('--horizon', type=int, default=3, help='forward months')
+    ct.add_argument('--freq', default='QE', choices=['ME', 'QE'],
+                    help='sampling: ME monthly, QE quarterly')
+    ct.add_argument('--top', type=int, default=20, help='holdings in the backtest')
+    ct.add_argument('--compare', action='store_true',
+                    help='also backtest every member strategy for comparison')
+    ct.set_defaults(func=cmd_consensus_test)
 
     sch = sub.add_parser('schedule',
                          help='print an ingest schedule matched to each source')

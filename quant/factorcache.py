@@ -66,14 +66,22 @@ def data_version() -> str:
                    (SELECT COUNT(*) FROM securities)           AS ns,
                    (SELECT COUNT(*) FROM profile_snapshots)    AS nps,
                    (SELECT MAX(snapshot_date) FROM profile_snapshots) AS mps,
-                   (SELECT MAX(rowid) FROM splits)             AS rs
+                   (SELECT MAX(rowid) FROM splits)             AS rs,
+                   (SELECT COUNT(*) FROM corporate_events)     AS ne,
+                   (SELECT COUNT(*) FROM attention)            AS na,
+                   (SELECT COUNT(*) FROM llm_reviews)          AS nl,
+                   (SELECT MAX(rowid) FROM llm_reviews)        AS rl
         """)
         if row.empty:
             return 'unknown'
         r = row.iloc[0]
+        # Every table a factor reads must move the version. 8-K events,
+        # pageviews and LLM reviews were missing, so a filing ingested
+        # without a price change left event factors served from cache.
         return (f"{r['nf']}:{r['mf']}:{r['np']}:{r['mp']}"
                 f":{r['ni']}:{r['ns']}:{r['nps']}:{r['mps']}"
-                f":{r['rf']}:{r['rp']}:{r['rs']}")
+                f":{r['rf']}:{r['rp']}:{r['rs']}"
+                f":{r['ne']}:{r['na']}:{r['nl']}:{r['rl']}")
     except Exception as exc:                       # noqa: BLE001
         # Without a version we cannot prove freshness, so make the key unique
         # and effectively bypass the cache rather than risk a stale hit.
