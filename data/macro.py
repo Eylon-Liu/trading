@@ -76,15 +76,18 @@ def parse_api(payload: dict) -> pd.DataFrame:
     return out.dropna()
 
 
-def fetch_series(series_id: str, start: date) -> pd.DataFrame:
+def fetch_series(series_id: str, start: date) -> pd.DataFrame | None:
+    """Observations from `start`; None when FRED did not answer."""
     if config.FRED_API_KEY:
         payload = http.fetch_json(API_URL, category='macro', params={
             'series_id': series_id, 'api_key': config.FRED_API_KEY,
-            'file_type': 'json', 'observation_start': str(start)})
-        return parse_api(payload) if payload else pd.DataFrame(columns=['date', 'value'])
+            'file_type': 'json', 'observation_start': str(start)},
+            timeout=20, retries=2)
+        return parse_api(payload) if payload is not None else None
     text = http.fetch_text(CSV_URL, category='macro',
-                           params={'id': series_id, 'cosd': str(start)})
-    return parse_csv(text or '', series_id)
+                           params={'id': series_id, 'cosd': str(start)},
+                           timeout=20, retries=2)
+    return parse_csv(text, series_id) if text is not None else None
 
 
 def update_macro(series: list[str] | None = None) -> int:
@@ -93,7 +96,7 @@ def update_macro(series: list[str] | None = None) -> int:
     last = db.read_sql('SELECT series_id, MAX(date) AS d FROM macro GROUP BY series_id')
     newest = dict(zip(last['series_id'], pd.to_datetime(last['d']).dt.date)) \
         if not last.empty else {}
-    written = 0
+    written, failures = 0, 0
     for sid in series:
         start = newest.get(sid)
         # Re-read a couple of weeks: FRED revises recent prints.
@@ -102,7 +105,20 @@ def update_macro(series: list[str] | None = None) -> int:
             df = fetch_series(sid, start)
         except Exception as exc:                   # noqa: BLE001
             log.warning('FRED %s failed: %s', sid, exc)
+            df = None
+        if df is None:
+            # The keyless CSV endpoint sometimes accepts the connection and
+            # never answers. With the default 30s x 4 retries per series that
+            # held the morning email for over ten minutes; two failures in a
+            # row now end the refresh and stored values are used instead.
+            failures += 1
+            if failures >= 2 and written == 0:
+                log.warning('FRED is not answering — skipping the macro '
+                            'refresh (set FRED_API_KEY for the JSON API)')
+                db.record_ingest('macro', 'fred', error='FRED not answering')
+                return 0
             continue
+        failures = 0
         if df.empty:
             continue
         written += db.upsert(db.macro, [

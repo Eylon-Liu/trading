@@ -276,3 +276,13 @@ def test_yahoo_is_skipped_for_names_nasdaq_listed(fresh_db, monkeypatch):
     ER.update_earnings(['AAPL'], followed=['AAPL'])
     assert asked == []
     assert ER.upcoming(['AAPL'], days=10)['time'].tolist() == ['amc']
+
+
+def test_unresponsive_fred_is_abandoned_quickly(fresh_db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(config, 'FRED_API_KEY', None)
+    monkeypatch.setattr(MACRO.http, 'fetch_text',
+                        lambda *a, **k: calls.append(k) or None)
+    assert MACRO.update_macro() == 0
+    assert len(calls) == 2
+    assert all(k.get('timeout') and k.get('retries') for k in calls)
