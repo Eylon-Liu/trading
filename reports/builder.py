@@ -718,9 +718,15 @@ def digest_window(as_of: date, now: datetime | None = None
     email was missed (the machine was asleep), the window reaches back to
     the last one that went out, but never past the close.
     """
-    now = now or config.utc_now()
-    end = now if as_of >= date.today() else datetime.combine(
-        as_of + timedelta(days=1), datetime.min.time())
+    # An explicit `now` always wins. Only when none is given and `as_of` is
+    # in the past does the window close at the end of that day — otherwise a
+    # digest rebuilt the next morning reached into the following day.
+    if now is not None:
+        end = now
+    elif as_of >= date.today():
+        end = config.utc_now()
+    else:
+        end = datetime.combine(as_of + timedelta(days=1), datetime.min.time())
     last = MC.last_completed_session(end)
     close = MC.session_close(last).astimezone(timezone.utc).replace(tzinfo=None)
     lower = end - timedelta(hours=24)
