@@ -315,7 +315,16 @@ def meta_members_at(strategy, start: date, preset: str = 'SPY',
                          f'{start}' + ('' if members else ' — family left out'))
     if strat.factor_votes:
         notes.append(f'{", ".join(strat.factor_votes)} left out (forward-only)')
-    return dataclasses.replace(strat, components=kept, factor_votes={}), notes
+    # An avoid list that cannot be tested from `start` must not cast vetoes
+    # either: degraded, it flags names on whatever factors happen to remain.
+    veto = tuple(v for v in strat.veto
+                 if (w := backtest_window(v, preset, coverage=cov)).testable
+                 and w.earliest <= start)
+    for v in strat.veto:
+        if v not in veto:
+            notes.append(f'veto {v} not testable from {start} — left out')
+    return dataclasses.replace(strat, components=kept, factor_votes={},
+                               veto=veto), notes
 
 
 def report(preset: str = 'SPY') -> pd.DataFrame:

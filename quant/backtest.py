@@ -161,7 +161,12 @@ def _preload(spec: UniverseSpec, start: date, end: date,
     if not facts.empty:
         facts = adjust_shares_for_splits(facts, splits)
     lookback = int(config.TRADING_DAYS['3Y'] * 1.6)
-    ohlc = yahoo.bulk_ohlc(names, start=start - timedelta(days=lookback), end=end)
+    # The benchmark rides along: BETA, IDIO_VOL and EARNINGS_REACTION are all
+    # measured against it. Loading only the universe left those factors empty
+    # in every backtest — silently, for the mid-term path, which never ran
+    # the degraded-run check.
+    ohlc = yahoo.bulk_ohlc(sorted(set(names) | {config.BENCHMARK_TICKER}),
+                           start=start - timedelta(days=lookback), end=end)
     insiders = sec.insiders_asof(names, end,
                                  lookback_days=(end - start).days + 180) \
         if names else pd.DataFrame()
@@ -730,7 +735,8 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
                        params: TP.PlanParams | None = None,
                        cost_bps: float | None = None,
                        fill_window: int = 5,
-                       max_gross_pct: float = 100.0) -> BacktestResult:
+                       max_gross_pct: float = 100.0,
+                       strict: bool = True) -> BacktestResult:
     """
     Backtest a mid-term strategy honouring its own entry and exit rules.
 
@@ -738,6 +744,10 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     orders for the following sessions and the portfolio is simulated bar by
     bar (see `simulate_trades`). Gross exposure never exceeds `max_gross_pct`
     of equity, and a name already held or on order is not bought again.
+
+    `strict` refuses a scan date where the strategy's factors are missing,
+    exactly as the long-horizon backtest does; without it a strategy that
+    had lost half its weight was reported under its own name.
     """
     strategy = ST.get(strategy_key)
     if strategy.invert:
@@ -763,11 +773,17 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     sessions = bars['close'].index
     scan_pos = rebalance_positions(sessions, 'M')
 
+    _require_honest_window(spec, strategy_key, start, strict)
     scorer = _Scorer(spec, strategy_key, pre)
     signals: dict = {}
     for p in scan_pos:
         d0 = sessions[p]
         result = scorer.run(d0.date(), n_positions, plan_params=params)
+        if strict and result.degraded:
+            raise DegradedBacktest(
+                f'{strategy.key} cannot be honestly backtested at {d0.date()}: '
+                + '; '.join(result.warnings)
+                + '  (pass strict=False to measure the degraded variant anyway)')
         if result.plans.empty:
             continue
         order = [t for t in result.scores.index if t in result.plans.index]

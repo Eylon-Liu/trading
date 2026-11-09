@@ -311,7 +311,7 @@ def test_consensus_test_command_prints_a_verdict(fresh_db, monkeypatch, capsys):
                       factor_votes={})
     monkeypatch.setattr(AV, 'meta_members_at', lambda *a, **k: (strat, ['x dropped']))
     buckets = pd.DataFrame({'bucket': [0, 1, 2], 'mean_excess': [-0.01, 0.005, 0.02],
-                            'periods': [12, 12, 12], 'names': [300, 120, 40],
+                            'periods': [12, 12, 12], 'names': [300, 120, 60],
                             'hit_rate': [0.45, 0.5, 0.6],
                             'median_excess': [-0.01, 0.0, 0.015],
                             'label': ['0 families', '1 family', '2 families']})
@@ -328,3 +328,41 @@ def test_consensus_test_command_prints_a_verdict(fresh_db, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert 'more agreement meant higher returns' in out
     assert 'Multi-Strategy Consensus' in out and '+12.0%' in out
+
+
+def test_agreement_spread_is_paired_within_dates():
+    by_date = pd.DataFrame({
+        'date': [1, 1, 1, 2, 2, 2],
+        'votes': [0, 2, 3, 0, 2, 1],
+        'excess': [-0.02, 0.01, 0.03, 0.01, 0.00, 0.5]})
+    s = CONS.agreement_spread(by_date)
+    assert s['dates'] == 2 and s['wins'] == 1
+    assert s['mean'] == pytest.approx(((0.02 + 0.02) + (-0.01)) / 2)
+
+
+def test_untestable_veto_is_left_out_of_a_backtest(monkeypatch):
+    from quant import availability as AV
+
+    def fake_window(m, preset='SPY', coverage=None):
+        if m == 'quality_breakdown':
+            return AV.Window(m, None, date(2026, 11, 6), ['needs insider_txns'])
+        return AV.Window(m, date(2018, 1, 2), date(2026, 11, 6))
+    monkeypatch.setattr(AV, 'backtest_window', fake_window)
+    strat, notes = AV.meta_members_at('consensus', date(2020, 1, 2),
+                                      coverage=pd.DataFrame())
+    assert strat.veto == ()
+    assert any('veto quality_breakdown' in n for n in notes)
+
+
+def test_backtest_preload_includes_the_benchmark(monkeypatch):
+    from quant import backtest as BT
+    seen = {}
+    monkeypatch.setattr(BT.yahoo, 'bulk_ohlc',
+                        lambda names, **k: seen.setdefault('names', names) or (pd.DataFrame(),) * 4)
+    monkeypatch.setattr(BT.sec, 'facts_asof', lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(BT.sec, 'insiders_asof', lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(BT.sec, 'events_asof', lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(BT.yahoo, 'split_factors', lambda *a, **k: pd.DataFrame())
+    spec = SimpleNamespace(resolve=lambda d: ['AAA', 'BBB'])
+    BT._preload(spec, date(2025, 1, 2), date(2025, 6, 30))
+    assert config.BENCHMARK_TICKER in seen['names']

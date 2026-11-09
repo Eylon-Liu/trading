@@ -41,6 +41,24 @@ log = logging.getLogger(__name__)
 MIN_FAMILIES = 2
 AI_FOR, AI_AGAINST = 1.0, -1.0
 VETO_PCT = 0.90
+MIN_BUCKET_NAMES = 50          # observations a vote bucket needs to be judged
+
+
+def agreement_spread(by_date: pd.DataFrame) -> dict:
+    """
+    Per date: mean excess of names with 2+ family votes minus names with none.
+
+    A paired comparison inside each date, so a strong or weak market moves
+    both sides together and cancels. Returns {mean, wins, dates} or {}.
+    """
+    if by_date is None or by_date.empty:
+        return {}
+    hi = by_date[by_date['votes'] >= 2].groupby('date')['excess'].mean()
+    lo = by_date[by_date['votes'] == 0].groupby('date')['excess'].mean()
+    d = (hi - lo).dropna()
+    if d.empty:
+        return {}
+    return {'mean': float(d.mean()), 'wins': int((d > 0).sum()), 'dates': int(len(d))}
 
 
 def _member_percentiles(raw: pd.DataFrame, key: str, as_of

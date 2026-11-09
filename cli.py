@@ -850,7 +850,18 @@ def cmd_consensus_test(args) -> int:
         print(f'\n  agreement IC (Spearman, votes vs forward excess): {ic:+.3f} '
               f'over {study["dates"]} dates, positive on '
               f'{study["agreement_ic_hit"]:.0%} of them')
-        ordered = b[b['bucket'] >= 0].sort_values('bucket')['mean_excess'].tolist()
+        # A bucket holding a couple of names per date is noise; it is shown
+        # above but does not decide the verdict.
+        solid = b[(b['bucket'] >= 0) & (b['names'] >= CONS.MIN_BUCKET_NAMES)]
+        thin = b[(b['bucket'] >= 0) & (b['names'] < CONS.MIN_BUCKET_NAMES)]
+        if not thin.empty:
+            print(f'  ({", ".join(thin["label"])}: under {CONS.MIN_BUCKET_NAMES} '
+                  f'observations — too few to judge, left out of the verdict)')
+        spread = CONS.agreement_spread(study['by_date'])
+        if spread:
+            print(f'  2+ families vs none: {spread["mean"]:+.2%} per period on '
+                  f'average, ahead on {spread["wins"]} of {spread["dates"]} dates')
+        ordered = solid.sort_values('bucket')['mean_excess'].tolist()
         rising = len(ordered) > 2 and all(x <= y for x, y in zip(ordered, ordered[1:]))
         if np.isfinite(ic) and ic > 0.02 and rising:
             print('  ✅ more agreement meant higher returns, step by step')
