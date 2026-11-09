@@ -863,11 +863,14 @@ def cmd_consensus_test(args) -> int:
                   f'average, ahead on {spread["wins"]} of {spread["dates"]} dates')
         ordered = solid.sort_values('bucket')['mean_excess'].tolist()
         rising = len(ordered) > 2 and all(x <= y for x, y in zip(ordered, ordered[1:]))
-        if np.isfinite(ic) and ic > 0.02 and rising:
-            print('  ✅ more agreement meant higher returns, step by step')
-        elif np.isfinite(ic) and ic > 0:
-            print('  🟡 weakly positive — agreement helped on average but not '
-                  'monotonically; treat as a tilt, not a rule')
+        # Averages can be carried by a few big dates; ask for consistency too.
+        steady = bool(spread) and spread['wins'] >= 0.6 * spread['dates']
+        if np.isfinite(ic) and ic > 0.02 and rising and steady:
+            print('  ✅ more agreement meant higher returns, step by step, on most dates')
+        elif np.isfinite(ic) and ic > 0 and (rising or (spread and spread['mean'] > 0)):
+            print('  🟡 positive on average but not consistent from date to date — '
+                  'a few strong periods carry it; treat agreement as a tilt, '
+                  'not a rule')
         else:
             print('  ❌ agreement did not predict returns on this universe/window')
 

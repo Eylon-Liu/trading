@@ -302,8 +302,16 @@ def test_engine_runs_and_persists_the_consensus(fresh_db, monkeypatch):
     assert any(f.startswith('family: ') for f in detail['factor'])
 
 
-def test_consensus_test_command_prints_a_verdict(fresh_db, monkeypatch, capsys):
-    import cli
+def _by_date(wins: int, dates: int = 12) -> pd.DataFrame:
+    rows = []
+    for d in range(dates):
+        hi = 0.03 if d < wins else -0.01
+        rows += [{'date': d, 'votes': 2, 'excess': hi},
+                 {'date': d, 'votes': 0, 'excess': 0.0}]
+    return pd.DataFrame(rows)
+
+
+def _cli_study(monkeypatch, wins: int):
     from quant import availability as AV
     from quant import backtest as BT
     strat = _strategy(components={'Quality & value': ('buffett',),
@@ -317,7 +325,25 @@ def test_consensus_test_command_prints_a_verdict(fresh_db, monkeypatch, capsys):
                             'label': ['0 families', '1 family', '2 families']})
     monkeypatch.setattr(CONS, 'agreement_study', lambda *a, **k: {
         'buckets': buckets, 'agreement_ic': 0.06, 'agreement_ic_hit': 0.75,
-        'dates': 12, 'by_date': pd.DataFrame()})
+        'dates': 12, 'by_date': _by_date(wins)})
+
+
+def test_inconsistent_agreement_is_only_a_tilt(fresh_db, monkeypatch, capsys):
+    import cli
+    from quant import backtest as BT
+    _cli_study(monkeypatch, wins=5)              # positive mean, 5 of 12 dates
+    monkeypatch.setattr(BT, 'run_backtest',
+                        lambda *a, **k: SimpleNamespace(metrics={}))
+    assert cli.main(['consensus-test', '--start', '2021-01-01']) == 0
+    out = capsys.readouterr().out
+    assert 'not consistent from date to date' in out
+    assert 'ahead on 5 of 12 dates' in out
+
+
+def test_consensus_test_command_prints_a_verdict(fresh_db, monkeypatch, capsys):
+    import cli
+    from quant import backtest as BT
+    _cli_study(monkeypatch, wins=10)
     m = {'cagr': 0.12, 'excess_cagr': 0.02, 'sharpe': 0.9, 'max_drawdown': -0.2,
          'mean_ic': 0.03}
     monkeypatch.setattr(BT, 'run_backtest',
