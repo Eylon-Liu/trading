@@ -2,7 +2,7 @@
 
 A local web app for **mid- and long-horizon** equity research. It stores everything it fetches, so you can re-run a screen **as of any past date**, compare today against a month or a year ago, and backtest a strategy without accidentally using information that did not exist yet.
 
-Runs on your machine — `python3 app.py`, then open `http://localhost:8050`; [reachable from your phone](docs/remote-access.md) once you set a login. Uses only free data sources; **no API keys required** for data, screening, or backtesting. An optional [AI analysis layer](#optional-ai-analysis-layer) adds natural-language interpretation when a Gemini or Anthropic key is set.
+Runs on your machine — `python3 app.py`, then open `http://localhost:8050`; [reachable from your phone](docs/remote-access.md) through Tailscale once you set a login. Uses only free data sources; **no API keys required** for data, screening, or backtesting. An optional [AI analysis layer](#optional-ai-analysis-layer) adds natural-language interpretation when a Gemini or Anthropic key is set.
 
 ```bash
 bash run.sh          # install, create the database, load the Dow 30, launch
@@ -384,16 +384,19 @@ rest on.
 ## Use it from your phone
 
 ```bash
-python3 cli.py set-password      # without a login the UI answers on this machine only
+python3 cli.py set-password                  # the login
+bash tools/setup_schedule.sh install-web     # keep the UI running on the Mac
+tailscale serve --bg 8050                    # private https address for your phone
 ```
 
-With a login set, the UI listens on the network and every page asks for it
-(30-day sessions, rate-limited, scrypt-hashed). The **🎛️ Control** tab runs
-the routine from the phone — send today's email, full refresh, AI reviews,
-backups — with a live log. To reach it from outside your home without
-opening a port, see **[docs/remote-access.md](docs/remote-access.md)**:
-Tailscale on your Mac (recommended), a Cloudflare Tunnel, or an always-on
-server with the included `docker compose` setup (web UI + scheduler).
+The UI listens on this computer only, never on the Wi-Fi. Your phone reaches
+it through Tailscale (free), and every page asks for the login (30-day
+sessions, rate-limited, scrypt-hashed). The **🎛️ Control** tab runs the
+routine from the phone: send today's email, full refresh, AI reviews,
+backups, with a live log. Step by step, plus why a cloud server isn't
+needed: **[docs/remote-access.md](docs/remote-access.md)**. A Cloudflare
+Tunnel and an always-on `docker compose` server (web UI + scheduler) are
+covered there too.
 
 ---
 

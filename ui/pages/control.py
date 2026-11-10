@@ -125,6 +125,12 @@ def _status_view():
         ('Next session', RB._fmt_day(st['next_session'])
          + (' (1 p.m. close)' if MC.is_early_close(st['next_session']) else '')),
     ]
+    from core import runlock
+    busy = runlock.holder()
+    rows.append(('Routine', '💤 idle' if busy is None else
+                 f'⏳ running: {busy.get("what", "?")} · since '
+                 f'{str(busy.get("started", "?"))[11:16] or "?"} '
+                 f'(pid {busy.get("pid", "?")}) — a new run waits for it'))
     last = db.read_sql("SELECT kind, period_end, emailed_at FROM reports "
                        "WHERE emailed_at IS NOT NULL ORDER BY emailed_at DESC LIMIT 1",
                        parse_dates=['emailed_at'])
@@ -205,7 +211,7 @@ def _render(active_tab, _n, _v):
             return C.placeholder('None yet.')
         return html.Div([html.Div(
             f'{"✅" if j.returncode == 0 else "❌"} {j.label} · '
-            f'{pd.Timestamp(j.started, unit="s", tz="UTC").tz_convert(None):%b %d %H:%M} UTC · '
+            f'{config.local_fmt(pd.Timestamp(j.started, unit="s"), "%b %d %H:%M")} · '
             f'{_fmt_secs(j.elapsed)}', style={'fontSize': '0.8rem', 'marginBottom': '4px'})
             for j in rows])
 

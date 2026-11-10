@@ -382,6 +382,17 @@ def _all_strategy_keys() -> list[str]:
 
 
 def cmd_daily(args) -> int:
+    """The routine, one run at a time across processes (core/runlock.py)."""
+    if args.dry_run:
+        return _daily(args)
+    from core import runlock
+    what = f'daily --mode {args.mode}' + (' --no-email' if args.no_email else '') \
+        + (' --resend' if args.resend else '')
+    with runlock.hold(what) as ok:
+        return _daily(args) if ok else 1
+
+
+def _daily(args) -> int:
     """
     The scheduled routine, end to end: pull → screen → build → email.
 
@@ -770,27 +781,43 @@ def _run_reviews(index: str, watch: list[str], held: list[str], spec) -> int:
 
 def cmd_review(args) -> int:
     """Run (or list) AI earnings reviews of recent results filings."""
+    db.init_db()
+    if args.run:
+        from core import runlock
+        with runlock.hold('review --run') as ok:
+            if not ok:
+                return 1
+            rc = _review_run(args)
+        if rc:
+            return rc
+    return _review_list(args)
+
+
+def _review_run(args) -> int:
     from data import members
     from nlp import earnings_review as ERV
     from nlp import providers
     from quant import portfolio as PF
-    db.init_db()
-    if args.run:
-        if not ERV.enabled():
-            print('❌  no LLM configured — set GEMINI_API_KEY or ANTHROPIC_API_KEY '
-                  'in .env (or QUANT_LLM_REVIEWS is off)')
-            return 1
-        names = [t.upper() for t in args.tickers] or sorted(
-            set(members.latest_members(args.index.upper())) | set(PF.watchlist())
-            | set(PF.lots('open')['ticker']))
-        todo = ERV.pending(tickers=names, lookback_days=args.days)
-        print(f'▸ {len(todo)} results filing(s) without a review in the last '
-              f'{args.days} days · model {providers.model_name()}')
-        done = ERV.review_recent(tickers=names, lookback_days=args.days,
-                                 max_reviews=args.max,
-                                 priority=list(PF.lots('open')['ticker']) + PF.watchlist(),
-                                 progress=lambda m: print(f'  ▸ {m}'))
-        print(f'✅  {len(done)} review(s) written')
+    if not ERV.enabled():
+        print('❌  no LLM configured — set GEMINI_API_KEY or ANTHROPIC_API_KEY '
+              'in .env (or QUANT_LLM_REVIEWS is off)')
+        return 1
+    names = [t.upper() for t in args.tickers] or sorted(
+        set(members.latest_members(args.index.upper())) | set(PF.watchlist())
+        | set(PF.lots('open')['ticker']))
+    todo = ERV.pending(tickers=names, lookback_days=args.days)
+    print(f'▸ {len(todo)} results filing(s) without a review in the last '
+          f'{args.days} days · model {providers.model_name()}')
+    done = ERV.review_recent(tickers=names, lookback_days=args.days,
+                             max_reviews=args.max,
+                             priority=list(PF.lots('open')['ticker']) + PF.watchlist(),
+                             progress=lambda m: print(f'  ▸ {m}'))
+    print(f'✅  {len(done)} review(s) written')
+    return 0
+
+
+def _review_list(args) -> int:
+    from nlp import earnings_review as ERV
     rv = ERV.latest_reviews([t.upper() for t in args.tickers] or None,
                             days=args.days if not args.run else 120)
     if rv.empty:
@@ -952,10 +979,12 @@ def cmd_set_password(args) -> int:
     user = (args.user or config.QUANT_USER).strip()
     if args.print:
         # For Docker and servers: paste these two lines into .env yourself.
+        # One stream, hint first: stderr interleaved with stdout put the
+        # hint between the two lines it referred to.
+        print('↓ add these two lines to .env (they replace any earlier ones), '
+              'then restart. Keep the single quotes: the hash contains $.')
         print(f"QUANT_USER='{user}'")
-        print(f"QUANT_PASSWORD_HASH='{auth.hash_password(pw)}'")
-        print('↑ add these two lines to .env (they replace any earlier ones), '
-              'then restart.', file=sys.stderr)
+        print(f"QUANT_PASSWORD_HASH='{auth.hash_password(pw)}'", flush=True)
         return 0
     path = set_env_values({'QUANT_USER': user,
                            'QUANT_PASSWORD_HASH': auth.hash_password(pw)})

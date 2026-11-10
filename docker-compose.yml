@@ -15,6 +15,8 @@ services:
     env_file: .env
     environment:
       QUANT_HOST: 0.0.0.0          # inside the container; the publish below limits it
+      QUANT_BEHIND_PROXY: "1"     # only the host's proxy can reach it (127.0.0.1 publish)
+      TZ: ${QUANT_TZ:-America/New_York}
     ports:
       - "127.0.0.1:8050:8050"
     volumes: &data
@@ -28,6 +30,10 @@ services:
     build: .
     command: ["python", "cli.py", "scheduler"]
     env_file: .env
+    environment:
+      TZ: ${QUANT_TZ:-America/New_York}
+    healthcheck:
+      disable: true                # the image's check is the web server's
     volumes: *data
     restart: unless-stopped
 

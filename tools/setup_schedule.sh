@@ -119,8 +119,8 @@ install-web)
     fi
     PY="$(python_bin)"
     if ! (cd "$ROOT" && "$PY" -c 'import config, sys; sys.exit(0 if config.QUANT_PASSWORD_HASH else 1)'); then
-        echo "⚠️  No login is set, so the web UI will answer on this Mac only."
-        echo "    For phone access first run:  $PY cli.py set-password"
+        echo "⚠️  No login is set: the web UI will serve this Mac's own browser only."
+        echo "    For phone access first run:  $PY cli.py set-password  (then this again)"
     fi
     mkdir -p "$LAUNCH_DIR" "$ROOT/logs"
     dst="$LAUNCH_DIR/com.quant.web.plist"
@@ -129,8 +129,10 @@ install-web)
     plutil -lint "$dst" >/dev/null
     launchctl unload "$dst" 2>/dev/null || true
     launchctl load "$dst"
-    echo "✅  web UI running at http://localhost:8050 and restarted at login"
-    echo "    Logs: $ROOT/logs/web.log · phone access: docs/remote-access.md"
+    echo "✅  web UI running at http://localhost:8050 (this Mac only) and restarted at login"
+    echo "    Phone: install Tailscale on the Mac and the phone, then run"
+    echo "           tailscale serve --bg 8050"
+    echo "    Logs: $ROOT/logs/web.log · details: docs/remote-access.md"
     ;;
 
 uninstall-web)

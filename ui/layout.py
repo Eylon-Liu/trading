@@ -26,9 +26,12 @@ TABS = [
 
 def header() -> dbc.Card:
     from core import auth
-    signout = (html.A('Sign out', href='/logout',
-                      style={'position': 'absolute', 'top': '10px', 'right': '14px',
-                             'color': TH.MUTED, 'fontSize': '0.78rem'})
+    # Its own right-aligned line, not overlaid: on a phone the title wraps
+    # to the full width and an absolutely placed link sat on top of it.
+    signout = (html.Div(html.A('Sign out', href='/logout',
+                               style={'color': TH.MUTED, 'fontSize': '0.78rem'}),
+                        style={'textAlign': 'right', 'marginTop': '-6px',
+                               'marginBottom': '2px'})
                if auth.configured() else None)
     return dbc.Card(dbc.CardBody(html.Div([
         signout,

@@ -404,17 +404,18 @@ FRED_API_KEY = os.environ.get('FRED_API_KEY')
 QUANT_EMAIL = (os.environ.get('QUANT_EMAIL') or '').strip() or None
 QUANT_INDEX = (os.environ.get('QUANT_INDEX') or 'SPY').strip().upper()
 
-# ── Web access (app.py) ──────────────────────────────────────────
-# Without a password the UI listens on this machine only (127.0.0.1). Set
-# one with `python cli.py set-password` and it listens on the network and
-# requires a login — that is what makes phone access safe.
+# ── Web access (app.py, core/auth.py) ────────────────────────────
+# The UI listens on this computer only (127.0.0.1); a phone reaches it
+# through `tailscale serve`. `python cli.py set-password` sets the login.
 QUANT_USER = (os.environ.get('QUANT_USER') or 'admin').strip()
 QUANT_PASSWORD_HASH = (os.environ.get('QUANT_PASSWORD_HASH') or '').strip() or None
 QUANT_SECRET_KEY = (os.environ.get('QUANT_SECRET_KEY') or '').strip() or None
-# Explicit bind address; empty means "decide from whether a password is set".
-QUANT_HOST = (os.environ.get('QUANT_HOST') or os.environ.get('HOST') or '').strip() or None
-# Set to 1 when an HTTPS proxy (Tailscale Serve, Cloudflare Tunnel, Caddy)
-# sits in front: trust its X-Forwarded headers and mark cookies Secure.
+# Explicit bind address only. Deliberately not the generic HOST variable:
+# some shells export HOST=<this Mac's name>, which would put the UI on the
+# Wi-Fi without anyone asking for it.
+QUANT_HOST = (os.environ.get('QUANT_HOST') or '').strip() or None
+# Trust X-Forwarded-* from any peer, not only from a proxy on this computer.
+# For Docker, where the host's proxy is the only way in (docker-compose.yml).
 QUANT_BEHIND_PROXY = (os.environ.get('QUANT_BEHIND_PROXY') or '').strip().lower() in (
     '1', 'true', 'yes', 'on')
 
