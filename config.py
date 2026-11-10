@@ -404,6 +404,25 @@ FRED_API_KEY = os.environ.get('FRED_API_KEY')
 QUANT_EMAIL = (os.environ.get('QUANT_EMAIL') or '').strip() or None
 QUANT_INDEX = (os.environ.get('QUANT_INDEX') or 'SPY').strip().upper()
 
+# ── Web access (app.py) ──────────────────────────────────────────
+# Without a password the UI listens on this machine only (127.0.0.1). Set
+# one with `python cli.py set-password` and it listens on the network and
+# requires a login — that is what makes phone access safe.
+QUANT_USER = (os.environ.get('QUANT_USER') or 'admin').strip()
+QUANT_PASSWORD_HASH = (os.environ.get('QUANT_PASSWORD_HASH') or '').strip() or None
+QUANT_SECRET_KEY = (os.environ.get('QUANT_SECRET_KEY') or '').strip() or None
+# Explicit bind address; empty means "decide from whether a password is set".
+QUANT_HOST = (os.environ.get('QUANT_HOST') or os.environ.get('HOST') or '').strip() or None
+# Set to 1 when an HTTPS proxy (Tailscale Serve, Cloudflare Tunnel, Caddy)
+# sits in front: trust its X-Forwarded headers and mark cookies Secure.
+QUANT_BEHIND_PROXY = (os.environ.get('QUANT_BEHIND_PROXY') or '').strip().lower() in (
+    '1', 'true', 'yes', 'on')
+
+# Built-in scheduler (`python cli.py scheduler`, used by the Docker setup).
+QUANT_TZ = (os.environ.get('QUANT_TZ') or 'America/New_York').strip()
+QUANT_MORNING_TIME = (os.environ.get('QUANT_MORNING_TIME') or '07:00').strip()
+QUANT_EVENING_TIME = (os.environ.get('QUANT_EVENING_TIME') or '18:30').strip()
+
 # Names you hold or are watching. They lead the daily brief and the weekend
 # digest, and are ingested even when they are not in QUANT_INDEX.
 # Comma- or space-separated: QUANT_WATCHLIST=AAPL, MSFT, BRK.B

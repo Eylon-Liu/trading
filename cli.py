@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 from datetime import date, timedelta
 
 import pandas as pd
@@ -906,6 +907,149 @@ def cmd_consensus_test(args) -> int:
     return 0
 
 
+def set_env_values(values: dict[str, str], path=None) -> Path:
+    """Update or append KEY='value' lines in .env, leaving the rest alone."""
+    from pathlib import Path as _P
+    path = _P(path or (config.ROOT / '.env'))
+    lines = path.read_text().splitlines() if path.exists() else []
+    done = set()
+    for i, line in enumerate(lines):
+        key = line.split('=', 1)[0].strip()
+        if key in values and not line.lstrip().startswith('#'):
+            # Single quotes: python-dotenv and docker compose both take the
+            # value literally, and a scrypt hash is full of '$'.
+            lines[i] = f"{key}='{values[key]}'"
+            done.add(key)
+    for key, val in values.items():
+        if key not in done:
+            lines.append(f"{key}='{val}'")
+    path.write_text('\n'.join(lines) + '\n')
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+def cmd_set_password(args) -> int:
+    """Set the web login; stores a scrypt hash in .env, never the password."""
+    import getpass
+
+    from core import auth
+    if args.stdin:
+        pw = sys.stdin.readline().rstrip('\n')
+        pw2 = pw
+    else:
+        pw = getpass.getpass('New password: ')
+        pw2 = getpass.getpass('Repeat it: ')
+    if pw != pw2:
+        print('❌  the two entries differ — nothing saved')
+        return 1
+    if len(pw) < 10:
+        print('❌  use at least 10 characters: this password guards a page you '
+              'will open from outside your home')
+        return 1
+    user = (args.user or config.QUANT_USER).strip()
+    if args.print:
+        # For Docker and servers: paste these two lines into .env yourself.
+        print(f"QUANT_USER='{user}'")
+        print(f"QUANT_PASSWORD_HASH='{auth.hash_password(pw)}'")
+        print('↑ add these two lines to .env (they replace any earlier ones), '
+              'then restart.', file=sys.stderr)
+        return 0
+    path = set_env_values({'QUANT_USER': user,
+                           'QUANT_PASSWORD_HASH': auth.hash_password(pw)})
+    print(f'✅  login saved to {path} (user "{user}", password stored as a hash)')
+    print('    Restart the app: it will listen on the network and ask for this')
+    print('    login on every device. Existing sessions are signed out.')
+    print('    From outside your home network, see docs/remote-access.md.')
+    return 0
+
+
+# Morning runs every day (the calendar picks brief vs. digest); the evening
+# preparation run only on weekdays.
+SCHEDULE = (
+    ('morning', 'QUANT_MORNING_TIME', tuple(range(7)), ('daily', '--mode', 'quick')),
+    ('evening', 'QUANT_EVENING_TIME', tuple(range(5)),
+     ('daily', '--mode', 'full', '--no-email', '--backup')),
+)
+CATCH_UP_HOURS = 3
+
+
+def scheduled_runs(now, tz_name: str | None = None, last_done: dict | None = None):
+    """
+    Pure: the runs due at `now` (a list of names) and the next fire time.
+
+    A run whose time passed less than CATCH_UP_HOURS ago and that has not
+    run that day is due — so a server restarted at 07:20 still sends the
+    7:00 email. `last_done` maps run name -> ISO date it last ran.
+    """
+    from datetime import datetime as _dt, time as _time, timedelta as _td
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tz_name or config.QUANT_TZ)
+    local = now.astimezone(tz)
+    last_done = last_done or {}
+    due, upcoming = [], []
+    for name, attr, days, _args in SCHEDULE:
+        hh, mm = (int(x) for x in getattr(config, attr).split(':'))
+        for offset in (-1, 0, 1, 2, 3, 4, 5, 6, 7):
+            day = local.date() + _td(days=offset)
+            if day.weekday() not in days:
+                continue
+            at = _dt.combine(day, _time(hh, mm), tzinfo=tz)
+            if at <= local:
+                if (local - at) <= _td(hours=CATCH_UP_HOURS) and \
+                        last_done.get(name) != day.isoformat() and offset == 0:
+                    due.append(name)
+                continue
+            upcoming.append(at)
+            break
+    return due, min(upcoming)
+
+
+def cmd_scheduler(args) -> int:
+    """
+    Run the daily routine on schedule — for an always-on server (Docker, a
+    VPS) where there is no launchd or cron. Times are in QUANT_TZ.
+    """
+    import json
+    import subprocess
+    import time as _time
+    from datetime import datetime as _dt, timezone as _tz
+
+    logs = config.ROOT / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    state_path = logs / 'scheduler_state.json'
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    commands = {name: run_args for name, _a, _d, run_args in SCHEDULE}
+    print(f'▸ scheduler: morning {config.QUANT_MORNING_TIME} daily, evening '
+          f'{config.QUANT_EVENING_TIME} Mon–Fri ({config.QUANT_TZ})', flush=True)
+    while True:
+        now = _dt.now(_tz.utc)
+        due, nxt = scheduled_runs(now, last_done=state)
+        for name in due:
+            local = now.astimezone(nxt.tzinfo)
+            log_path = logs / f'routine_{local:%Y%m%d_%H%M}_{name}.log'
+            print(f'▸ {local:%Y-%m-%d %H:%M} running {name} → {log_path.name}', flush=True)
+            with log_path.open('a') as fh:
+                rc = subprocess.call([sys.executable, 'cli.py', *commands[name]],
+                                     cwd=str(config.ROOT), stdout=fh,
+                                     stderr=subprocess.STDOUT)
+            print(f'  {name} finished with exit {rc}', flush=True)
+            state[name] = local.date().isoformat()
+            state_path.write_text(json.dumps(state))
+        if args.once:
+            return 0
+        if not due:
+            wait = (nxt - _dt.now(_tz.utc)).total_seconds()
+            print(f'  next run {nxt:%a %Y-%m-%d %H:%M %Z}', flush=True)
+            # Short naps: robust to clock changes, DST and a suspended host.
+            _time.sleep(max(1.0, min(wait, 300.0)))
+
+
 def cmd_macro(args) -> int:
     from data import macro
     db.init_db()
@@ -1058,6 +1202,20 @@ def build_parser() -> argparse.ArgumentParser:
     mc = sub.add_parser('macro', help='rates, credit, VIX and regime flags (FRED)')
     mc.add_argument('--refresh', action='store_true', help='fetch from FRED first')
     mc.set_defaults(func=cmd_macro)
+
+    sc = sub.add_parser('scheduler', help='run the daily routine on schedule '
+                                          '(for Docker / servers without cron)')
+    sc.add_argument('--once', action='store_true',
+                    help='run whatever is due now and exit')
+    sc.set_defaults(func=cmd_scheduler)
+
+    sp = sub.add_parser('set-password', help='set the login for phone / network access')
+    sp.add_argument('--user', help=f'username (default {config.QUANT_USER})')
+    sp.add_argument('--stdin', action='store_true',
+                    help='read the password from stdin (for scripts and Docker)')
+    sp.add_argument('--print', action='store_true',
+                    help='print the .env lines instead of writing .env (Docker)')
+    sp.set_defaults(func=cmd_set_password)
 
     rv = sub.add_parser('review', help='AI earnings reviews of recent results filings')
     rv.add_argument('tickers', nargs='*', help='limit to these tickers')

@@ -1,0 +1,13 @@
+.git
+.env
+.env.local
+db/
+cache/
+logs/
+reports/out/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+docs/*.png

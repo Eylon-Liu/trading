@@ -8,6 +8,8 @@
 #   bash tools/setup_schedule.sh cron       # Linux (or macOS cron): print crontab lines
 #   bash tools/setup_schedule.sh run        # run the morning routine now (sends email)
 #   bash tools/setup_schedule.sh test       # dry run: which email would go out today
+#   bash tools/setup_schedule.sh install-web    # macOS: keep the web UI running (phone access)
+#   bash tools/setup_schedule.sh uninstall-web
 #
 # Schedule:
 #   07:00 every day       one email — full brief on trading days, a news-only
@@ -111,6 +113,37 @@ EOF
     check_email
     ;;
 
+install-web)
+    if [ "$(uname)" != "Darwin" ]; then
+        echo "launchd is macOS-only. On a server use: docker compose up -d"; exit 1
+    fi
+    PY="$(python_bin)"
+    if ! (cd "$ROOT" && "$PY" -c 'import config, sys; sys.exit(0 if config.QUANT_PASSWORD_HASH else 1)'); then
+        echo "⚠️  No login is set, so the web UI will answer on this Mac only."
+        echo "    For phone access first run:  $PY cli.py set-password"
+    fi
+    mkdir -p "$LAUNCH_DIR" "$ROOT/logs"
+    dst="$LAUNCH_DIR/com.quant.web.plist"
+    sed -e "s|__ROOT__|$ROOT|g" -e "s|__PYTHON__|$PY|g" \
+        "$PLIST_DIR/com.quant.web.plist" > "$dst"
+    plutil -lint "$dst" >/dev/null
+    launchctl unload "$dst" 2>/dev/null || true
+    launchctl load "$dst"
+    echo "✅  web UI running at http://localhost:8050 and restarted at login"
+    echo "    Logs: $ROOT/logs/web.log · phone access: docs/remote-access.md"
+    ;;
+
+uninstall-web)
+    dst="$LAUNCH_DIR/com.quant.web.plist"
+    if [ -f "$dst" ]; then
+        launchctl unload "$dst" 2>/dev/null || true
+        rm "$dst"
+        echo "🗑  com.quant.web unloaded and removed"
+    else
+        echo "⚠️  com.quant.web not installed"
+    fi
+    ;;
+
 run)
     echo "Running the morning routine now (this sends today's email)..."
     bash "$ROOT/tools/daily_routine.sh" morning
@@ -121,7 +154,7 @@ test)
     ;;
 
 *)
-    echo "Usage: $0 {install|uninstall|status|cron|run|test}"
+    echo "Usage: $0 {install|uninstall|status|cron|run|test|install-web|uninstall-web}"
     exit 1
     ;;
 esac

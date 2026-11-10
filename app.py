@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Quant Research Terminal — local web application.
+Quant Research Terminal — web application.
 
 Runs a Dash server on your machine; open http://localhost:8050 in a browser.
 Nothing is hosted and no data leaves the machine except the API calls that
 fetch public market and filing data.
 
     python app.py
+
+Without a password it answers on this machine only. To use it from a phone,
+run `python cli.py set-password`: it then listens on the network and every
+page requires a login (core/auth.py). docs/remote-access.md covers reaching
+it safely from outside your home network.
 
 Everything the UI does is also available headlessly through cli.py, which is
 what makes nightly ingest and scheduled reports possible.
@@ -28,6 +33,7 @@ from dash import Input, Output, callback
 pd.options.mode.chained_assignment = None
 
 import config
+from core import auth as AUTH
 from core import db
 from ui import theme as TH
 from ui.layout import TABS, serve_layout
@@ -50,9 +56,10 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
     update_title=None,
 )
-server = app.server                       # for gunicorn/uwsgi if ever needed
+server = app.server
 app.index_string = TH.INDEX_STRING
 app.layout = serve_layout
+AUTH_ENABLED = AUTH.install(server)
 
 
 @server.route('/reports/<path:name>')
@@ -109,20 +116,47 @@ def _startup_checks() -> None:
         log.warning('could not inspect the database: %s', exc)
 
 
-if __name__ == '__main__':
+def main() -> int:
     _startup_checks()
-    _port = int(os.environ.get('PORT', 8050))
-    _host = os.environ.get('HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT', 8050))
+    host = AUTH.bind_host()
+    problem = AUTH.check_bind(host)
+    if problem:
+        print(f'\n  ❌ {problem}\n')
+        return 2
+
     print(f'\n  📊 Quant Research Terminal')
-    print(f'  ➜  http://localhost:{_port}')
-    if _host == '0.0.0.0':
+    print(f'  ➜  http://localhost:{port}')
+    if host not in AUTH.LOCAL_HOSTS:
         import socket
-        _ip = socket.gethostbyname(socket.gethostname())
-        _local = socket.gethostname()
-        if not _local.endswith('.local'):
-            _local += '.local'
-        print(f'  ➜  http://{_local}:{_port}  (stable hostname)')
-        print(f'  ➜  http://{_ip}:{_port}  (LAN IP / Tailscale)')
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            ip = '?'
+        name = socket.gethostname()
+        if not name.endswith('.local'):
+            name += '.local'
+        print(f'  ➜  http://{name}:{port}  (stable hostname)')
+        print(f'  ➜  http://{ip}:{port}  (LAN IP / Tailscale)')
+        print(f'  🔒 login required — user "{config.QUANT_USER}"')
+    else:
+        print('  🔒 this machine only — `python cli.py set-password` to allow '
+              'phone access')
     print(f'  ➜  database: {config.DATABASE_URL}')
     print(f'  ➜  headless equivalent: python cli.py --help\n')
-    app.run(debug=False, port=_port, host=_host)
+
+    try:
+        from waitress import serve
+    except ImportError:                   # dev server: fine locally, not on a network
+        log.warning('waitress not installed — using the development server')
+        app.run(debug=False, port=port, host=host)
+        return 0
+    # A production server: the Flask development server is single-purpose
+    # and not meant to face a network. Threads let a long backtest run
+    # without freezing every other tab.
+    serve(server, host=host, port=port, threads=8, ident='qrt')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
