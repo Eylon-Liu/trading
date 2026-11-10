@@ -646,6 +646,49 @@ def freshness_warnings(as_of: date, data_through: date | None) -> list[str]:
         out.append(f'Screens were last run for {_fmt_day(data_through)}, not '
                    f'{_fmt_day(expected)}. Rankings and signals below are '
                    f'from that run.')
+    return out + feed_warnings()
+
+
+def feed_warnings(now: datetime | None = None) -> list[str]:
+    """
+    News and policy feeds that could not be reached at their last refresh.
+
+    Without this a dead feed is invisible: the weekend digest simply shows
+    fewer (or no) articles, which reads as a quiet weekend. Three signals,
+    all from stored bookkeeping — nothing is fetched here:
+      * the last news refresh failed for every ticker, or for a large share;
+      * articles are stored, but none newer than three days;
+      * the Federal Register refresh failed.
+    """
+    now = now or config.utc_now()
+    out: list[str] = []
+    try:
+        log_rows = db.read_sql(
+            "SELECT source, key, last_success, last_error FROM ingest_log "
+            "WHERE source IN ('news', 'policy')", parse_dates=['last_success'])
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('feed warnings unavailable: %s', exc)
+        return out
+    news = log_rows[log_rows['source'] == 'news']
+    if not news.empty:
+        failed = int(news['last_error'].notna().sum())
+        if failed == len(news):
+            out.append('News could not be fetched at the last refresh — no '
+                       'source answered (Yahoo, Google News). Articles below, '
+                       'if any, are from earlier refreshes.')
+        elif failed >= max(5, 0.2 * len(news)):
+            out.append(f'News could not be fetched for {failed} of {len(news)} '
+                       f'tickers at the last refresh; coverage below is partial.')
+        else:
+            newest = db.read_sql('SELECT MAX(published) AS p FROM news',
+                                 parse_dates=['p'])['p'].iloc[0]
+            if pd.notna(newest) and (now - newest) > timedelta(days=3):
+                out.append(f'No article newer than {newest:%a %b %d} is stored — '
+                           f'the news refresh may not be running.')
+    policy = log_rows[log_rows['source'] == 'policy']
+    if not policy.empty and policy['last_error'].notna().all():
+        out.append('The Federal Register could not be reached at the last '
+                   'refresh; the policy section may be out of date.')
     return out
 
 
@@ -1818,6 +1861,8 @@ def render_news_digest(d: dict) -> str:
         'only — no prices, rankings or signals. The full brief resumes on the '
         'next trading day.</div>',
     ]
+    for w in d.get('feed_warnings') or []:
+        parts.append(f'<div class="alert">⚠️ {_esc(w)}</div>')
 
     news, filings, policy = d['news'], d['filings'], d['policy']
     n_tickers = (len({t for ts in news['tickers'] for t in ts})
@@ -1965,6 +2010,7 @@ def build_report(strategy: str | None = None, kind: str = 'daily',
             sorted(set(watchlist) | set(held_names) | set(digest['picks'])),
             as_of, days=10))
         digest['held'] = held_names
+        digest['feed_warnings'] = _safe(feed_warnings) or []
         digest['reviews'] = _safe(lambda: _recent_reviews(
             digest['start'].date(), as_of, held_names, watchlist), pd.DataFrame())
         html_out = render_news_digest(digest)

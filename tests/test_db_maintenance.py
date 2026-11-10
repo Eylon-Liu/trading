@@ -129,13 +129,145 @@ def test_clean_is_idempotent(fresh_db):
     assert all(v == 0 for v in second.values())
 
 
-def test_backup_produces_a_readable_copy(fresh_db, tmp_path):
+def test_backup_is_compressed_and_restores_to_a_readable_copy(fresh_db, tmp_path):
     _persist('r1', date(2026, 11, 6))
     out = M.backup(dest_dir=tmp_path / 'bk')
-    assert out is not None and out.exists()
+    assert out is not None and out.exists() and out.name.endswith('.sqlite.gz')
+    assert not list((tmp_path / 'bk').glob('*.partial'))
+    restored = M.restore_to(out, tmp_path / 'restored.sqlite')
     import sqlite3
-    with sqlite3.connect(out) as conn:
+    with sqlite3.connect(restored) as conn:
         assert conn.execute('SELECT COUNT(*) FROM runs').fetchone()[0] == 1
+
+
+def test_only_the_newest_backups_are_kept(fresh_db, tmp_path, monkeypatch):
+    monkeypatch.setattr(M, 'BACKUP_DIR', tmp_path / 'backups')
+    (tmp_path / 'backups').mkdir()
+    for stamp in ('20260101-0700', '20260102-0700', '20260103-0700'):
+        (tmp_path / 'backups' / f'quant-{stamp}.sqlite').write_bytes(b'old plain copy')
+    newest = M.backup(keep=2)
+    names = [p.name for p in M.list_backups()]
+    assert names[0] == newest.name and len(names) == 2
+    assert 'quant-20260103-0700.sqlite' in names           # plain copies still count
+
+
+# ── retention: disk use levels off ───────────────────────────────
+
+def test_factor_detail_is_pruned_but_scores_are_kept(fresh_db):
+    old = date.today() - timedelta(days=45)
+    _persist('old', old)
+    _persist('new', date.today())
+    assert M.prune_factor_detail(30) == 2
+    assert _count(fresh_db, 'factor_scores') == 2           # today's detail
+    assert _count(fresh_db, 'scores') == 4                  # both rankings
+
+
+def test_old_daily_runs_thin_to_one_per_week(fresh_db):
+    # Two full weeks of daily runs, 200+ days ago, and one recent run.
+    monday = date.today() - timedelta(days=210)
+    monday -= timedelta(days=monday.weekday())
+    for i in range(10):
+        d = monday + timedelta(days=i + 2 * (i // 5))       # Mon-Fri, Mon-Fri
+        _persist(f'old-{i}', d)
+    _persist('other-strategy', monday, strategy='momentum_trend')
+    _persist('recent', date.today())
+    removed = M.thin_old_runs(120)
+    assert removed == 8
+    left = fresh_db.read_sql('SELECT run_id, as_of FROM runs ORDER BY as_of')
+    assert set(left['run_id']) == {'old-4', 'old-9', 'other-strategy', 'recent'}
+    assert _count(fresh_db, 'scores') == 8                  # whole runs went, none partial
+    assert not any(M.delete_orphans().values())
+    assert M.thin_old_runs(120) == 0                        # idempotent
+
+
+def test_old_news_is_pruned(fresh_db):
+    now = datetime.utcnow()
+    fresh_db.upsert(fresh_db.news, [
+        {'id': 'old', 'ticker': 'AAPL', 'published': now - timedelta(days=200), 'title': 'old'},
+        {'id': 'new', 'ticker': 'AAPL', 'published': now - timedelta(days=3), 'title': 'new'}])
+    assert M.prune_news(180) == 1
+    assert fresh_db.read_sql('SELECT id FROM news')['id'].tolist() == ['new']
+
+
+def test_cache_is_compressed_and_stale_entries_swept(tmp_path, monkeypatch):
+    import gzip
+    import os
+    import time
+    import config
+    from core import http
+    monkeypatch.setattr(config, 'CACHE_DIR', tmp_path)
+    payload = b'{"facts": ' + b'"x" ' * 20000 + b'}'
+    path = http._cache_path('https://example.test/a', None, 'sec_facts')
+    http._cache_write(path, payload)
+    assert path.stat().st_size < len(payload) / 5           # stored compressed
+    assert http._cache_read(path, ttl=60) == payload         # read back intact
+
+    legacy = tmp_path / 'sec_facts' / 'legacy.cache'         # written before compression
+    legacy.write_bytes(payload)
+    stale = tmp_path / 'prices' / 'stale.cache'
+    stale.parent.mkdir()
+    stale.write_bytes(b'x' * 5000)
+    old = time.time() - 40 * 86400
+    os.utime(stale, (old, old))
+    in_flight = tmp_path / 'prices' / 'other.tmp'            # another process, mid-write
+    in_flight.write_bytes(b'partial')
+    mtime_before = legacy.stat().st_mtime
+
+    res = http.sweep_cache(max_age_days=30)
+    assert res['removed'] == 1 and not stale.exists()
+    assert res['compressed'] == 1 and res['bytes_freed'] > len(payload) / 2
+    assert gzip.decompress(legacy.read_bytes()) == payload
+    assert http._cache_read(legacy, ttl=-1) == payload
+    assert abs(legacy.stat().st_mtime - mtime_before) < 1    # its age is unchanged
+    assert in_flight.exists()
+    assert http.sweep_cache(max_age_days=30)['compressed'] == 0
+
+
+def test_old_reports_and_logs_are_pruned(fresh_db, tmp_path, monkeypatch):
+    import os
+    import time
+    import config
+    monkeypatch.setattr(config, 'REPORT_DIR', tmp_path / 'out')
+    monkeypatch.setattr(config, 'ROOT', tmp_path)
+    (tmp_path / 'out').mkdir()
+    (tmp_path / 'logs' / 'jobs').mkdir(parents=True)
+    old_day = date.today() - timedelta(days=200)
+    rows = []
+    for rid, kind, day in (('d-old', 'daily', old_day), ('m-old', 'monthly', old_day),
+                           ('d-new', 'daily', date.today())):
+        f = tmp_path / 'out' / f'{rid}.html'
+        f.write_text('<html></html>')
+        rows.append({'report_id': rid, 'kind': kind, 'period_start': day,
+                     'period_end': day, 'path': str(f)})
+    fresh_db.upsert(fresh_db.reports, rows)
+    assert M.prune_reports(180) == 1
+    assert sorted(p.name for p in (tmp_path / 'out').iterdir()) == ['d-new.html', 'm-old.html']
+    assert set(fresh_db.read_sql('SELECT report_id FROM reports')['report_id']) == {'m-old', 'd-new'}
+
+    old_log = tmp_path / 'logs' / 'routine_20260101_0700_morning.log'
+    old_log.write_text('x')
+    past = time.time() - 40 * 86400
+    os.utime(old_log, (past, past))
+    new_log = tmp_path / 'logs' / 'jobs' / 'today.log'
+    new_log.write_text('x')
+    big = tmp_path / 'logs' / 'daily.log'
+    big.write_bytes(b'line\n' * 1_400_000)                   # 7 MB of cron appends
+    assert M.prune_logs(30) == 2
+    assert not old_log.exists() and new_log.exists()
+    assert 0.9e6 < big.stat().st_size <= 1e6 and big.read_bytes().startswith(b'line\n')
+
+
+def test_housekeeping_runs_every_step_and_survives_one_failing(fresh_db, tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, 'CACHE_DIR', tmp_path / 'cache')
+    monkeypatch.setattr(M, 'BACKUP_DIR', tmp_path / 'backups')
+    monkeypatch.setattr(M, 'prune_news', lambda days: 1 / 0)
+    _persist('old', date.today() - timedelta(days=45))
+    said = []
+    out = M.housekeeping(say=said.append)
+    assert out['factor_detail_rows'] == 2
+    assert str(out['news_rows']).startswith('failed')
+    assert 'usage' in out and said and said[0].startswith('🧹 storage')
 
 
 def test_integrity_check_on_a_healthy_store(fresh_db):

@@ -340,6 +340,9 @@ POLICY_THEMES = {
 # NEWS / LLM
 # ─────────────────────────────────────────────
 
+# Longest a news refresh may take. Names not reached are first in line next
+# time, after your holdings, watchlist and the current top picks.
+NEWS_BUDGET_SECONDS = int(os.environ.get('QUANT_NEWS_BUDGET_SECONDS') or 900)
 NEWS_LOOKBACK_DAYS = 30
 MAX_NEWS_PER_TICKER = 25
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
@@ -418,6 +421,21 @@ QUANT_HOST = (os.environ.get('QUANT_HOST') or '').strip() or None
 # For Docker, where the host's proxy is the only way in (docker-compose.yml).
 QUANT_BEHIND_PROXY = (os.environ.get('QUANT_BEHIND_PROXY') or '').strip().lower() in (
     '1', 'true', 'yes', 'on')
+
+# ── Storage retention (core/maintenance.py: housekeeping) ───────
+# Applied at the end of every routine run so disk use levels off instead of
+# growing with each day. Nothing here touches prices, filings, fundamentals
+# or index membership — the history backtests are built on.
+RETENTION = {
+    'factor_detail_days': 30,   # per-factor breakdown behind each screen run
+    'daily_runs_days': 120,     # after this, keep one run per week per strategy
+    'news_days': 180,           # articles (the digest and Intel read recent ones)
+    'attention_days': 800,      # Wikipedia pageviews (the factor needs ~400)
+    'cache_days': 30,           # downloaded responses not refreshed since
+    'log_days': 30,
+    'report_days': 180,         # daily / news report files (monthly ones are kept)
+    'backups': 3,               # compressed database copies
+}
 
 # Built-in scheduler (`python cli.py scheduler`, used by the Docker setup).
 QUANT_TZ = (os.environ.get('QUANT_TZ') or 'America/New_York').strip()

@@ -24,6 +24,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 from lxml import etree
 
@@ -519,13 +520,50 @@ def facts_asof(tickers: list[str], as_of: date | str,
         params.update({f'c{i}': c for i, c in enumerate(concepts)})
         clause = f'AND concept IN ({cph})'
 
-    return db.read_sql(f"""
+    return _read_lean(f"""
         SELECT ticker, concept, tag, unit, period_start, period_end,
                filed, form, fy, fp, val
         FROM sec_facts
         WHERE ticker IN ({ph}) AND filed <= :ts {clause}
         ORDER BY ticker, concept, period_end, filed
-    """, params, parse_dates=['period_start', 'period_end', 'filed'])
+    """, params, parse_dates=['period_start', 'period_end', 'filed'],
+        text_columns=('ticker', 'concept', 'tag', 'unit', 'form', 'fp'))
+
+
+def _read_lean(sql: str, params: dict, parse_dates: list[str],
+               text_columns: tuple[str, ...], chunk_rows: int = 200_000) -> pd.DataFrame:
+    """
+    A large, repetitive query result without the memory spike.
+
+    Two million fact rows hold only a few thousand distinct strings (500
+    tickers, ~100 concepts, a handful of forms), but the driver hands back a
+    separate Python string for every cell: the S&P 500 frame took 0.8 GB and
+    2 GB at the peak of loading it, which is what made the daily routine need
+    2.5 GB. Reading in chunks bounds the peak, and pointing every equal value
+    at one shared string shrinks the frame about fivefold. Values, dtypes and
+    row order are exactly what a plain read returns.
+    """
+    import sys
+    from sqlalchemy import text as _text
+
+    pool: dict[str, str] = {}
+    parts = []
+    with db.get_engine().connect() as conn:
+        for chunk in pd.read_sql(_text(sql), conn, params=params,
+                                 parse_dates=parse_dates, chunksize=chunk_rows):
+            for col in text_columns:
+                if col not in chunk.columns:
+                    continue
+                codes, uniques = pd.factorize(chunk[col], use_na_sentinel=True)
+                shared = np.empty(len(uniques) + 1, dtype=object)
+                for i, u in enumerate(uniques):
+                    shared[i] = pool.setdefault(u, sys.intern(u)) if isinstance(u, str) else u
+                shared[-1] = None                       # code -1 → missing
+                chunk[col] = shared[codes]
+            parts.append(chunk)
+    if not parts:
+        return db.read_sql(sql, params, parse_dates=parse_dates)
+    return pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
 
 
 def events_asof(tickers: list[str], as_of: date | str,

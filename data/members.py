@@ -69,6 +69,44 @@ def normalize_ticker(raw: str | None) -> str | None:
     return t
 
 
+# ─────────────────────────────────────────────
+# TICKER CHANGES
+# ─────────────────────────────────────────────
+
+# Same company, new symbol. A historical constituent list names the symbol
+# of its day, but prices and filings are stored under today's — so without
+# this map Meta (FB until 2022), Elevance (ANTM), RTX (UTX) and two dozen
+# others silently vanished from every backtest date before their rename,
+# which both shrinks the universe and removes some of its largest names.
+#
+# Only genuine symbol changes of a continuing listing belong here. A company
+# that was acquired (XLNX, ATVI, PXD…) or failed (SIVB, FRC) has no current
+# symbol and is correctly absent; mapping it to its acquirer would hand the
+# acquirer's history to a different business.
+TICKER_RENAMES: dict[str, str] = {
+    'FB': 'META', 'ANTM': 'ELV', 'ABC': 'COR', 'BLL': 'BALL', 'RE': 'EG',
+    'PEAK': 'DOC', 'FLT': 'CPAY', 'FBHS': 'FBIN', 'WLTW': 'WTW',
+    'NLOK': 'GEN', 'LB': 'BBWI', 'COG': 'CTRA', 'HFC': 'DINO',
+    'CTL': 'LUMN', 'MYL': 'VTRS', 'UTX': 'RTX', 'ADS': 'BFH', 'GPS': 'GAP',
+    'PKI': 'RVTY', 'ARNC': 'HWM', 'CDAY': 'DAY', 'VIAC': 'PARA',
+    'DISCA': 'WBD', 'DISCK': 'WBD', 'BK': 'BNY', 'MMC': 'MRSH', 'FI': 'FISV',
+}
+
+
+def current_symbol(ticker: str) -> str:
+    """Today's symbol for a constituent named by an older one."""
+    seen = set()
+    while ticker in TICKER_RENAMES and ticker not in seen:
+        seen.add(ticker)
+        ticker = TICKER_RENAMES[ticker]
+    return ticker
+
+
+def current_symbols(tickers) -> list[str]:
+    """Map a list through `current_symbol`, de-duplicated, order kept."""
+    return list(dict.fromkeys(current_symbol(t) for t in tickers))
+
+
 # Corporate-form words that carry no identifying information. Deliberately
 # excludes bare single letters: "A O Smith" and "BF-B" need theirs.
 _CORP_STOPWORDS = {
@@ -462,7 +500,7 @@ def members_asof(index_symbol: str, as_of: date | str,
         WHERE index_symbol = :idx AND as_of = :d AND source = :s
         ORDER BY ticker
     """, {'idx': index_symbol, 'd': str(chosen_date), 's': chosen_src})
-    return rows['ticker'].tolist()
+    return sorted(current_symbols(rows['ticker'].tolist()))
 
 
 def compare_sources(index_symbol: str, as_of: date | str) -> dict:

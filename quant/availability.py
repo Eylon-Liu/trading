@@ -160,7 +160,8 @@ def survivorship_gap(preset: str, as_of: date) -> float:
     if mem.empty:
         return 0.0
 
-    tickers = mem['ticker'].tolist()
+    from data.members import current_symbols
+    tickers = current_symbols(mem['ticker'].tolist())
     ph = ','.join(f':t{i}' for i in range(len(tickers)))
     params: dict = {f't{i}': t for i, t in enumerate(tickers)}
     params['a'] = str(as_of - timedelta(days=60))

@@ -18,6 +18,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
+import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -59,14 +61,50 @@ def _mk_id(ticker: str, title: str, published=None) -> str:
 # SOURCES
 # ─────────────────────────────────────────────
 
-def _from_yfinance(ticker: str) -> list[dict]:
-    """yfinance `.news` — richest of the three, includes a real summary."""
+class NewsUnavailable(RuntimeError):
+    """No news source answered — distinct from "answered, nothing new"."""
+
+
+# What the last update_news() call saw, for the sync report.
+LAST_RUN: dict = {'tickers': 0, 'failed': 0, 'written': 0}
+
+# A source that fails this many times in a row is left alone for the rest of
+# the run. Each failed request costs its retries and backoff; with a feed
+# down, 500 tickers of that was most of an hour spent learning one fact.
+_BREAKER_LIMIT = 5
+_strikes: dict[str, int] = {}
+_strikes_lock = threading.Lock()
+
+
+def _source_open(name: str) -> bool:
+    return _strikes.get(name, 0) < _BREAKER_LIMIT
+
+
+def _note(name: str, ok: bool) -> None:
+    with _strikes_lock:
+        _strikes[name] = 0 if ok else _strikes.get(name, 0) + 1
+        if not ok and _strikes[name] == _BREAKER_LIMIT:
+            log.warning('news: %s failed %d times in a row — skipping it for '
+                        'the rest of this run', name, _BREAKER_LIMIT)
+
+
+def _from_yfinance(ticker: str) -> list[dict] | None:
+    """yfinance `.news` — richest of the three, includes a real summary.
+
+    Returns None when the source could not be reached, [] when it answered
+    with nothing. The difference matters: the first is an outage to report,
+    the second is a quiet day.
+    """
+    if not _source_open('yfinance'):
+        return None
     try:
         import yfinance as yf
         items = yf.Ticker(ticker).news or []
     except Exception as exc:                       # noqa: BLE001
         log.debug('yfinance news failed for %s: %s', ticker, exc)
-        return []
+        _note('yfinance', False)
+        return None
+    _note('yfinance', True)
 
     out = []
     for it in items:
@@ -90,16 +128,22 @@ def _from_yfinance(ticker: str) -> list[dict]:
     return out
 
 
-def _from_rss(url: str, params: dict, ticker: str, source: str) -> list[dict]:
-    raw = http.fetch(url, params=params, category='news')
+def _from_rss(url: str, params: dict, ticker: str, source: str) -> list[dict] | None:
+    """None when the feed could not be fetched or parsed; [] when it is empty."""
+    if not _source_open(source):
+        return None
+    raw = http.fetch(url, params=params, category='news', retries=2)
     if not raw:
-        return []
+        _note(source, False)
+        return None
     try:
         import feedparser
         feed = feedparser.parse(raw)
     except Exception as exc:                       # noqa: BLE001
         log.debug('rss parse failed (%s): %s', source, exc)
-        return []
+        _note(source, False)
+        return None
+    _note(source, True)
 
     out = []
     for entry in feed.entries[:config.MAX_NEWS_PER_TICKER]:
@@ -122,13 +166,22 @@ def _from_rss(url: str, params: dict, ticker: str, source: str) -> list[dict]:
 
 
 def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]:
-    """Gather, deduplicate, score and structure coverage for one ticker."""
-    items = _from_yfinance(ticker)
-    items += _from_rss(YAHOO_RSS, {'s': ticker, 'region': 'US', 'lang': 'en-US'},
-                       ticker, 'Yahoo RSS')
+    """Gather, deduplicate, score and structure coverage for one ticker.
+
+    Raises NewsUnavailable when every source failed. One source answering —
+    even with nothing — is a real answer, and the others are redundancy.
+    """
     query = f'{company_name} stock' if company_name else f'{ticker} stock'
-    items += _from_rss(GOOGLE_RSS, {'q': query, 'hl': 'en-US', 'gl': 'US',
-                                    'ceid': 'US:en'}, ticker, 'Google News')
+    answers = [
+        _from_yfinance(ticker),
+        _from_rss(YAHOO_RSS, {'s': ticker, 'region': 'US', 'lang': 'en-US'},
+                  ticker, 'Yahoo RSS'),
+        _from_rss(GOOGLE_RSS, {'q': query, 'hl': 'en-US', 'gl': 'US',
+                               'ceid': 'US:en'}, ticker, 'Google News'),
+    ]
+    if all(a is None for a in answers):
+        raise NewsUnavailable(f'no news source answered for {ticker}')
+    items = [it for a in answers if a for it in a]
 
     seen, unique = set(), []
     for it in items:
@@ -163,10 +216,45 @@ def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]
     return rows
 
 
-def update_news(tickers: list[str]) -> int:
-    """Fetch and store coverage for each ticker."""
+def _fetch_order(tickers: list[str]) -> list[str]:
+    """
+    The names you hold or watch and the current top picks first, then the
+    rest oldest-refresh-first — so when the time budget runs out, what is
+    left unfetched is what matters least and waited least.
+    """
+    wanted = set(tickers)
+    first: list[str] = []
+    try:
+        mine = db.read_sql("SELECT ticker FROM positions WHERE status = 'open' "
+                           "UNION SELECT ticker FROM watchlist")['ticker'].tolist()
+        picks = db.read_sql(
+            "SELECT DISTINCT s.ticker FROM scores s JOIN runs r ON r.run_id = s.run_id "
+            "WHERE r.as_of = (SELECT MAX(as_of) FROM runs) AND s.rank <= 20")['ticker'].tolist()
+        first = [t for t in dict.fromkeys(mine + sorted(picks)) if t in wanted]
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('news priority unavailable: %s', exc)
+    seen = db.read_sql("SELECT key, last_success FROM ingest_log WHERE source = 'news'")
+    # Never refreshed (or only ever failed) sorts first, as the oldest.
+    age = {k: ('' if pd.isna(v) else str(v))
+           for k, v in zip(seen['key'], seen['last_success'])}
+    rest = sorted(wanted - set(first), key=lambda t: (age.get(t, ''), t))
+    return first + rest
+
+
+def update_news(tickers: list[str], budget_seconds: float | None = None) -> int:
+    """
+    Fetch and store coverage for each ticker, within a time budget.
+
+    The budget (config.NEWS_BUDGET_SECONDS) keeps the morning email on time
+    whatever the feeds are doing: names not reached stay stale and are first
+    in line, after your own, at the next refresh.
+    """
     if not tickers:
         return 0
+    budget = config.NEWS_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    deadline = time.monotonic() + budget
+    with _strikes_lock:
+        _strikes.clear()
 
     names = {}
     ph = ','.join(f':t{i}' for i in range(len(tickers)))
@@ -176,23 +264,44 @@ def update_news(tickers: list[str]) -> int:
         names = dict(zip(meta['ticker'], meta['name']))
 
     written = 0
+    failed: list[str] = []
+    skipped = 0
     with ThreadPoolExecutor(max_workers=max(2, config.MAX_WORKERS // 2)) as pool:
         futures = {pool.submit(fetch_for_ticker, t, names.get(t)): t
-                   for t in sorted(set(tickers))}
+                   for t in _fetch_order(tickers)}
         for fut in as_completed(futures):
             t = futures[fut]
+            if fut.cancelled():
+                continue
             try:
                 rows = fut.result()
             except Exception as exc:               # noqa: BLE001
+                # Recorded as a failure, not as "0 articles": a feed that is
+                # down used to be logged as a successful refresh, and a
+                # weekend digest with no news looked like a quiet weekend.
                 log.warning('news failed for %s: %s', t, exc)
+                failed.append(t)
+                db.record_ingest('news', t, error=str(exc)[:200])
                 continue
             if rows:
                 # First sighting wins: an article already stored keeps its
                 # original publish time instead of being re-dated to now.
                 written += db.upsert(db.news, rows, on_conflict='ignore')
             db.record_ingest('news', t, rows=len(rows) if rows else 0)
+            if time.monotonic() > deadline and not skipped:
+                skipped = sum(1 for f in futures if f.cancel())
+                if skipped:
+                    log.warning('news: time budget of %ds reached — %d tickers '
+                                'left for the next refresh', int(budget), skipped)
 
-    log.info('news: %d articles across %d tickers', written, len(tickers))
+    n = len(set(tickers)) - skipped
+    LAST_RUN.update(tickers=n, failed=len(failed), written=written, skipped=skipped)
+    log.info('news: %d articles across %d tickers (%d unreachable, %d left '
+             'for next time)', written, n, len(failed), skipped)
+    if failed and len(failed) == n:
+        raise NewsUnavailable(
+            f'no news source answered for any of {n} tickers — check the '
+            f'network; Yahoo and Google News feeds were both unreachable')
     return written
 
 

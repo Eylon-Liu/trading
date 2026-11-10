@@ -434,5 +434,17 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
 
     emit(f'{src.label}: {len(due)} of {len(tickers)} tickers stale')
     rows = fn(due)
+    detail = ''
+    if name == 'news':
+        notes = []
+        if news.LAST_RUN.get('failed'):
+            notes.append(f'{news.LAST_RUN["failed"]} of {news.LAST_RUN["tickers"]} '
+                         f'tickers: no source answered')
+        if news.LAST_RUN.get('skipped'):
+            notes.append(f'{news.LAST_RUN["skipped"]} left for the next refresh '
+                         f'(time budget)')
+        detail = '; '.join(notes)
+        if detail:
+            emit(f'⚠️ news: {detail}')
     return SourceResult(name, 'fetched', rows=rows or 0, stale_keys=len(due),
-                        total_keys=len(tickers))
+                        total_keys=len(tickers), detail=detail)

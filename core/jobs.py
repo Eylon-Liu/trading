@@ -44,7 +44,7 @@ ACTIONS: dict[str, Action] = {a.key: a for a in (
     Action('brief', '📧 Send today\'s email', ('daily',),
            'Refresh news and prices, run the screens and email the brief — '
            'the same as the 7:00 job. Skipped if today\'s already went out.',
-           '2–10 min'),
+           '5–20 min'),
     Action('resend', '🔁 Re-send today\'s email', ('daily', '--resend', '--skip-ingest'),
            'Rebuild today\'s brief from stored data and send it again.', '1–3 min'),
     Action('preview', '👁️ Build today\'s brief (no email)', ('report', '--kind', 'auto'),
@@ -52,7 +52,8 @@ ACTIONS: dict[str, Action] = {a.key: a for a in (
     Action('refresh', '🔄 Full refresh (no email)',
            ('daily', '--mode', 'full', '--no-email', '--force'),
            'Every source — SEC filings, fundamentals, prices — then all screens. '
-           'What the 18:30 job does.', '5–40 min'),
+           'What the 18:30 job does. The very first one also loads two years '
+           'of insider filings and takes a few hours.', '10–40 min'),
     Action('reviews', '🧠 Run AI earnings reviews', ('review', '--run'),
            'Review results filings from the last 10 days that have none yet.',
            '1–5 min'),
@@ -60,7 +61,7 @@ ACTIONS: dict[str, Action] = {a.key: a for a in (
            ('earnings', '--refresh'), 'Upcoming report dates for your names.',
            '< 2 min'),
     Action('backup', '💾 Back up the database', ('db', 'backup'),
-           'Consistent copy to db/backups/ (keeps 5).', '< 1 min'),
+           'Consistent, compressed copy to db/backups/ (keeps 3).', '1–2 min'),
 )}
 
 

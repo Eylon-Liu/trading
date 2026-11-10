@@ -141,7 +141,10 @@ def _status_view():
     rows.append(('Prices through', RB._fmt_day(newest) if newest else 'none stored'))
     path = M.sqlite_path()
     if path and path.exists():
-        rows.append(('Database', f'{path.stat().st_size / 1e6:,.0f} MB'))
+        use = M.usage()
+        rows.append(('Storage', f'{use["total"] / 1000:,.1f} GB — database '
+                     f'{use["database"]:,.0f} MB, downloads cache {use["cache"]:,.0f} MB, '
+                     f'backups {use["backups"]:,.0f} MB (pruned automatically)'))
     rows.append(('Email (SMTP)', 'configured' if config.SMTP_USER and config.SMTP_PASS
                  else 'not set — add SMTP_USER / SMTP_PASS to .env'))
     rows.append(('Recipient', config.QUANT_EMAIL or 'not set — QUANT_EMAIL in .env'))

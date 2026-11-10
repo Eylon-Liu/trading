@@ -42,7 +42,9 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # 12: backtest-built frames before this lacked every benchmark-relative
 # factor (BETA, IDIO_VOL, EARNINGS_REACTION) and share keys with live
 # builds, so a stale one could be served to either path.
-CODE_VERSION = 12
+# 13: backtest-built frames included names outside the universe of their
+# date (future index members, with fundamentals only).
+CODE_VERSION = 13
 
 # Entries are self-invalidating via the data version, so this only bounds
 # unbounded growth from many one-off as-of dates.

@@ -9,9 +9,11 @@ outbound request in the project goes through `fetch`.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -79,13 +81,29 @@ def _cache_path(url: str, params: dict | None, category: str) -> Path:
     return d / f'{key}.cache'
 
 
+# Responses are stored gzip-compressed. SEC's companyfacts JSON is 4-9 MB per
+# company and compresses ~15x; uncompressed, that one category was 1.9 GB for
+# the S&P 500 — more than twice the database built from it.
+_GZIP_MAGIC = b'\x1f\x8b'
+
+
+def _decode(raw: bytes) -> bytes:
+    """Stored bytes → payload; files written before compression pass through."""
+    if raw[:2] == _GZIP_MAGIC:
+        try:
+            return gzip.decompress(raw)
+        except (OSError, EOFError):
+            return raw
+    return raw
+
+
 def _cache_read(path: Path, ttl: int) -> bytes | None:
     if not path.exists():
         return None
     if ttl >= 0 and (time.time() - path.stat().st_mtime) > ttl:
         return None
     try:
-        return path.read_bytes()
+        return _decode(path.read_bytes())
     except OSError:
         return None
 
@@ -93,10 +111,51 @@ def _cache_read(path: Path, ttl: int) -> bytes | None:
 def _cache_write(path: Path, payload: bytes) -> None:
     try:
         tmp = path.with_suffix('.tmp')
-        tmp.write_bytes(payload)
+        tmp.write_bytes(gzip.compress(payload, compresslevel=4))
         tmp.replace(path)
     except OSError as exc:
         log.debug('cache write failed for %s: %s', path, exc)
+
+
+def sweep_cache(max_age_days: int = 30) -> dict[str, int]:
+    """
+    Keep the cache bounded: delete entries not refreshed for `max_age_days`
+    (every TTL is far shorter, so these are only ever a last-resort fallback
+    for a source that has been down that long) and compress any entry
+    written before compression existed. Returns counts and bytes freed.
+    """
+    out = {'removed': 0, 'compressed': 0, 'bytes_freed': 0}
+    root = config.CACHE_DIR
+    if not root.exists():
+        return out
+    cutoff = time.time() - max_age_days * 86400
+    for path in list(root.rglob('*.cache')) + list(root.rglob('*.tmp')):
+        try:
+            st = path.stat()
+            # A .tmp is a write in progress — possibly another process's —
+            # unless it has been sitting there for an hour.
+            if path.suffix == '.tmp' and time.time() - st.st_mtime < 3600:
+                continue
+            if st.st_mtime < cutoff or path.suffix == '.tmp':
+                path.unlink()
+                out['removed'] += 1
+                out['bytes_freed'] += st.st_size
+                continue
+            with open(path, 'rb') as fh:
+                head = fh.read(2)
+            if head == _GZIP_MAGIC or st.st_size < 4096:
+                continue
+            packed = gzip.compress(path.read_bytes(), compresslevel=4)
+            if len(packed) < st.st_size:
+                tmp = path.with_suffix('.tmp')
+                tmp.write_bytes(packed)
+                os.utime(tmp, (st.st_atime, st.st_mtime))    # age is unchanged
+                tmp.replace(path)
+                out['compressed'] += 1
+                out['bytes_freed'] += st.st_size - len(packed)
+        except OSError as exc:
+            log.debug('cache sweep skipped %s: %s', path, exc)
+    return out
 
 
 # ─────────────────────────────────────────────

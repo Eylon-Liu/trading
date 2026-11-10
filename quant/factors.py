@@ -692,6 +692,16 @@ def build_all(tickers: list[str], as_of: date | str,
     for f in frames[1:]:
         out = out.join(f, how='outer')
 
+    # Only the names asked for. A backtest hands in facts preloaded for every
+    # ticker the window will ever touch, and the fundamentals built from them
+    # came back for all of those — so through the outer join a 2020 date also
+    # ranked companies that did not join the index until years later (61 of
+    # them at 2020-01-31), with fundamentals but no price factors. Being
+    # picked before you were a member is exactly the look-ahead the
+    # point-in-time universe exists to prevent.
+    if tickers:
+        out = out[out.index.isin(set(tickers))]
+
     if tickers:
         ph = ','.join(f':t{i}' for i in range(len(tickers)))
         meta = db.read_sql(

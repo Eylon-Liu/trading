@@ -536,6 +536,13 @@ def _daily(args) -> int:
         except Exception as exc:                   # noqa: BLE001
             print(f'⚠️  backup failed: {exc}')
 
+    # Keep the footprint level: prune what the retention schedule says is
+    # past its use (config.RETENTION). The evening run may also compact.
+    try:
+        maintenance.housekeeping(vacuum=bool(args.backup), say=print)
+    except Exception as exc:                       # noqa: BLE001
+        print(f'⚠️  housekeeping failed: {exc}')
+
     if failed:
         print(f'⚠️  {len(failed)} strategy screen(s) failed: {", ".join(failed)}')
     return rc
@@ -553,6 +560,13 @@ def cmd_db(args) -> int:
             print(f'size     : {info["size_mb"]} MB (+{info["wal_mb"]} MB WAL)')
         print(f'backups  : {info["backups"]}'
               + (f' — newest {info["latest_backup"]}' if info['latest_backup'] else ''))
+        use = M.usage()
+        print('on disk  : ' + ', '.join(f'{k} {v:,.0f} MB' for k, v in use.items() if k != 'total')
+              + f' — {use["total"]:,.0f} MB in all')
+        free = M.reclaimable_mb()
+        if free >= 50:
+            print(f'           {free:,.0f} MB inside the database is free space; '
+                  f'`python cli.py db tidy --vacuum` returns it to the disk')
         print()
         print(info['tables'].to_string(index=False))
         problems = {k: v for k, v in M.consistency_report().items() if v}
@@ -593,6 +607,26 @@ def cmd_db(args) -> int:
         for k, v in res.items():
             print(f'  {k:22} {v}')
         print('✅  clean-up done' + (' (vacuumed)' if args.vacuum else ''))
+        return 0
+
+    if args.action == 'tidy':
+        res = M.housekeeping(vacuum=args.vacuum, say=print)
+        for k, v in res.items():
+            if k not in ('usage', 'freed_mb') and v not in (0, 0.0):
+                print(f'  {k:22} {v}')
+        return 0
+
+    if args.action == 'restore':
+        backups = M.list_backups()
+        if not backups:
+            print('❌  no backups in db/backups/ — make one with `python cli.py db backup`')
+            return 1
+        live = M.sqlite_path()
+        dest = live.with_name(live.stem + '.restored.sqlite')
+        M.restore_to(backups[0], dest)
+        print(f'✅  {backups[0].name} unpacked to {dest}')
+        print(f'    Check it, stop the web UI and the routine, then replace the live file:')
+        print(f'    mv "{dest}" "{live}"')
         return 0
     return 1
 
@@ -1171,20 +1205,23 @@ def build_parser() -> argparse.ArgumentParser:
     dly.add_argument('--skip-ingest', action='store_true')
     dly.add_argument('--skip-screens', action='store_true')
     dly.add_argument('--backup', action='store_true',
-                     help='back up the database afterwards (keeps 5)')
+                     help='back up the database afterwards (compressed; keeps 3)')
     dly.add_argument('--no-llm', action='store_true',
                      help='skip the AI earnings reviews this run')
     dly.add_argument('--dry-run', action='store_true',
                      help='print what would happen and exit')
     dly.set_defaults(func=cmd_daily)
 
-    dbp = sub.add_parser('db', help='database upkeep: status | backup | check | clean')
-    dbp.add_argument('action', choices=['status', 'backup', 'check', 'clean'])
-    dbp.add_argument('--keep', type=int, default=5, help='backups to keep')
+    dbp = sub.add_parser('db', help='database upkeep: status | backup | check | '
+                                    'clean | tidy | restore')
+    dbp.add_argument('action', choices=['status', 'backup', 'check', 'clean',
+                                        'tidy', 'restore'])
+    dbp.add_argument('--keep', type=int, default=None,
+                     help=f'backups to keep (default {config.RETENTION["backups"]})')
     dbp.add_argument('--full', action='store_true',
                      help='check: full integrity_check instead of quick_check')
     dbp.add_argument('--vacuum', action='store_true',
-                     help='clean: VACUUM afterwards to return space to disk')
+                     help='clean / tidy: VACUUM afterwards to return space to disk')
     dbp.add_argument('--prune-detail-days', type=int,
                      help='clean: drop per-factor detail of runs older than N days')
     dbp.add_argument('--no-backup', action='store_true',
