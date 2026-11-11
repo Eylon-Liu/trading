@@ -137,8 +137,9 @@ point a Cloudflare Tunnel at it. Times follow `QUANT_TZ` (default
 **Bringing your data along** instead of re-downloading it:
 
 ```bash
-python3 cli.py db backup                         # on the Mac
-scp db/backups/quant-*.sqlite server:trading/    # newest file
+python3 cli.py db backup                            # on the Mac
+scp db/backups/quant-*.sqlite.gz server:trading/    # newest file
+gunzip quant-*.sqlite.gz                            # on the server
 docker compose run --rm -v "$PWD:/import" web \
     sh -c 'cp /import/quant-*.sqlite /app/db/quant.sqlite'
 docker compose restart

@@ -225,7 +225,9 @@ def _risk_free(start: date, end: date) -> float:
 
 def _weights(scores: pd.DataFrame, n: int, scheme: str,
              vols: pd.Series | None = None) -> pd.Series:
-    picks = scores.head(n)
+    # The same sector-capped shortlist a live screen shows, so a backtest
+    # holds what the screen would have told you to hold.
+    picks = EN.diversified_head(scores, n)
     if picks.empty:
         return pd.Series(dtype=float)
 

@@ -165,6 +165,70 @@ def _from_rss(url: str, params: dict, ticker: str, source: str) -> list[dict] | 
     return out
 
 
+# Syndicated market-research releases ("… Market Report 2026: Size, Share,
+# Trends and Forecast to 2030 | 18.6% CAGR with Microsoft, NVIDIA…") name a
+# dozen large companies to ride their feeds. They carry words like
+# "forecast" and "capacity", so the extractor tagged them as guidance — and
+# they led the material-events section of a real weekend digest.
+_PROMO = re.compile(
+    r'market (report|size|share|outlook|analysis|forecast)\b|\bcagr\b|'
+    r'researchandmarkets|market research|forecasts? to 20\d\d|'
+    r'\b(size|share), (share|trends|growth)\b', re.I)
+
+# Words too generic to identify a company on their own.
+_NAME_NOISE = {'inc', 'corp', 'corporation', 'company', 'co', 'the', 'group',
+               'holdings', 'plc', 'ltd', 'limited', 'class', 'and', 'of',
+               'international', 'global', 'american', 'united', 'general',
+               'national', 'first', 'new', 'financial', 'energy', 'services',
+               'technologies', 'technology', 'systems', 'industries',
+               'communications', 'resources', 'partners', 'trust', 'bancorp'}
+# A company better known by a brand than by its registered name.
+_ALIASES = {
+    'GOOGL': ('google', 'youtube', 'waymo'), 'GOOG': ('google', 'youtube', 'waymo'),
+    'META': ('facebook', 'instagram', 'whatsapp'), 'AMZN': ('aws',),
+    'BRK-B': ('berkshire', 'buffett'), 'JPM': ('jpmorgan', 'jp morgan'),
+    'XOM': ('exxon',), 'JNJ': ('j&j', 'johnson & johnson'), 'PG': ('p&g', 'procter'),
+    'KO': ('coca-cola', 'coke'), 'T': ('at&t',), 'BAC': ('bank of america', 'bofa'),
+    'GS': ('goldman',), 'MS': ('morgan stanley',), 'UNH': ('unitedhealth', 'optum'),
+    'HD': ('home depot',), 'LLY': ('eli lilly', 'lilly'), 'GM': ('general motors',),
+    'GE': ('general electric', 'ge aerospace'), 'BA': ('boeing',),
+}
+
+
+def _name_keys(ticker: str, company_name: str | None) -> list[str]:
+    """Lower-case strings whose presence means the article is about this company."""
+    keys = list(_ALIASES.get(ticker, ()))
+    words = [w for w in re.sub(r'[^a-z0-9& ]', ' ', (company_name or '').lower()).split()
+             if w not in _NAME_NOISE]
+    if words:
+        keys.append(words[0] if len(words[0]) >= 4 else ' '.join(words[:2]))
+    return [k for k in keys if k]
+
+
+def is_about(ticker: str, company_name: str | None, title: str, body: str) -> bool:
+    """
+    Does the article mention the company at all — by name, brand, or symbol?
+
+    A ticker feed also carries pieces about peers and suppliers ("Arbutus
+    reports third quarter…" in Pfizer's feed). Those are worth keeping as
+    context, but an event found in one is not this company's event. With no
+    name on file there is nothing to check against, so the answer is yes.
+    """
+    keys = _name_keys(ticker, company_name)
+    if not keys:
+        return True
+    text = f'{title} {body}'
+    low = text.lower()
+    if any(k in low for k in keys):
+        return True
+    sym = re.escape(ticker.replace('-', '.'))
+    # "(NYSE: PFE)", "$PFE", or the bare symbol when it is not also a word.
+    if re.search(rf'[:$(]\s?{sym}\b', text) or \
+            (len(ticker) >= 3 and re.search(rf'\b{sym}\b', text)):
+        return True
+    return False
+
+
 def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]:
     """Gather, deduplicate, score and structure coverage for one ticker.
 
@@ -186,7 +250,7 @@ def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]
     seen, unique = set(), []
     for it in items:
         key = (it['title'] or '').strip().lower()[:90]
-        if key and key not in seen:
+        if key and key not in seen and not _PROMO.search(it['title'] or ''):
             seen.add(key)
             unique.append(it)
 
@@ -200,6 +264,10 @@ def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]
         text = f"{it['title']}. {it['body']}"
         sent = SENT.score(text)
         ex = EX.extract(text)
+        if ex.events and not is_about(ticker, company_name, it['title'], it['body']):
+            # Kept as context, but someone else's buyback or guidance is not
+            # a material event for this company.
+            ex.events = []
         rows.append({
             'id': _mk_id(ticker, it['title'], it['published']),
             'ticker': ticker, 'published': it['published'],

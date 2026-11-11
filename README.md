@@ -24,14 +24,28 @@ bash run.sh          # install, create the database, load the Dow 30, launch
 
 The app treats these as separate questions rather than one ranked list, because they are.
 
-| | **Long-term** (1 year+) | **Mid-term** (1–6 months) |
+| | **Long-term** (1 year+) | **Mid-term** (3–6 months) |
 |---|---|---|
-| Question | *Is this business worth owning?* | *Is this worth trading now?* |
-| Driven by | Returns on capital, balance sheet, valuation, earnings durability | Trend, catalyst, positioning; fundamentals only as a filter |
-| Output | Rank, signal, and the reasoning behind it | Entry, stop, target, time stop, position size |
-| Exit | A broken thesis — no price level | Stop hit, target hit, time stop, or trend break |
-| Rebalance | Quarterly | Monthly, with intra-period stops |
-| Strategies | Quality Value, Deep Value, Piotroski, Compounder, Dividend Quality, Low Volatility, GARP, Multi-Factor | Momentum + Trend, 52-Week Breakout, Pullback, Post-Earnings Drift, Insider Cluster, Mean Reversion |
+| Question | *Is this business worth owning?* | *Is this worth holding for the next two quarters?* |
+| Driven by | Returns on capital, balance sheet, valuation, earnings durability | What lasts that long: 6–12 month momentum, earnings drift, cash returned to owners, insider buying |
+| Output | Rank, signal, and the reasoning behind it | Entry, stop, target, six-month time stop, position size |
+| Exit | A broken thesis — no price level | Stop hit, target hit, six-month limit, or dropping out at the half-yearly review |
+| Rebalance | Every six months | Every six months, with stops in between |
+| Strategies | Buffett Quality, Quality Momentum, Style Factors, Insider Conviction, AI Earnings Review, Total Shareholder Yield, **Multi-Strategy Consensus** | **Balanced (Value + Momentum + Quality)**, Momentum + Trend, 52-Week Breakout, Low-Vol Relative Strength, Post-Earnings Drift, Insider Cluster; shorter entry setups: Pullback, Mean Reversion |
+
+**Do they beat SPY?** Measured, not assumed — and the answer is *not
+provably*. **[docs/strategy-research.md](docs/strategy-research.md)** tests
+every strategy on the S&P 500 from 2020 over 3- and 6-month holds. Held six
+months, with costs, Buffett Quality, Shareholder Yield, Momentum + Trend and
+the Consensus finished 0.4–1.4% a year ahead of SPY and the Balanced blend
+slightly behind — margins too small to distinguish from luck. Rotated every
+three months, all of them did worse, which is why both horizons now
+rebalance half-yearly. Value screens won in 2020–2023 and momentum screens
+afterwards; neither did both.
+
+A shortlist (and a backtest portfolio) never takes more than 30% of its
+names from one sector: the top of a ranking can be a single theme, and a
+theme reverses all at once.
 
 Position sizes are **percentages of portfolio** implied by a risk budget and the stop distance — a wider stop earns a smaller position. The app knows nothing about your account and never asks.
 
@@ -233,7 +247,7 @@ python3 cli.py consensus-test --start 2021-01-01            # study + backtest
 python3 cli.py consensus-test --start 2021-01-01 --compare  # …next to every member strategy
 ```
 
-The **agreement study** groups every ranked name at each date by how many families agreed, and reports its forward return versus SPY (3 months by default), hit rate, and the rank correlation between votes and returns — then says plainly whether more agreement meant higher returns on your universe. The **backtest** runs the consensus walk-forward with the same execution rules as every other strategy. Families whose data does not reach back to `--start` are left out for the whole run, and the AI vote is never part of a backtest.
+The **agreement study** groups every ranked name at each date by how many families agreed, and reports its forward return versus SPY (6 months by default), hit rate, and the rank correlation between votes and returns — then says plainly whether more agreement meant higher returns on your universe. The **backtest** runs the consensus walk-forward — top names held six months, next-close fills, costs included — and with `--compare` every member strategy the same way. Families whose data does not reach back to `--start` are left out for the whole run, and the AI vote is never part of a backtest.
 
 The app is fully functional without a key: every panel degrades to a stated reason rather than a blank space, and a missing key, an expired key, a rate limit, a network failure and a safety refusal are each handled and logged distinctly.
 
@@ -332,7 +346,7 @@ profile snapshots, news — so it is worth protecting.
 
 ```bash
 python3 cli.py db status     # size, row counts, backups, anything cleanable
-python3 cli.py db backup     # consistent online copy to db/backups/ (keeps 5)
+python3 cli.py db backup     # consistent, compressed copy to db/backups/ (keeps 3)
 python3 cli.py db check      # SQLite integrity check + consistency counts
 python3 cli.py db clean      # backup, then remove duplicate runs / news rows,
                              # orphans; --vacuum to return space to disk
@@ -341,6 +355,32 @@ python3 cli.py db clean      # backup, then remove duplicate runs / news rows,
 The evening job backs up automatically (`--backup`). On a store built before
 this version, run `db clean --vacuum` once: earlier versions kept every
 re-run of every screen, which is usually most of the file.
+
+### Disk and memory: it levels off
+
+Every routine run ends with housekeeping (`config.RETENTION`), so the
+footprint stops growing instead of adding a little every day:
+
+| What | Kept | Why it is safe |
+|---|---|---|
+| Downloaded responses (`cache/`) | gzip-compressed; dropped 30 days after their last refresh | everything in them is already in the database |
+| Per-factor detail behind each screen | 30 days | rankings and signals are kept; only the breakdown goes |
+| Daily screen runs | every day for 120 days, then one a week | the track record and Compare need cohorts, not five a week |
+| News articles | 180 days | the digest and Intel read recent news only |
+| Backups | 3, gzip-compressed | each is a full copy |
+| Logs, daily report files | 30 / 180 days | monthly reports are kept |
+
+Prices, filings, fundamentals and index membership — what backtests are
+built on — are never pruned. Measured on the S&P 500: about 1.3 GB in all
+(database 1.0 GB, cache 0.3 GB) where the cache alone had been 2.4 GB, and
+the daily routine peaks near 1.1 GB of memory, down from 2.5 GB.
+
+```bash
+python3 cli.py db status           # where the space is
+python3 cli.py db tidy             # apply the retention schedule now
+python3 cli.py db tidy --vacuum    # …and hand freed space back to the disk
+python3 cli.py db restore          # unpack the newest backup beside the live file
+```
 
 ---
 
@@ -456,7 +496,9 @@ The suite covers the transforms against hand-computed values, Wilder RSI against
 - **SIC → GICS is approximate.** Alphabet lands in Information Technology rather than Communication Services, for instance.
 - **`yfinance.info` is unreliable.** Market cap and forward P/E fall back to SEC-derived estimates when it is throttled; the app is built not to depend on it.
 - **Backtests ignore borrow costs, taxes, and market impact.** Long-horizon fills are at the close one session after the signal.
-- **Delisted tickers have no price history** from the free source, so names that later failed cannot be picked in a historical backtest (see *How the backtests trade*).
+- **Delisted tickers have no price history** from the free source, so names that later failed cannot be picked in a historical backtest (see *How the backtests trade*). Companies that merely changed symbol (FB→META, BK→BNY…) are mapped; companies removed from the index but still trading can be loaded, which brings the S&P 500 gap under 10% for every year from 2020.
+- **No strategy here is proven to beat SPY.** Over 2020–2026 the best were about 1% a year ahead with six-month holds and costs, well inside the noise; treat rankings as a way to narrow a list, not as a forecast (docs/strategy-research.md).
+- **Headline sentiment is lexicon-based** and misreads some headlines ("first-ever close above $350" scored negative). The optional AI layer reads them properly.
 
 ---
 

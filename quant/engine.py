@@ -61,7 +61,45 @@ class RunResult:
         return self.strategy.horizon
 
     def top(self, n: int = 20) -> pd.DataFrame:
-        return self.scores.head(n)
+        """The shortlist: best-ranked first, no sector over its share."""
+        return diversified_head(self.scores, n)
+
+
+def diversified_head(scores: pd.DataFrame, n: int,
+                     max_share: float | None = None) -> pd.DataFrame:
+    """
+    The first `n` rows of a ranking with at most `max_share` of them from
+    any one sector (config.MAX_SECTOR_SHARE; at least two names). Names
+    passed over stay in the ranking — only the shortlist skips them. Rows
+    with no known sector are never capped, and the cap gives way rather
+    than return fewer than `n` names.
+    """
+    if scores.empty or n <= 0:
+        return scores.head(0)
+    share = config.MAX_SECTOR_SHARE if max_share is None else max_share
+    if 'sector' not in scores or share >= 1.0:
+        return scores.head(n)
+    cap = max(2, int(np.ceil(n * share)))
+    n = min(n, len(scores))
+    # The cap is a preference, not a rule that can leave the list short: in
+    # a narrow universe (a single-sector screen, a small watchlist) it is
+    # relaxed one name at a time until the shortlist is full.
+    while True:
+        taken: dict[str, int] = {}
+        keep = []
+        for ticker, sector in scores['sector'].items():
+            known = isinstance(sector, str) and sector and sector != 'Unknown'
+            if known and taken.get(sector, 0) >= cap:
+                continue
+            keep.append(ticker)
+            if known:
+                taken[sector] = taken.get(sector, 0) + 1
+            if len(keep) == n:
+                break
+        if len(keep) == n or cap >= n:
+            break
+        cap += 1
+    return scores.loc[keep]
 
 
 # ─────────────────────────────────────────────
@@ -495,7 +533,7 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     plans = pd.DataFrame()
     # An avoid list gets no long entry, stop or target.
     if strategy.needs_trade_plan and not strategy.invert:
-        shortlist = scores.head(top_n)
+        shortlist = diversified_head(scores, top_n)
         plans = TP.build_plans(
             raw_eligible.loc[raw_eligible.index.intersection(shortlist.index)],
             as_of, setup=strategy.setup, params=plan_params)

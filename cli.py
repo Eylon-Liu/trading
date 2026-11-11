@@ -936,18 +936,20 @@ def cmd_consensus_test(args) -> int:
         else:
             print('  ❌ agreement did not predict returns on this universe/window')
 
-    print('\n▸ walk-forward backtest (quarterly rebalance, next-close fills)')
+    print('\n▸ walk-forward backtest (top names held six months, next-close '
+          'fills, costs included)')
     keys = [strat] + ([k for fam in strat.components.values() for k in fam]
                       if args.compare else [])
     rows = []
     for k in keys:
         name = k.name if hasattr(k, 'name') else ST.get(k).name
         try:
-            if (ST.get(k).horizon == 'mid'):
-                res = BT.run_trade_backtest(spec, k, start, args.end, n_positions=10)
-            else:
-                res = BT.run_backtest(spec, k, start, args.end, n_holdings=args.top,
-                                      rebalance='Q')
+            # Every member on the same footing: hold the shortlist, review
+            # half-yearly. Mid-term members used to go through the stop-and-
+            # target trade simulation here while the others were simply held,
+            # so the table compared exit rules as much as selection.
+            res = BT.run_backtest(spec, k, start, args.end, n_holdings=args.top,
+                                  rebalance='SA')
         except (ValueError, BT.DegradedBacktest) as exc:
             rows.append({'strategy': name, 'note': str(exc)[:70]})
             continue
@@ -1299,7 +1301,7 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument('--universe', help=f'default QUANT_INDEX ({config.QUANT_INDEX})')
     ct.add_argument('--start', default=str(date.today() - timedelta(days=365 * 4)))
     ct.add_argument('--end')
-    ct.add_argument('--horizon', type=int, default=3, help='forward months')
+    ct.add_argument('--horizon', type=int, default=6, help='forward months')
     ct.add_argument('--freq', default='QE', choices=['ME', 'QE'],
                     help='sampling: ME monthly, QE quarterly')
     ct.add_argument('--top', type=int, default=20, help='holdings in the backtest')

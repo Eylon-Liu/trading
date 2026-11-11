@@ -145,3 +145,38 @@ def test_news_refresh_stops_at_its_time_budget_and_keeps_priorities(fresh_db, mo
     nxt = NEWS._fetch_order(tickers)
     left_out = [t for t in tickers if t not in done]
     assert nxt[0] == 'ZZZ' and set(nxt[1:1 + len(left_out)]) == set(left_out)
+
+
+# ── what counts as this company's news ───────────────────────────
+
+def test_market_research_releases_are_dropped(feeds):
+    promo = _article()
+    promo[0]['title'] = ('Mobile Robot Middleware Market Report 2026: Size, Share, Trends and '
+                         'Forecast to 2030 | 18.6% CAGR with Microsoft, AWS, NVIDIA')
+    real = _article()
+    real[0]['title'] = 'Microsoft raises full-year guidance after cloud beat'
+    feeds.update(yf=promo + real, rss=[])
+    rows = NEWS.fetch_for_ticker('MSFT', 'Microsoft Corp')
+    assert [r['title'] for r in rows] == ['Microsoft raises full-year guidance after cloud beat']
+
+
+def test_another_companys_event_is_not_this_companys_event(feeds):
+    other = [{'ticker': 'PFE', 'title': 'Arbutus Reports Third Quarter Results and announces buyback',
+              'url': '', 'published': datetime.utcnow(), 'source': 'Yahoo RSS',
+              'body': 'Returned $230M of capital to shareholders via tender offer; dividend received.'}]
+    own = [{'ticker': 'PFE', 'title': 'Pfizer raises dividend and announces $5 billion buyback',
+            'url': '', 'published': datetime.utcnow(), 'source': 'Yahoo RSS', 'body': ''}]
+    feeds.update(yf=other + own, rss=[])
+    rows = {r['title'][:7]: r for r in NEWS.fetch_for_ticker('PFE', 'Pfizer Inc')}
+    assert rows['Arbutus']['events'] == ''              # kept as context, no event
+    assert rows['Pfizer ']['events'] != ''
+
+
+def test_is_about_recognises_names_brands_and_symbols():
+    assert NEWS.is_about('GOOGL', 'Alphabet Inc.', 'Google unveils new chips', '')
+    assert NEWS.is_about('PFE', 'Pfizer Inc', 'Drugmaker (NYSE: PFE) wins approval', '')
+    assert NEWS.is_about('JPM', 'JPMorgan Chase & Co', 'JP Morgan lifts forecast', '')
+    assert not NEWS.is_about('T', 'AT&T Inc.', 'Tesla deliveries beat', 'The T in the title is not a symbol.')
+    assert NEWS.is_about('T', 'AT&T Inc.', 'AT&T adds subscribers', '')
+    assert not NEWS.is_about('PFE', 'Pfizer Inc', 'Arbutus Reports Third Quarter Results', '')
+    assert NEWS.is_about('ZZZ', None, 'anything', '')     # no name on file: cannot judge

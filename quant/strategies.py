@@ -8,12 +8,25 @@ LONG-TERM (a year and up) is a *screen to accumulate*. It asks which
 businesses are worth owning, so it leans on fundamentals that only mean
 anything over years: returns on capital, balance-sheet strength, valuation,
 earnings durability. There is no exit level, because the exit is a broken
-thesis, not a price. Turnover should be low and rebalancing quarterly.
+thesis, not a price. Turnover should be low.
 
-MID-TERM (days to months) is a *trade*. Fundamentals act as a quality filter
-rather than the thesis; what drives it is trend, catalyst, and positioning.
-Every candidate gets a full plan — entry, stop, target, time stop, size — from
-quant/tradeplan.py, because a position with no exit rule is not a trade.
+Both horizons rebalance every six months. That is a measured choice, not a
+convention: on the S&P 500 from 2020 every strategy tested did better held
+six months than rotated every three — by two to three points a year, in a
+walk-forward test with costs and in month-by-month cohorts alike. Rotating
+quarterly sells names whose trend or re-rating has not finished.
+
+MID-TERM (three to six months) is a *position*. What drives it has to last
+that long: 12- and 6-month momentum, the drift after an earnings surprise,
+cash returned to owners, insider buying — not last week's oversold reading.
+Every candidate gets a plan — entry, stop, target, a six-month time stop,
+size — from quant/tradeplan.py, because a position with no exit rule is not
+a plan.
+
+Evidence, not assertion: docs/strategy-research.md measures every strategy
+here on the S&P 500 from 2020 over 3- and 6-month holds. Its plain
+conclusion is that none is proven to beat SPY; read it before trusting a
+ranking with money.
 
 A strategy is a declarative dict, so adding one is configuration rather than
 code.
@@ -34,16 +47,17 @@ HORIZONS = {
     'long': {
         'label': 'Long-term (1 year+)',
         'blurb': 'Screen for businesses worth owning and accumulating.',
-        'rebalance': 'Q',
+        'rebalance': 'SA',
         'needs_trade_plan': False,
         'default_holdings': 25,
     },
     'mid': {
-        'label': 'Mid-term (1-6 months)',
-        'blurb': 'Time-bound trades with a defined entry, stop and target.',
-        'rebalance': 'M',
+        'label': 'Mid-term (3-6 months)',
+        'blurb': 'Positions held three to six months, with an entry, a stop '
+                 'and a six-month time limit.',
+        'rebalance': 'SA',
         'needs_trade_plan': True,
-        'default_holdings': 10,
+        'default_holdings': 20,
     },
 }
 
@@ -281,6 +295,33 @@ LONG_TERM = {
 # ─────────────────────────────────────────────
 
 MID_TERM = {
+    # Value and momentum are the two best-documented return patterns, and
+    # they fail at different times: on the S&P 500 the value screens beat
+    # SPY in 2020-2023 while every momentum screen lagged, and from 2024 it
+    # was the reverse (their excess returns correlate about -0.3). This
+    # blends them in one ranking — with profitability and the earnings
+    # reaction as tie-breakers, and a trend gate so that cheap-and-falling
+    # is not bought. It is steadier than either style alone; it is not
+    # shown to beat SPY (docs/strategy-research.md).
+    'balanced': Strategy(
+        key='balanced', name='Balanced: Value + Momentum + Quality', horizon='mid',
+        description='Cash-generative, reasonably priced businesses that are '
+                    'also in an uptrend — three styles in one ranking.',
+        thesis='Cheap stocks can stay cheap and rising stocks can be '
+               'expensive; a name that is both cheap on cash flow and already '
+               'rising has two independent reasons to be owned, and the two '
+               'styles have historically lost money at different times. '
+               'Hold about six months; exit on the stop, at the six-month '
+               'limit, or when the name falls out of the top of the ranking '
+               'at the half-yearly review.',
+        weights={
+            'EARNINGS_YIELD': 1.0, 'FCF_YIELD': 1.0, 'BUYBACK_YIELD': 1.0,
+            'MOM_12_1': 1.5, 'MOM_6_1': 0.75, 'PCT_FROM_52W_HIGH': 0.75,
+            'ROIC': 0.75, 'ACCRUALS': 0.5, 'EARNINGS_REACTION': 0.75,
+        },
+        filters={'min_above_ma200': 1},
+        setup='momentum',
+    ),
     'momentum_trend': Strategy(
         key='momentum_trend', name='Momentum + Trend', horizon='mid',
         description='12-1 momentum in confirmed uptrends, scaled by volatility.',
@@ -306,9 +347,12 @@ MID_TERM = {
     ),
     'pullback': Strategy(
         key='pullback', name='Pullback in Uptrend', horizon='mid',
-        description='Oversold entries inside intact long-term uptrends.',
+        description='Oversold entries inside intact long-term uptrends — a '
+                    'way into a trend, usually resolved within weeks.',
         thesis='Buy temporary weakness in a strong name; exit if the pullback '
-               'becomes a trend change.',
+               'becomes a trend change. An entry technique more than a '
+               'three-to-six-month thesis: over 6-month holds it was level '
+               'with SPY from 2020 and behind it from 2024.',
         weights={
             'PCT_VS_MA200': 1.2, 'MOM_12_1': 1.0,
             'REVERSAL_1M': 1.2, 'ROIC': 0.5,
@@ -348,8 +392,11 @@ MID_TERM = {
     ),
     'mean_reversion': Strategy(
         key='mean_reversion', name='Quality Mean Reversion', horizon='mid',
-        description='Deeply oversold but fundamentally sound — a contrarian bounce.',
-        thesis='Fade the overshoot in a quality name; exit quickly if it keeps falling.',
+        description='Deeply oversold but fundamentally sound — a contrarian '
+                    'bounce, usually over weeks rather than months.',
+        thesis='Fade the overshoot in a quality name; exit quickly if it keeps '
+               'falling. The bounce is a short-horizon effect: over 6-month '
+               'holds it beat SPY in 2020-2022 and trailed it every year since.',
         weights={
             'REVERSAL_1M': 1.5, 'ROIC': 1.0, 'FCF_YIELD': 0.8,
             'DEBT_TO_EQUITY': 0.8, 'PIOTROSKI_F': 0.6,
@@ -403,7 +450,8 @@ META = {
                'are grouped into families and each family casts one vote, so '
                'three momentum variants agreeing count once, not three times. '
                'A name on the Deteriorating Quality avoid list loses a vote. '
-               'Exit when agreement falls away.',
+               'Built for holds of about six months: review half-yearly and '
+               'exit when agreement falls away.',
         weights={},
         components={
             'Quality & value': ('buffett', 'shareholder_yield'),

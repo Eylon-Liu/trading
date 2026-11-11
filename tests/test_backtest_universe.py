@@ -82,3 +82,82 @@ def test_lean_read_matches_a_plain_read_and_shares_strings(fresh_db):
     # Equal values are one object, across chunks — that is the memory saving.
     assert lean['concept'].iloc[0] is lean['concept'].iloc[15]
     assert lean['ticker'].iloc[0] is lean['ticker'].iloc[7]
+
+
+# ── shortlist: no sector takes more than its share ───────────────
+
+def _ranking(sectors):
+    return pd.DataFrame({'composite': [1.0 - i * 0.01 for i in range(len(sectors))],
+                         'sector': sectors}, index=[f'T{i:02d}' for i in range(len(sectors))])
+
+
+def test_shortlist_caps_any_one_sector():
+    from quant import engine as EN
+    # The top of the ranking is one theme: twelve tech names, then others.
+    sc = _ranking(['Information Technology'] * 12 + ['Health Care'] * 6
+                  + ['Energy'] * 6 + ['Financials'] * 6)
+    top = EN.diversified_head(sc, 20)
+    counts = top['sector'].value_counts()
+    assert len(top) == 20 and counts.max() == 6          # 30% of 20
+    assert list(top.index[:6]) == [f'T{i:02d}' for i in range(6)]   # best names kept, in order
+    assert 'T06' not in top.index and 'T12' in top.index           # 7th tech name passed over
+    # Passed-over names are still in the ranking itself.
+    assert len(sc) == 30
+
+
+def test_shortlist_cap_never_starves_a_small_list_and_ignores_unknown_sector():
+    from quant import engine as EN
+    sc = _ranking(['Energy'] * 5 + ['Unknown'] * 5)
+    assert len(EN.diversified_head(sc, 4)) == 4          # cap is at least two names…
+    assert EN.diversified_head(sc, 4)['sector'].tolist() == ['Energy', 'Energy', 'Unknown', 'Unknown']
+    assert len(EN.diversified_head(_ranking(['Unknown'] * 8), 6)) == 6
+    assert EN.diversified_head(sc, 10, max_share=1.0).equals(sc.head(10))
+
+
+def test_backtest_holds_the_capped_shortlist():
+    from quant import backtest as BT
+    sc = _ranking(['Information Technology'] * 12 + ['Health Care'] * 4
+                  + ['Energy'] * 4 + ['Financials'] * 4)
+    w = BT._weights(sc, 10, 'equal')
+    held = sc.loc[w.index, 'sector'].value_counts()
+    assert len(w) == 10 and held['Information Technology'] == 3 and abs(w.sum() - 1) < 1e-9
+
+
+def test_cap_gives_way_in_a_narrow_universe():
+    from quant import engine as EN
+    # A single-sector screen must still return a full shortlist.
+    one = _ranking(['Information Technology'] * 15)
+    assert list(EN.diversified_head(one, 10).index) == list(one.index[:10])
+    # Two sectors, ten wanted: as even as the ranking allows, never short.
+    two = _ranking(['Information Technology'] * 12 + ['Health Care'] * 10)
+    top = EN.diversified_head(two, 10)
+    assert len(top) == 10 and top['sector'].value_counts().max() == 5
+    assert len(EN.diversified_head(_ranking(['Energy'] * 3), 10)) == 3
+
+
+# ── the 3-6 month horizon ────────────────────────────────────────
+
+def test_mid_term_means_three_to_six_months():
+    from quant import strategies as ST
+    from quant import tradeplan as TP
+    mid = ST.HORIZONS['mid']
+    assert '3-6 months' in mid['label'] and mid['rebalance'] == 'SA'     # hold ~six months
+    p = TP.PlanParams()
+    assert p.time_stop_days == 126                        # six months of sessions
+    assert p.atr_stop_mult >= 3.0                         # not a swing-trade stop
+
+
+def test_balanced_blends_value_momentum_and_quality():
+    from quant import factors as FA
+    from quant import strategies as ST
+    s = ST.get('balanced')
+    assert s.horizon == 'mid' and s.filters.get('min_above_ma200') == 1
+    value = {'EARNINGS_YIELD', 'FCF_YIELD', 'BUYBACK_YIELD'}
+    momentum = {'MOM_12_1', 'MOM_6_1', 'PCT_FROM_52W_HIGH'}
+    w = s.weights
+    assert value <= set(w) and momentum <= set(w) and 'ROIC' in w
+    assert all(f in FA.FACTOR_DIRECTION for f in w)
+    # Neither style dominates the other.
+    v, m = sum(w[f] for f in value), sum(w[f] for f in momentum)
+    assert 0.8 <= v / m <= 1.25
+    assert 'balanced' not in {k for fam in ST.get('consensus').components.values() for k in fam}

@@ -30,3 +30,4 @@ env/
 .idea/
 .vscode/
 *.swp
+tools/research/panel.pkl

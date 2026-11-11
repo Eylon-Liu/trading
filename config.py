@@ -241,6 +241,12 @@ REBALANCE_OPTIONS = {'M': 'Monthly', 'Q': 'Quarterly', 'SA': 'Semi-Annual', 'A':
 BENCHMARK_TICKER = 'SPY'
 RISK_FREE_SERIES = 'DGS3MO'      # FRED 3-month T-bill
 RISK_FREE_RATE = 0.05             # annual fallback when no FRED T-bill data is stored
+# Largest share of a shortlist or backtest portfolio that one sector may
+# take. A ranking is sector-relative, but its very top can still be one
+# theme: in spring 2026 thirteen of the twenty highest momentum scores were
+# semiconductor and memory names. Concentration like that is a bet on a
+# sector, not on the strategy, and it reverses all at once.
+MAX_SECTOR_SHARE = 0.30
 TRANSACTION_COST_BPS = 10.0      # one-way, per trade
 SLIPPAGE_BPS = 5.0
 DEFAULT_PORTFOLIO_SIZE = 20

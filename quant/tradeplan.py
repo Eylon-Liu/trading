@@ -2,11 +2,17 @@
 Trade plans for mid-term positions.
 
 A long-term screen answers "is this worth owning?" and needs no exit level —
-you exit when the thesis breaks. A mid-term position held days-to-months is a
-different object: it needs a defined entry, a stop that reflects the stock's
-own volatility, a target expressed as a multiple of the risk taken, a time
-stop for when nothing happens, and a position weight derived from the stop
-distance rather than picked by feel.
+you exit when the thesis breaks. A mid-term position held three to six months
+is a different object: it needs a defined entry, a stop that reflects the
+stock's own volatility, a target expressed as a multiple of the risk taken, a
+time stop for when nothing happens, and a position weight derived from the
+stop distance rather than picked by feel.
+
+The defaults are sized for that holding period. A stop two daily ATRs away
+is a swing-trade stop: over months, ordinary noise reaches it and the
+position is closed long before the thesis has had time to work. Three ATRs
+or the two-month swing low (whichever is further), a two-to-one target and a
+six-month time limit let a position survive a normal pullback.
 
 Everything here is mechanical and derived from price. Weights are expressed as
 a percentage of portfolio given a stated risk budget — never share counts —
@@ -36,14 +42,14 @@ log = logging.getLogger(__name__)
 class PlanParams:
     """Tunables for plan construction."""
 
-    atr_stop_mult: float = 2.0       # stop distance in ATR units
-    target_r: float = 2.5            # profit target as a multiple of risk
-    time_stop_days: int = 60         # trading days before a stale trade is cut
+    atr_stop_mult: float = 3.0       # stop distance in ATR units
+    target_r: float = 2.0            # profit target as a multiple of risk
+    time_stop_days: int = 126        # trading days (six months) before exit
     risk_budget_pct: float = 1.0     # % of portfolio risked per position
     max_weight_pct: float = 10.0     # cap on any single position
     min_weight_pct: float = 1.0
-    swing_lookback: int = 20         # sessions used to find structural support
-    max_stop_pct: float = 15.0       # refuse trades needing a wider stop
+    swing_lookback: int = 40         # sessions used to find structural support
+    max_stop_pct: float = 20.0       # refuse trades needing a wider stop
     entry_pullback_atr: float = 0.5  # how far below spot a limit entry sits
 
 
