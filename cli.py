@@ -9,7 +9,9 @@ thing cron-able: a nightly ingest followed by a morning report needs no browser.
     python cli.py ingest --index DIA --full
     python cli.py screen --universe "SPY,sector=Information Technology" --strategy buffett
     python cli.py backtest --strategy momentum_trend --start 2023-01-01
-    python cli.py report --kind daily --strategy buffett --email you@example.com
+    python cli.py report --kind daily --email you@example.com
+    python cli.py daily                      # the scheduled routine, end to end
+    python cli.py db status                  # size, backups, row counts
     python cli.py strategies
 """
 
@@ -18,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 from datetime import date, timedelta
 
 import pandas as pd
@@ -264,13 +267,22 @@ def cmd_freshness(args) -> int:
     return 0
 
 
+def _resolve_as_of(value: str | None):
+    """'session' / 'last-session' -> the last completed trading session."""
+    if value and value.lower() in ('session', 'last-session', 'last_session'):
+        from core import market_calendar as MC
+        return MC.last_completed_session()
+    return value
+
+
 def cmd_screen(args) -> int:
     from data.universe import UniverseSpec, parse_spec
     from quant import engine
 
     db.init_db()
     spec = parse_spec(args.universe) if args.universe else UniverseSpec(preset='SPY')
-    result = engine.run(spec, args.strategy, as_of=args.as_of, top_n=args.top)
+    result = engine.run(spec, args.strategy, as_of=_resolve_as_of(args.as_of),
+                        top_n=args.top)
 
     if result.scores.empty:
         print('❌  no results — check the universe resolves and data is ingested')
@@ -303,14 +315,18 @@ def cmd_backtest(args) -> int:
     spec = parse_spec(args.universe) if args.universe else UniverseSpec(preset='SPY')
     strat = ST.get(args.strategy)
 
-    if strat.horizon == 'mid' and not strat.invert:
-        print(f'▸ mid-horizon backtest (stop/target aware): {strat.name}')
-        res = BT.run_trade_backtest(spec, args.strategy, args.start, args.end,
-                                    n_positions=args.top)
-    else:
-        print(f'▸ long-horizon backtest: {strat.name}')
-        res = BT.run_backtest(spec, args.strategy, args.start, args.end,
-                              n_holdings=args.top, rebalance=args.rebalance)
+    try:
+        if strat.horizon == 'mid':
+            print(f'▸ mid-horizon backtest (stop/target aware): {strat.name}')
+            res = BT.run_trade_backtest(spec, args.strategy, args.start, args.end,
+                                        n_positions=args.top)
+        else:
+            print(f'▸ long-horizon backtest: {strat.name}')
+            res = BT.run_backtest(spec, args.strategy, args.start, args.end,
+                                  n_holdings=args.top, rebalance=args.rebalance)
+    except (ValueError, BT.DegradedBacktest) as exc:
+        print(f'❌  {exc}')
+        return 1
 
     if not res.metrics:
         print('❌  backtest produced no results')
@@ -332,21 +348,287 @@ def cmd_report(args) -> int:
     from reports import email as mailer
 
     db.init_db()
-    path, html = builder.build_report(
-        strategy=getattr(args, 'strategy', None),
-        kind=args.kind, as_of=args.as_of)
-    print(f'✅  report written to {path}')
+    as_of = pd.to_datetime(args.as_of or date.today()).date()
+    kind = builder.auto_kind(as_of) if args.kind == 'auto' else args.kind
+    path, html = builder.build_report(kind=kind, as_of=as_of)
+    print(f'✅  {kind} report written to {path}')
 
     if args.email:
         try:
             mailer.send_report(html, args.email,
-                               subject=f'{args.kind.title()} Market Brief')
+                               subject=builder.subject_for(kind, as_of),
+                               report_id=builder.report_id_for(kind, as_of))
             print(f'📧  emailed to {args.email}')
         except mailer.SMTPNotConfigured as exc:
             print(f'⚠️  email skipped: {exc}')
+            return 1
         except Exception as exc:                   # noqa: BLE001
-            print(f'⚠️  email failed: {exc}')
+            _explain_smtp_error(exc)
+            return 1
     return 0
+
+
+def _all_strategy_keys() -> list[str]:
+    from quant import custom as CU
+    from quant import strategies as ST
+    keys = list(ST.ALL_STRATEGIES)
+    try:
+        extra = CU.summary()
+        if not extra.empty:
+            keys += [k for k in extra['key'] if k not in keys]
+    except Exception:                              # noqa: BLE001
+        pass
+    return keys
+
+
+def cmd_daily(args) -> int:
+    """The routine, one run at a time across processes (core/runlock.py)."""
+    if args.dry_run:
+        return _daily(args)
+    from core import runlock
+    what = f'daily --mode {args.mode}' + (' --no-email' if args.no_email else '') \
+        + (' --resend' if args.resend else '')
+    with runlock.hold(what) as ok:
+        return _daily(args) if ok else 1
+
+
+def _daily(args) -> int:
+    """
+    The scheduled routine, end to end: pull → screen → build → email.
+
+    Which email goes out is decided by the NYSE calendar for the day it runs:
+
+      trading day      the full brief — screens for every strategy, dated
+                       to the last completed session, compared with the
+                       session before it
+      weekend/holiday  a news-only digest of what was published since the
+                       last close; nothing is screened, because nothing
+                       traded
+
+    Safe to run more than once a day: a report already emailed for this date
+    is not sent again (unless --resend), and a re-run replaces the day's
+    screens instead of adding to them. A failed source is reported and the
+    brief is still built from stored data, with a warning in the email.
+    """
+    from core import maintenance
+    from core import market_calendar as MC
+    from data import members, sync
+    from data.universe import parse_spec
+    from quant import engine
+    from reports import builder
+    from reports import email as mailer
+
+    db.init_db()
+    today = pd.to_datetime(args.date).date() if args.date else date.today()
+    kind = builder.auto_kind(today) if args.kind == 'auto' else args.kind
+    index = (args.index or config.QUANT_INDEX).upper()
+    to = [] if args.no_email else mailer.recipients(args.email or config.QUANT_EMAIL)
+    report_id = builder.report_id_for(kind, today)
+    session = MC.last_completed_session()
+    spec = parse_spec(index)
+    from quant import portfolio as PF
+    watch = PF.watchlist()
+    held = PF.lots('open')['ticker'].unique().tolist()
+
+    reason = MC.closed_reason(today)
+    print(f'▸ {today:%a %Y-%m-%d} · '
+          f'{"market open" if reason is None else f"market closed ({reason})"}'
+          f' · last completed session {session} · report: {kind}')
+    print(f'  index={index}  mode={args.mode}  '
+          f'email={", ".join(to) if to else "(none)"}'
+          + (f'  watchlist={",".join(watch)}' if watch else ''))
+
+    if not to and not args.no_email:
+        print('⚠️  no recipient: set QUANT_EMAIL in .env or pass --email '
+              '(or --no-email to only prepare data).')
+        return 1
+
+    if kind == 'news' and not to and not args.force:
+        print('  market closed and no email requested — nothing to prepare.')
+        return 0
+
+    if to and not args.resend and builder.emailed_at(report_id):
+        print(f'✓ the {kind} report for {today} was already emailed — '
+              f'nothing to do (pass --resend to send again).')
+        return 0
+
+    if kind == 'news':
+        sources = ['news', 'policy', 'earnings']
+    elif args.mode == 'full':
+        sources = None                          # every source
+    else:
+        sources = ['prices', 'news', 'policy', 'macro', 'earnings']
+
+    if args.dry_run:
+        print(f'  dry run: would ingest {sources or "all sources"}, '
+              f'{"skip screens" if kind == "news" else f"screen as of {session}"}, '
+              f'build "{builder.subject_for(kind, today)}"'
+              + (f', email {", ".join(to)}' if to else ''))
+        return 0
+
+    # ── 1. pull ──────────────────────────────────────────────────
+    if not args.skip_ingest:
+        try:
+            tickers = members.latest_members(index)
+        except Exception as exc:                   # noqa: BLE001
+            print(f'⚠️  could not resolve {index} members: {exc}')
+            tickers = []
+        tickers = sorted(set(tickers) | set(watch) | set(held))
+        print(f'▸ ingest {", ".join(sources) if sources else "all sources"} '
+              f'for {len(tickers)} names')
+        try:
+            rep = sync.sync(tickers, index=index, sources=sources,
+                            progress=lambda m: print(f'  ▸ {m}'))
+            print(f'  {rep.summary()}')
+        except Exception as exc:                   # noqa: BLE001
+            print(f'⚠️  ingest failed ({type(exc).__name__}: {exc}) — '
+                  f'continuing with stored data')
+
+    # ── 1b. AI earnings reviews of new results filings ───────────
+    if not args.no_llm:
+        _run_reviews(index, watch, held, spec)
+
+    # ── 2. screen ────────────────────────────────────────────────
+    failed: list[str] = []
+    if kind != 'news' and not args.skip_screens:
+        keys = _all_strategy_keys()
+        print(f'▸ screening {len(keys)} strategies on {index} as of {session}')
+        for key in keys:
+            try:
+                res = engine.run(spec, key, as_of=session)
+                note = f'{len(res.scores)} ranked' if not res.scores.empty else 'no results'
+                if res.warnings:
+                    note += f' ({len(res.warnings)} warning(s))'
+                print(f'  ▸ {key:22} {note}')
+            except Exception as exc:               # noqa: BLE001
+                failed.append(key)
+                print(f'  ⚠️ {key:22} failed: {type(exc).__name__}: {str(exc)[:120]}')
+
+    # ── 3. build ─────────────────────────────────────────────────
+    if not to and builder.emailed_at(report_id):
+        # The evening job: this morning's email is the record of what was
+        # sent, so leave its file alone. Tomorrow's brief reads these screens.
+        print(f'✓ screens ready; the {kind} report for {today} was already '
+              f'emailed, so its file is left as sent.')
+        return 1 if failed else 0
+    path, html = builder.build_report(kind=kind, as_of=today, universe=spec)
+    print(f'✅  {kind} report written to {path}')
+
+    # ── 4. email ─────────────────────────────────────────────────
+    rc = 0
+    if to:
+        try:
+            mailer.send_report(html, to, subject=builder.subject_for(kind, today),
+                               report_id=report_id)
+            print(f'📧  emailed to {", ".join(to)}')
+        except mailer.SMTPNotConfigured as exc:
+            print(f'❌  email not sent: {exc}')
+            rc = 1
+        except Exception as exc:                   # noqa: BLE001
+            _explain_smtp_error(exc)
+            rc = 1
+
+    if args.backup:
+        try:
+            out = maintenance.backup()
+            if out:
+                print(f'💾  database backed up to {out}')
+        except Exception as exc:                   # noqa: BLE001
+            print(f'⚠️  backup failed: {exc}')
+
+    # Keep the footprint level: prune what the retention schedule says is
+    # past its use (config.RETENTION). The evening run may also compact.
+    try:
+        maintenance.housekeeping(vacuum=bool(args.backup), say=print)
+    except Exception as exc:                       # noqa: BLE001
+        print(f'⚠️  housekeeping failed: {exc}')
+
+    if failed:
+        print(f'⚠️  {len(failed)} strategy screen(s) failed: {", ".join(failed)}')
+    return rc
+
+
+def cmd_db(args) -> int:
+    """Database upkeep: status, backup, integrity check, clean-up."""
+    from core import maintenance as M
+
+    db.init_db()
+    if args.action == 'status':
+        info = M.status()
+        print(f'database : {info["url"]}')
+        if info.get('size_mb') is not None:
+            print(f'size     : {info["size_mb"]} MB (+{info["wal_mb"]} MB WAL)')
+        print(f'backups  : {info["backups"]}'
+              + (f' — newest {info["latest_backup"]}' if info['latest_backup'] else ''))
+        use = M.usage()
+        print('on disk  : ' + ', '.join(f'{k} {v:,.0f} MB' for k, v in use.items() if k != 'total')
+              + f' — {use["total"]:,.0f} MB in all')
+        free = M.reclaimable_mb()
+        if free >= 50:
+            print(f'           {free:,.0f} MB inside the database is free space; '
+                  f'`python cli.py db tidy --vacuum` returns it to the disk')
+        print()
+        print(info['tables'].to_string(index=False))
+        problems = {k: v for k, v in M.consistency_report().items() if v}
+        print()
+        if problems:
+            print('cleanable: ' + ', '.join(f'{k}={v}' for k, v in problems.items()))
+            print('           run `python cli.py db clean` to remove them')
+        else:
+            print('no duplicate or orphaned rows')
+        return 0
+
+    if args.action == 'backup':
+        out = M.backup(keep=args.keep)
+        if out is None:
+            print('❌  backups are only supported for a local SQLite database')
+            return 1
+        print(f'✅  backup written to {out}')
+        return 0
+
+    if args.action == 'check':
+        res = M.integrity_check(full=args.full)
+        if res == ['ok']:
+            print('✅  integrity check passed')
+        else:
+            print('❌  integrity problems:')
+            for line in res[:50]:
+                print(f'   {line}')
+        for k, v in M.consistency_report().items():
+            print(f'  {k:22} {v}')
+        return 0 if res == ['ok'] else 1
+
+    if args.action == 'clean':
+        if not args.no_backup:
+            out = M.backup(keep=args.keep)
+            if out:
+                print(f'💾  backup first: {out}')
+        res = M.clean(vacuum=args.vacuum, factor_detail_days=args.prune_detail_days)
+        for k, v in res.items():
+            print(f'  {k:22} {v}')
+        print('✅  clean-up done' + (' (vacuumed)' if args.vacuum else ''))
+        return 0
+
+    if args.action == 'tidy':
+        res = M.housekeeping(vacuum=args.vacuum, say=print)
+        for k, v in res.items():
+            if k not in ('usage', 'freed_mb') and v not in (0, 0.0):
+                print(f'  {k:22} {v}')
+        return 0
+
+    if args.action == 'restore':
+        backups = M.list_backups()
+        if not backups:
+            print('❌  no backups in db/backups/ — make one with `python cli.py db backup`')
+            return 1
+        live = M.sqlite_path()
+        dest = live.with_name(live.stem + '.restored.sqlite')
+        M.restore_to(backups[0], dest)
+        print(f'✅  {backups[0].name} unpacked to {dest}')
+        print(f'    Check it, stop the web UI and the routine, then replace the live file:')
+        print(f'    mv "{dest}" "{live}"')
+        return 0
+    return 1
 
 
 def cmd_strategies(args) -> int:
@@ -374,6 +656,479 @@ def cmd_status(args) -> int:
         FROM ingest_log GROUP BY source ORDER BY source
     """)
     print(fresh.to_string(index=False) if not fresh.empty else '  (nothing yet)')
+    return 0
+
+
+# ─────────────────────────────────────────────
+# PORTFOLIO, WATCHLIST, TRACK RECORD, CALENDARS
+# ─────────────────────────────────────────────
+
+def _fmt_pct(v) -> str:
+    import numpy as np
+    return f'{v:+.1%}' if v is not None and np.isfinite(v) else '—'
+
+
+def cmd_watch(args) -> int:
+    from quant import portfolio as PF
+    db.init_db()
+    if args.action == 'add':
+        names = PF.watch_add(args.tickers, note=args.note)
+        print(f'✅  watching {", ".join(names)}')
+    elif args.action == 'remove':
+        n = PF.watch_remove(args.tickers)
+        print(f'🗑  removed {n}')
+    wl = PF.watchlist_table()
+    env_only = sorted(set(config.WATCHLIST) - set(wl['ticker']))
+    if wl.empty and not env_only:
+        print('watchlist is empty — `python cli.py watch add AAPL MSFT`')
+        return 0
+    for _i, r in wl.iterrows():
+        print(f'  {r["ticker"]:8} {r["note"] or ""}')
+    for t in env_only:
+        print(f'  {t:8} (from QUANT_WATCHLIST in .env)')
+    return 0
+
+
+def cmd_portfolio(args) -> int:
+    from quant import portfolio as PF
+    db.init_db()
+    a = args.action
+    if a == 'add':
+        if args.shares is None or args.cost is None:
+            print('usage: portfolio add TICKER SHARES COST [--date --stop --target]')
+            return 1
+        lot = PF.add_lot(args.ticker, args.shares, args.cost, opened=args.date,
+                         stop=args.stop, target=args.target,
+                         strategy=args.strategy, note=args.note)
+        print(f'✅  added {args.ticker.upper()} lot {lot}')
+    elif a == 'close':
+        n = PF.close(args.ticker, exit_price=args.price, closed=args.date)
+        print(f'✅  closed {n} lot(s)' if n else '❌  no open lot matches')
+        if not n:
+            return 1
+    elif a == 'set':
+        n = PF.set_levels(args.ticker, stop=args.stop, target=args.target)
+        print(f'✅  updated {n} lot(s)')
+    elif a == 'import':
+        n = PF.import_csv(args.ticker)
+        print(f'✅  imported {n} lot(s) from {args.ticker}')
+    elif a == 'remove':
+        n = PF.delete_lot(args.ticker)
+        print(f'🗑  deleted {n} lot(s)')
+
+    if a in ('show', 'add', 'close', 'set', 'import', 'remove'):
+        h = PF.holdings()
+        if h.empty:
+            print('no open positions — `python cli.py portfolio add AAPL 10 185.50`')
+        else:
+            view = h[['shares', 'avg_cost', 'last', 'day_chg', 'pnl', 'pnl_pct',
+                      'weight', 'stop', 'target']].copy()
+            for c in ('day_chg', 'pnl_pct', 'weight'):
+                view[c] = view[c].map(_fmt_pct)
+            print(view.round(2).to_string())
+            sm = PF.summary(h)
+            money = lambda v: f'${v:,.0f}' if v == v else '—'      # noqa: E731
+            print(f'\nvalue {money(sm["market_value"])}  ·  P&L {money(sm["pnl"])} '
+                  f'({_fmt_pct(sm["pnl_pct"])})  ·  last session {money(sm["day_pnl"])}'
+                  + (f'  ·  {sm["unpriced"]} without a stored price — run ingest'
+                     if sm['unpriced'] else ''))
+        if args.lots:
+            print('\nlots:')
+            print(PF.lots('open')[['lot_id', 'ticker', 'shares', 'cost_basis', 'opened',
+                                   'stop', 'target', 'note']].to_string(index=False))
+    if a in ('show', 'alerts'):
+        al = PF.alerts()
+        print('\nalerts:' if al else '\nno alerts')
+        icon = {'risk': '🔴', 'watch': '🟠', 'info': '🔵'}
+        for x in al:
+            print(f'  {icon[x["level"]]} {x["ticker"]:6} {x["text"]}')
+    return 0
+
+
+def cmd_track(args) -> int:
+    from data.universe import parse_spec
+    from quant import track
+    db.init_db()
+    spec_json = parse_spec(args.index).to_json() if args.index else None
+    tr = track.summary(lookback_days=args.days, top_n=args.top, spec_json=spec_json)
+    if tr.empty:
+        print('no completed cohorts yet — the routine needs to have stored '
+              'screens at least a week ago')
+        return 0
+    view = tr[['name', 'horizon', 'cohorts', 'independent', 'mean_pick_return',
+               'mean_excess', 'hit_rate', 'mean_ic']].copy()
+    for c in ('mean_pick_return', 'mean_excess', 'hit_rate'):
+        view[c] = view[c].map(_fmt_pct)
+    view['mean_ic'] = view['mean_ic'].round(3)
+    print(view.to_string(index=False))
+    print('\nPicks bought at the close after each stored screen. Daily cohorts '
+          'overlap; trust "independent", not "cohorts".')
+    return 0
+
+
+def cmd_earnings(args) -> int:
+    from data import earnings as ER
+    from data import members
+    from quant import portfolio as PF
+    db.init_db()
+    names = set(PF.watchlist()) | set(PF.lots('open')['ticker'])
+    if args.index:
+        names |= set(members.latest_members(args.index.upper()))
+    if args.refresh:
+        print(f'▸ refreshing calendar for {len(names)} names')
+        n = ER.update_earnings(sorted(names))
+        for src, st in ER.LAST_STATUS.items():
+            print(f'  {src:8} {st}')
+        print(f'  {n} date(s) stored')
+    er = ER.upcoming(sorted(names), days=args.days)
+    if er.empty:
+        print('nothing scheduled — add names with `watch add`, or pass --index SPY')
+        return 0
+    er['report_date'] = er['report_date'].dt.date
+    er['status'] = er['confirmed'].map({True: 'confirmed', False: 'estimated'})
+    print(er[['ticker', 'report_date', 'time', 'source', 'status', 'eps_estimate',
+              'days_until']].to_string(index=False))
+    return 0
+
+
+def _run_reviews(index: str, watch: list[str], held: list[str], spec) -> int:
+    """Review new results filings; your names first, then current picks."""
+    from data import members
+    from nlp import earnings_review as ERV
+    from reports import builder
+    if not ERV.enabled():
+        return 0
+    try:
+        universe = sorted(set(members.latest_members(index)) | set(watch) | set(held))
+        picks = builder._current_picks(date.today(), spec.to_json())
+        done = ERV.review_recent(tickers=universe,
+                                 priority=list(held) + list(watch) + picks,
+                                 progress=lambda m: print(f'  ▸ {m}'))
+    except Exception as exc:                       # noqa: BLE001
+        print(f'⚠️  AI reviews skipped: {type(exc).__name__}: {exc}')
+        return 0
+    if done:
+        print(f'🧠  {len(done)} new AI earnings review(s): '
+              + ', '.join(f'{r["ticker"]} {r["verdict"]}' for r in done))
+    return len(done)
+
+
+def cmd_review(args) -> int:
+    """Run (or list) AI earnings reviews of recent results filings."""
+    db.init_db()
+    if args.run:
+        from core import runlock
+        with runlock.hold('review --run') as ok:
+            if not ok:
+                return 1
+            rc = _review_run(args)
+        if rc:
+            return rc
+    return _review_list(args)
+
+
+def _review_run(args) -> int:
+    from data import members
+    from nlp import earnings_review as ERV
+    from nlp import providers
+    from quant import portfolio as PF
+    if not ERV.enabled():
+        print('❌  no LLM configured — set GEMINI_API_KEY or ANTHROPIC_API_KEY '
+              'in .env (or QUANT_LLM_REVIEWS is off)')
+        return 1
+    names = [t.upper() for t in args.tickers] or sorted(
+        set(members.latest_members(args.index.upper())) | set(PF.watchlist())
+        | set(PF.lots('open')['ticker']))
+    todo = ERV.pending(tickers=names, lookback_days=args.days)
+    print(f'▸ {len(todo)} results filing(s) without a review in the last '
+          f'{args.days} days · model {providers.model_name()}')
+    done = ERV.review_recent(tickers=names, lookback_days=args.days,
+                             max_reviews=args.max,
+                             priority=list(PF.lots('open')['ticker']) + PF.watchlist(),
+                             progress=lambda m: print(f'  ▸ {m}'))
+    print(f'✅  {len(done)} review(s) written')
+    return 0
+
+
+def _review_list(args) -> int:
+    from nlp import earnings_review as ERV
+    rv = ERV.latest_reviews([t.upper() for t in args.tickers] or None,
+                            days=args.days if not args.run else 120)
+    if rv.empty:
+        print('no reviews stored yet' + ('' if args.run else
+              ' — run `python cli.py review --run`'))
+        return 0
+    for _i, r in rv.head(40).iterrows():
+        print(f'{r["ticker"]:6} {r["verdict"]:10} score {r["score"]:+.1f} '
+              f'({r["conviction"]})  guidance {r["guidance"]:9}  '
+              f'filed {r["filed"].date()}  · {r["summary"][:110]}')
+    return 0
+
+
+def cmd_consensus_test(args) -> int:
+    """
+    Does agreement between strategy families predict returns? Two answers:
+    the agreement study (forward excess return by number of agreeing
+    families) and a walk-forward backtest of the consensus, optionally next
+    to each of its member strategies.
+    """
+    import numpy as np
+
+    from data.universe import parse_spec
+    from quant import availability as AV
+    from quant import backtest as BT
+    from quant import consensus as CONS
+    from quant import strategies as ST
+
+    db.init_db()
+    spec = parse_spec(args.universe or config.QUANT_INDEX)
+    start = pd.to_datetime(args.start).date()
+    strat, notes = AV.meta_members_at('consensus', start, spec.preset or 'SPY')
+    print(f'▸ consensus on {spec.describe()} from {start}')
+    print(f'  families: {", ".join(strat.components) or "none"}')
+    for n in notes:
+        print(f'  note: {n}')
+    if len(strat.components) < 2:
+        print('❌  fewer than two strategy families have data from this start '
+              'date — pick a later --start or ingest more history')
+        return 1
+
+    print(f'\n▸ agreement study: {args.horizon}-month forward return vs SPY, '
+          f'sampled {"monthly" if args.freq == "ME" else "quarterly"}')
+    study = CONS.agreement_study(spec, start, args.end, args.horizon,
+                                 freq=args.freq, strategy_key=strat,
+                                 progress=(lambda m: print(f'  ▸ {m}'))
+                                 if args.verbose else None)
+    b = study['buckets']
+    if b.empty:
+        print('  no dates with enough data')
+    else:
+        view = b[['label', 'mean_excess', 'median_excess', 'hit_rate',
+                  'names', 'periods']].copy()
+        for c in ('mean_excess', 'median_excess', 'hit_rate'):
+            view[c] = view[c].map(lambda v: f'{v:+.2%}' if c != 'hit_rate' else f'{v:.0%}')
+        print(view.to_string(index=False))
+        ic = study['agreement_ic']
+        print(f'\n  agreement IC (Spearman, votes vs forward excess): {ic:+.3f} '
+              f'over {study["dates"]} dates, positive on '
+              f'{study["agreement_ic_hit"]:.0%} of them')
+        # A bucket holding a couple of names per date is noise; it is shown
+        # above but does not decide the verdict.
+        solid = b[(b['bucket'] >= 0) & (b['names'] >= CONS.MIN_BUCKET_NAMES)]
+        thin = b[(b['bucket'] >= 0) & (b['names'] < CONS.MIN_BUCKET_NAMES)]
+        if not thin.empty:
+            print(f'  ({", ".join(thin["label"])}: under {CONS.MIN_BUCKET_NAMES} '
+                  f'observations — too few to judge, left out of the verdict)')
+        spread = CONS.agreement_spread(study['by_date'])
+        if spread:
+            print(f'  2+ families vs none: {spread["mean"]:+.2%} per period on '
+                  f'average, ahead on {spread["wins"]} of {spread["dates"]} dates')
+        ordered = solid.sort_values('bucket')['mean_excess'].tolist()
+        rising = len(ordered) > 2 and all(x <= y for x, y in zip(ordered, ordered[1:]))
+        # Averages can be carried by a few big dates; ask for consistency too.
+        steady = bool(spread) and spread['wins'] >= 0.6 * spread['dates']
+        if np.isfinite(ic) and ic > 0.02 and rising and steady:
+            print('  ✅ more agreement meant higher returns, step by step, on most dates')
+        elif np.isfinite(ic) and ic > 0 and (rising or (spread and spread['mean'] > 0)):
+            print('  🟡 positive on average but not consistent from date to date — '
+                  'a few strong periods carry it; treat agreement as a tilt, '
+                  'not a rule')
+        else:
+            print('  ❌ agreement did not predict returns on this universe/window')
+
+    print('\n▸ walk-forward backtest (top names held six months, next-close '
+          'fills, costs included)')
+    keys = [strat] + ([k for fam in strat.components.values() for k in fam]
+                      if args.compare else [])
+    rows = []
+    for k in keys:
+        name = k.name if hasattr(k, 'name') else ST.get(k).name
+        try:
+            # Every member on the same footing: hold the shortlist, review
+            # half-yearly. Mid-term members used to go through the stop-and-
+            # target trade simulation here while the others were simply held,
+            # so the table compared exit rules as much as selection.
+            res = BT.run_backtest(spec, k, start, args.end, n_holdings=args.top,
+                                  rebalance='SA')
+        except (ValueError, BT.DegradedBacktest) as exc:
+            rows.append({'strategy': name, 'note': str(exc)[:70]})
+            continue
+        m = res.metrics
+        rows.append({'strategy': name, 'cagr': m.get('cagr'),
+                     'vs_spy': m.get('excess_cagr'), 'sharpe': m.get('sharpe'),
+                     'max_dd': m.get('max_drawdown'), 'mean_ic': m.get('mean_ic')})
+    out = pd.DataFrame(rows)
+    for c in ('cagr', 'vs_spy', 'max_dd'):
+        if c in out:
+            out[c] = out[c].map(lambda v: f'{v:+.1%}' if isinstance(v, float) and v == v else '—')
+    for c in ('sharpe', 'mean_ic'):
+        if c in out:
+            out[c] = out[c].map(lambda v: f'{v:+.2f}' if isinstance(v, float) and v == v else '—')
+    print(out.fillna('').to_string(index=False))
+    print('\nThe AI review vote is forward-only and is not part of any backtest; '
+          'its value shows up in `python cli.py track`.')
+    return 0
+
+
+def set_env_values(values: dict[str, str], path=None) -> Path:
+    """Update or append KEY='value' lines in .env, leaving the rest alone."""
+    from pathlib import Path as _P
+    path = _P(path or (config.ROOT / '.env'))
+    lines = path.read_text().splitlines() if path.exists() else []
+    done = set()
+    for i, line in enumerate(lines):
+        key = line.split('=', 1)[0].strip()
+        if key in values and not line.lstrip().startswith('#'):
+            # Single quotes: python-dotenv and docker compose both take the
+            # value literally, and a scrypt hash is full of '$'.
+            lines[i] = f"{key}='{values[key]}'"
+            done.add(key)
+    for key, val in values.items():
+        if key not in done:
+            lines.append(f"{key}='{val}'")
+    path.write_text('\n'.join(lines) + '\n')
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+def cmd_set_password(args) -> int:
+    """Set the web login; stores a scrypt hash in .env, never the password."""
+    import getpass
+
+    from core import auth
+    if args.stdin:
+        pw = sys.stdin.readline().rstrip('\n')
+        pw2 = pw
+    else:
+        pw = getpass.getpass('New password: ')
+        pw2 = getpass.getpass('Repeat it: ')
+    if pw != pw2:
+        print('❌  the two entries differ — nothing saved')
+        return 1
+    if len(pw) < 10:
+        print('❌  use at least 10 characters: this password guards a page you '
+              'will open from outside your home')
+        return 1
+    user = (args.user or config.QUANT_USER).strip()
+    if args.print:
+        # For Docker and servers: paste these two lines into .env yourself.
+        # One stream, hint first: stderr interleaved with stdout put the
+        # hint between the two lines it referred to.
+        print('↓ add these two lines to .env (they replace any earlier ones), '
+              'then restart. Keep the single quotes: the hash contains $.')
+        print(f"QUANT_USER='{user}'")
+        print(f"QUANT_PASSWORD_HASH='{auth.hash_password(pw)}'", flush=True)
+        return 0
+    path = set_env_values({'QUANT_USER': user,
+                           'QUANT_PASSWORD_HASH': auth.hash_password(pw)})
+    print(f'✅  login saved to {path} (user "{user}", password stored as a hash)')
+    print('    Restart the app: it will listen on the network and ask for this')
+    print('    login on every device. Existing sessions are signed out.')
+    print('    From outside your home network, see docs/remote-access.md.')
+    return 0
+
+
+# Morning runs every day (the calendar picks brief vs. digest); the evening
+# preparation run only on weekdays.
+SCHEDULE = (
+    ('morning', 'QUANT_MORNING_TIME', tuple(range(7)), ('daily', '--mode', 'quick')),
+    ('evening', 'QUANT_EVENING_TIME', tuple(range(5)),
+     ('daily', '--mode', 'full', '--no-email', '--backup')),
+)
+CATCH_UP_HOURS = 3
+
+
+def scheduled_runs(now, tz_name: str | None = None, last_done: dict | None = None):
+    """
+    Pure: the runs due at `now` (a list of names) and the next fire time.
+
+    A run whose time passed less than CATCH_UP_HOURS ago and that has not
+    run that day is due — so a server restarted at 07:20 still sends the
+    7:00 email. `last_done` maps run name -> ISO date it last ran.
+    """
+    from datetime import datetime as _dt, time as _time, timedelta as _td
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tz_name or config.QUANT_TZ)
+    local = now.astimezone(tz)
+    last_done = last_done or {}
+    due, upcoming = [], []
+    for name, attr, days, _args in SCHEDULE:
+        hh, mm = (int(x) for x in getattr(config, attr).split(':'))
+        for offset in (-1, 0, 1, 2, 3, 4, 5, 6, 7):
+            day = local.date() + _td(days=offset)
+            if day.weekday() not in days:
+                continue
+            at = _dt.combine(day, _time(hh, mm), tzinfo=tz)
+            if at <= local:
+                if (local - at) <= _td(hours=CATCH_UP_HOURS) and \
+                        last_done.get(name) != day.isoformat() and offset == 0:
+                    due.append(name)
+                continue
+            upcoming.append(at)
+            break
+    return due, min(upcoming)
+
+
+def cmd_scheduler(args) -> int:
+    """
+    Run the daily routine on schedule — for an always-on server (Docker, a
+    VPS) where there is no launchd or cron. Times are in QUANT_TZ.
+    """
+    import json
+    import subprocess
+    import time as _time
+    from datetime import datetime as _dt, timezone as _tz
+
+    logs = config.ROOT / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    state_path = logs / 'scheduler_state.json'
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    commands = {name: run_args for name, _a, _d, run_args in SCHEDULE}
+    print(f'▸ scheduler: morning {config.QUANT_MORNING_TIME} daily, evening '
+          f'{config.QUANT_EVENING_TIME} Mon–Fri ({config.QUANT_TZ})', flush=True)
+    while True:
+        now = _dt.now(_tz.utc)
+        due, nxt = scheduled_runs(now, last_done=state)
+        for name in due:
+            local = now.astimezone(nxt.tzinfo)
+            log_path = logs / f'routine_{local:%Y%m%d_%H%M}_{name}.log'
+            print(f'▸ {local:%Y-%m-%d %H:%M} running {name} → {log_path.name}', flush=True)
+            with log_path.open('a') as fh:
+                rc = subprocess.call([sys.executable, 'cli.py', *commands[name]],
+                                     cwd=str(config.ROOT), stdout=fh,
+                                     stderr=subprocess.STDOUT)
+            print(f'  {name} finished with exit {rc}', flush=True)
+            state[name] = local.date().isoformat()
+            state_path.write_text(json.dumps(state))
+        if args.once:
+            return 0
+        if not due:
+            wait = (nxt - _dt.now(_tz.utc)).total_seconds()
+            print(f'  next run {nxt:%a %Y-%m-%d %H:%M %Z}', flush=True)
+            # Short naps: robust to clock changes, DST and a suspended host.
+            _time.sleep(max(1.0, min(wait, 300.0)))
+
+
+def cmd_macro(args) -> int:
+    from data import macro
+    db.init_db()
+    if args.refresh:
+        print(f'▸ fetched {macro.update_macro()} observations')
+    snap = macro.snapshot(date.today())
+    if snap.empty:
+        print('no macro data yet — run `python cli.py macro --refresh`')
+        return 0
+    print(snap[['label', 'value', 'chg_1w', 'chg_1m', 'date']].round(2).to_string(index=False))
+    print()
+    icon = {'ok': '🟢', 'watch': '🟠', 'risk': '🔴'}
+    for lvl, txt in macro.regime(date.today(), snap):
+        print(f'{icon[lvl]} {txt}')
     return 0
 
 
@@ -408,7 +1163,8 @@ def build_parser() -> argparse.ArgumentParser:
     scr = sub.add_parser('screen', help='rank a universe under a strategy')
     scr.add_argument('--universe', help='e.g. "SPY,sector=Health Care,mcap>5B"')
     scr.add_argument('--strategy', default='buffett')
-    scr.add_argument('--as-of', help='YYYY-MM-DD (defaults to today)')
+    scr.add_argument('--as-of', help='YYYY-MM-DD, or "session" for the last '
+                                     'completed trading session (default: today)')
     scr.add_argument('--top', type=int, default=20)
     scr.set_defaults(func=cmd_screen)
 
@@ -421,12 +1177,137 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument('--rebalance', default=None, help='M | Q | SA | A')
     bt.set_defaults(func=cmd_backtest)
 
-    rep = sub.add_parser('report', help='render a daily or monthly report')
-    rep.add_argument('--kind', default='daily', choices=['daily', 'monthly'])
-    rep.add_argument('--strategy', default='buffett')
+    rep = sub.add_parser('report', help='render a daily, news or monthly report')
+    rep.add_argument('--kind', default='daily',
+                     choices=['daily', 'news', 'monthly', 'auto'],
+                     help='news = closed-market digest; auto = daily on '
+                          'trading days, news otherwise')
+    rep.add_argument('--strategy', default='buffett',
+                     help='ignored; kept for old cron lines')
     rep.add_argument('--as-of')
-    rep.add_argument('--email', help='send the rendered report to this address')
+    rep.add_argument('--email', help='send the rendered report to this address '
+                                     '(comma-separate several)')
     rep.set_defaults(func=cmd_report)
+
+    dly = sub.add_parser(
+        'daily', help='scheduled routine: ingest, screen, build and email — '
+                      'full brief on trading days, news-only when closed')
+    dly.add_argument('--mode', choices=['quick', 'full'], default='quick',
+                     help='quick: prices+news+policy; full: every source')
+    dly.add_argument('--index', help=f'universe (default QUANT_INDEX={config.QUANT_INDEX})')
+    dly.add_argument('--email', help='recipient(s); default QUANT_EMAIL from .env')
+    dly.add_argument('--no-email', action='store_true',
+                     help='prepare data and screens only (the evening job)')
+    dly.add_argument('--kind', choices=['auto', 'daily', 'news'], default='auto')
+    dly.add_argument('--date', help='pretend today is YYYY-MM-DD (for testing)')
+    dly.add_argument('--resend', action='store_true',
+                     help='send even if today\'s report was already emailed')
+    dly.add_argument('--force', action='store_true',
+                     help='run even when the market is closed and no email is due')
+    dly.add_argument('--skip-ingest', action='store_true')
+    dly.add_argument('--skip-screens', action='store_true')
+    dly.add_argument('--backup', action='store_true',
+                     help='back up the database afterwards (compressed; keeps 3)')
+    dly.add_argument('--no-llm', action='store_true',
+                     help='skip the AI earnings reviews this run')
+    dly.add_argument('--dry-run', action='store_true',
+                     help='print what would happen and exit')
+    dly.set_defaults(func=cmd_daily)
+
+    dbp = sub.add_parser('db', help='database upkeep: status | backup | check | '
+                                    'clean | tidy | restore')
+    dbp.add_argument('action', choices=['status', 'backup', 'check', 'clean',
+                                        'tidy', 'restore'])
+    dbp.add_argument('--keep', type=int, default=None,
+                     help=f'backups to keep (default {config.RETENTION["backups"]})')
+    dbp.add_argument('--full', action='store_true',
+                     help='check: full integrity_check instead of quick_check')
+    dbp.add_argument('--vacuum', action='store_true',
+                     help='clean / tidy: VACUUM afterwards to return space to disk')
+    dbp.add_argument('--prune-detail-days', type=int,
+                     help='clean: drop per-factor detail of runs older than N days')
+    dbp.add_argument('--no-backup', action='store_true',
+                     help='clean: skip the safety backup')
+    dbp.set_defaults(func=cmd_db)
+
+    wt = sub.add_parser('watch', help='watchlist: add | remove | list')
+    wt.add_argument('action', choices=['add', 'remove', 'list'])
+    wt.add_argument('tickers', nargs='*')
+    wt.add_argument('--note')
+    wt.set_defaults(func=cmd_watch)
+
+    pf = sub.add_parser(
+        'portfolio', help='your positions: show | add | close | set | alerts | '
+                          'import | remove')
+    pf.add_argument('action', choices=['show', 'add', 'close', 'set', 'alerts',
+                                       'import', 'remove'], nargs='?', default='show')
+    pf.add_argument('ticker', nargs='?',
+                    help='ticker (add/close/set), lot id (close/remove), or CSV path (import)')
+    pf.add_argument('shares', nargs='?', type=float)
+    pf.add_argument('cost', nargs='?', type=float, help='cost per share')
+    pf.add_argument('--date', help='open/close date, YYYY-MM-DD')
+    pf.add_argument('--stop', type=float, help='alert level (set -1 to clear)')
+    pf.add_argument('--target', type=float, help='alert level (set -1 to clear)')
+    pf.add_argument('--price', type=float, help='close: exit price (default last close)')
+    pf.add_argument('--strategy', help='which screen it came from')
+    pf.add_argument('--note')
+    pf.add_argument('--lots', action='store_true', help='also list individual lots')
+    pf.set_defaults(func=cmd_portfolio)
+
+    tr = sub.add_parser('track', help='live track record of stored screens')
+    tr.add_argument('--index', default=config.QUANT_INDEX,
+                    help='only runs on this universe (default QUANT_INDEX)')
+    tr.add_argument('--days', type=int, default=400, help='lookback in days')
+    tr.add_argument('--top', type=int, default=10, help='picks per run')
+    tr.set_defaults(func=cmd_track)
+
+    er = sub.add_parser('earnings', help='upcoming earnings for your names')
+    er.add_argument('--days', type=int, default=21)
+    er.add_argument('--index', help='also include an index, e.g. SPY')
+    er.add_argument('--refresh', action='store_true', help='fetch the calendar first')
+    er.set_defaults(func=cmd_earnings)
+
+    mc = sub.add_parser('macro', help='rates, credit, VIX and regime flags (FRED)')
+    mc.add_argument('--refresh', action='store_true', help='fetch from FRED first')
+    mc.set_defaults(func=cmd_macro)
+
+    sc = sub.add_parser('scheduler', help='run the daily routine on schedule '
+                                          '(for Docker / servers without cron)')
+    sc.add_argument('--once', action='store_true',
+                    help='run whatever is due now and exit')
+    sc.set_defaults(func=cmd_scheduler)
+
+    sp = sub.add_parser('set-password', help='set the login for phone / network access')
+    sp.add_argument('--user', help=f'username (default {config.QUANT_USER})')
+    sp.add_argument('--stdin', action='store_true',
+                    help='read the password from stdin (for scripts and Docker)')
+    sp.add_argument('--print', action='store_true',
+                    help='print the .env lines instead of writing .env (Docker)')
+    sp.set_defaults(func=cmd_set_password)
+
+    rv = sub.add_parser('review', help='AI earnings reviews of recent results filings')
+    rv.add_argument('tickers', nargs='*', help='limit to these tickers')
+    rv.add_argument('--run', action='store_true',
+                    help='review filings that have none yet (otherwise just list)')
+    rv.add_argument('--days', type=int, default=10, help='filings from the last N days')
+    rv.add_argument('--max', type=int, default=None,
+                    help='cap on new reviews (default QUANT_LLM_MAX_REVIEWS)')
+    rv.add_argument('--index', default=config.QUANT_INDEX)
+    rv.set_defaults(func=cmd_review)
+
+    ct = sub.add_parser('consensus-test',
+                        help='does multi-strategy agreement predict returns? '
+                             '(agreement study + backtest)')
+    ct.add_argument('--universe', help=f'default QUANT_INDEX ({config.QUANT_INDEX})')
+    ct.add_argument('--start', default=str(date.today() - timedelta(days=365 * 4)))
+    ct.add_argument('--end')
+    ct.add_argument('--horizon', type=int, default=6, help='forward months')
+    ct.add_argument('--freq', default='QE', choices=['ME', 'QE'],
+                    help='sampling: ME monthly, QE quarterly')
+    ct.add_argument('--top', type=int, default=20, help='holdings in the backtest')
+    ct.add_argument('--compare', action='store_true',
+                    help='also backtest every member strategy for comparison')
+    ct.set_defaults(func=cmd_consensus_test)
 
     sch = sub.add_parser('schedule',
                          help='print an ingest schedule matched to each source')

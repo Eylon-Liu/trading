@@ -49,7 +49,8 @@ def _fetch_views(ticker: str, article: str, start: date, end: date) -> list[dict
     url = PAGEVIEWS.format(article=article,
                            start=start.strftime('%Y%m%d'),
                            end=end.strftime('%Y%m%d'))
-    payload = http.fetch_json(url, category='_default', ttl=60 * 60 * 24)
+    # The URL embeds yesterday's date, so a cached copy is never read again.
+    payload = http.fetch_json(url, category='_default', use_cache=False)
     if not payload or 'items' not in payload:
         return []
 
@@ -64,25 +65,33 @@ def _fetch_views(ticker: str, article: str, start: date, end: date) -> list[dict
     return rows
 
 
-def update_attention(tickers: list[str], days_back: int = 730) -> int:
-    """Fetch and store daily pageviews for each ticker's article."""
+def update_attention(tickers: list[str], days_back: int = 730,
+                     overlap_days: int = 3) -> int:
+    """Fetch and store daily pageviews, from each ticker's last stored day on."""
     if not tickers:
         return 0
 
     end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=days_back)
+    full_start = end - timedelta(days=days_back)
 
-    names = {}
     ph = ','.join(f':t{i}' for i in range(len(tickers)))
+    params = {f't{i}': t for i, t in enumerate(tickers)}
     meta = db.read_sql(f'SELECT ticker, name FROM securities WHERE ticker IN ({ph})',
-                       {f't{i}': t for i, t in enumerate(tickers)})
-    if not meta.empty:
-        names = dict(zip(meta['ticker'], meta['name']))
+                       params)
+    names = dict(zip(meta['ticker'], meta['name'])) if not meta.empty else {}
+    have = db.read_sql(f'SELECT ticker, MAX(date) AS last FROM attention '
+                       f'WHERE ticker IN ({ph}) GROUP BY ticker', params)
+    last = dict(zip(have['ticker'], pd.to_datetime(have['last']).dt.date)) \
+        if not have.empty else {}
 
     written = 0
     with ThreadPoolExecutor(max_workers=max(2, config.MAX_WORKERS // 2)) as pool:
         futures = {}
         for t in sorted(set(tickers)):
+            start = max(full_start, last[t] - timedelta(days=overlap_days)) \
+                if t in last else full_start
+            if start > end:
+                continue
             article = _article_for(t, names.get(t))
             if article:
                 futures[pool.submit(_fetch_views, t, article, start, end)] = t
@@ -100,4 +109,3 @@ def update_attention(tickers: list[str], days_back: int = 730) -> int:
     db.record_ingest('attention', str(date.today()), rows=written)
     log.info('attention: %d daily observations', written)
     return written
-

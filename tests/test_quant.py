@@ -20,11 +20,10 @@ from quant import tradeplan as TP
 # ─────────────────────────────────────────────
 
 def _rsi(prices: pd.Series, period: int = 14) -> float:
-    return float(FA.rsi(prices.to_frame('x'), period=period)['x'])
+    return float(FA._vectorized_rsi(prices.to_frame('X'), period)['X'])
 
 
 def test_wilder_rsi_all_gains_is_100():
-    """No down days is RSI 100 by definition — it used to come back NaN."""
     prices = pd.Series(np.arange(1, 40, dtype=float))
     assert _rsi(prices) == pytest.approx(100.0)
 
@@ -55,17 +54,17 @@ def test_wilder_rsi_differs_from_simple_moving_average_version():
     assert abs(wilder - simple) > 0.5, 'the two smoothings must not coincide'
 
 
-def test_rsi_needs_a_full_period_of_history():
-    assert np.isnan(_rsi(pd.Series([1.0, 2.0, 3.0])))
+def test_rsi_needs_enough_bars():
+    assert np.isnan(_rsi(pd.Series(np.arange(1, 10, dtype=float))))
 
 
 def test_atr_is_positive_and_scales_with_range():
     n = 60
     idx = pd.date_range('2024-01-01', periods=n, freq='B')
-    close = pd.DataFrame({'x': np.full(n, 100.0)}, index=idx)
+    close = pd.DataFrame({'X': np.full(n, 100.0)}, index=idx)
 
-    narrow = float(FA.atr(close + 0.5, close - 0.5, close)['x'])
-    wide = float(FA.atr(close + 5.0, close - 5.0, close)['x'])
+    narrow = FA._vectorized_atr(close + 0.5, close - 0.5, close)['X']
+    wide = FA._vectorized_atr(close + 5.0, close - 5.0, close)['X']
     assert narrow > 0 and wide > narrow * 5
 
 
@@ -510,38 +509,46 @@ def test_validate_flags_impossible_ratios():
 # SHARPE / SORTINO with risk-free rate
 # ─────────────────────────────────────────────
 
-def test_sharpe_subtracts_risk_free_rate():
-    """Sharpe must be (CAGR - Rf) / vol, not CAGR / vol."""
+def test_sharpe_is_mean_excess_over_volatility():
+    """Textbook Sharpe: annualised mean periodic excess return / volatility."""
+    rng = np.random.RandomState(7)
+    idx = pd.date_range('2020-01-31', periods=121, freq='ME')
+    equity = pd.Series(np.cumprod(np.r_[1.0, 1 + 0.008 + 0.04 * rng.randn(120)]),
+                       index=idx)
+    rf = 0.03
+    m = BT.compute_metrics(equity, rf=rf)
+
+    rets = equity.pct_change().dropna()
+    years = (idx[-1] - idx[0]).days / 365.25
+    ppy = len(rets) / years
+    rf_p = (1 + rf) ** (1 / ppy) - 1
+    expected = (rets - rf_p).mean() / rets.std() * np.sqrt(ppy)
+    assert m['sharpe'] == pytest.approx(expected, rel=1e-9)
+    assert m['sharpe'] < BT.compute_metrics(equity, rf=0.0)['sharpe'], \
+        'subtracting Rf must reduce Sharpe'
+
+
+def test_sortino_uses_downside_deviation():
+    """Downside deviation counts every period, gains as zero — not the std
+    of the losing periods alone."""
+    rng = np.random.RandomState(42)
+    idx = pd.date_range('2020-01-31', periods=121, freq='ME')
+    equity = pd.Series(np.cumprod(np.r_[1.0, 1 + 0.005 + 0.03 * rng.randn(120)]),
+                       index=idx)
+    rf = 0.02
+    m = BT.compute_metrics(equity, rf=rf)
+    rets = equity.pct_change().dropna()
+    ppy = len(rets) / ((idx[-1] - idx[0]).days / 365.25)
+    ex = rets - ((1 + rf) ** (1 / ppy) - 1)
+    dd = np.sqrt((np.minimum(ex, 0) ** 2).mean())
+    assert m['sortino'] == pytest.approx(ex.mean() / dd * np.sqrt(ppy), rel=1e-9)
+
+
+def test_default_risk_free_comes_from_config():
     import config
     idx = pd.date_range('2020-01-31', periods=61, freq='ME')
     equity = pd.Series(1.01 ** np.arange(61), index=idx)
-    m = BT.compute_metrics(equity)
-    cagr = m['cagr']
-    vol = m['volatility']
-    rf = config.RISK_FREE_RATE
-    expected_sharpe = (cagr - rf) / vol if vol > 0 else 0.0
-    assert m['sharpe'] == pytest.approx(expected_sharpe, rel=1e-6)
-    assert m['sharpe'] < cagr / vol, 'subtracting Rf must reduce Sharpe'
-
-
-def test_sortino_subtracts_risk_free_rate():
-    """Sortino must be (CAGR - Rf) / downside_vol."""
-    import config
-    rng = np.random.RandomState(42)
-    idx = pd.date_range('2020-01-31', periods=120, freq='ME')
-    equity = pd.Series(np.cumprod(1 + 0.005 + 0.03 * rng.randn(120)), index=idx)
-    m = BT.compute_metrics(equity)
-    rf = config.RISK_FREE_RATE
-    assert m['sortino'] != 0.0
-    # Recompute from scratch
-    rets = equity.pct_change().dropna()
-    years = max((equity.index[-1] - equity.index[0]).days / 365.25, 1e-9)
-    cagr = float((equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1.0)
-    ppy = len(rets) / years
-    downside = rets[rets < 0]
-    dvol = float(downside.std() * np.sqrt(ppy))
-    expected = (cagr - rf) / dvol
-    assert m['sortino'] == pytest.approx(expected, rel=1e-6)
+    assert BT.compute_metrics(equity)['risk_free'] == config.RISK_FREE_RATE
 
 
 def test_sharpe_zero_vol_returns_zero():
@@ -706,3 +713,22 @@ def test_sell_conviction_100pct_disposal():
     from quant.factors import _sell_conviction_weight
     row = pd.Series({'shares': -1000, 'post_txn_shares': 0})
     assert _sell_conviction_weight(row) == pytest.approx(1.0)
+
+
+def test_sell_conviction_separates_sell_only_names(fresh_db):
+    """A 2% trim and a 50% disposal used to both score exactly -1."""
+    d = pd.Timestamp('2026-06-01')
+    row = {'filed': d, 'txn_date': d, 'role': 'Officer', 'txn_code': 'S', 'price': 100.0}
+    ins = pd.DataFrame([
+        {**row, 'ticker': 'TRIM', 'insider': 'A', 'shares': -20, 'value': 2_000.0,
+         'post_txn_shares': 980},
+        {**row, 'ticker': 'DUMP', 'insider': 'B', 'shares': -500, 'value': 50_000.0,
+         'post_txn_shares': 500},
+    ])
+    no_events = pd.DataFrame({'ticker': pd.Series(dtype=str),
+                              'filed': pd.Series(dtype='datetime64[ns]'),
+                              'category': pd.Series(dtype=str)})
+    out = FA.alt_factors(['TRIM', 'DUMP'], date(2026, 6, 5),
+                         _bt_insiders=ins, _bt_events=no_events)
+    assert out.loc['DUMP', 'INSIDER_NET_BUY'] == pytest.approx(-1.0)
+    assert out.loc['TRIM', 'INSIDER_NET_BUY'] == pytest.approx(-0.15)

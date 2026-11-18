@@ -248,7 +248,7 @@ COMPARE = ['composite', 'rank', 'signal']
 def _live(strategy, as_of):
     from quant import engine as EN
     _MODE[0] = 'live'
-    return EN.run(Spec(), strategy, as_of=as_of, persist=False)
+    return EN.run(Spec(), strategy, as_of=as_of, top_n=10, persist=False)
 
 
 def _bt(strategy, dates, end):
@@ -257,11 +257,10 @@ def _bt(strategy, dates, end):
     _MODE[0] = 'bt'
     try:
         idx = pd.DatetimeIndex(dates)
-        pre = BT._preload(Spec(), idx, idx[0].date(), end)
-        return [BT._score_at(pre, Spec(), strategy, d.date(), 10) for d in idx]
+        scorer = BT._Scorer(Spec(), strategy, BT._preload(Spec(), idx[0].date(), end))
+        return [scorer.run(d.date(), 10) for d in idx]
     finally:
         _MODE[0] = 'live'
-
 
 
 def _same(a: pd.DataFrame, b: pd.DataFrame, cols=COMPARE, what=''):
@@ -381,7 +380,7 @@ def mid_run(stores, request):
 def test_every_fill_is_after_its_scan(mid_run):
     t = mid_run.trades
     assert len(t) > 10, 'fixture should generate trades'
-    assert (pd.to_datetime(t['entry_date']) > pd.to_datetime(t['scan_date'])).all()
+    assert (pd.to_datetime(t['entry_date']) > pd.to_datetime(t['signal_date'])).all()
     assert (pd.to_datetime(t['exit_date']) >= pd.to_datetime(t['entry_date'])).all()
 
 
@@ -399,8 +398,7 @@ def test_long_backtest_trades_after_each_rebalance_date(stores):
     with _use_store(stores[0]):
         r = BT.run_backtest(Spec(), 'quality_momentum', '2023-01-01', '2024-12-31',
                             n_holdings=6, rebalance='Q', strict=False)
-    first_rebalance = pd.Timestamp('2023-03-31')
-    assert r.equity.index[0] > first_rebalance
+    assert r.equity.index[0] > pd.Timestamp(r.rebalance_dates[0])
     assert r.equity.index.is_monotonic_increasing
     assert 'mean_ic' in r.metrics
 
@@ -409,10 +407,9 @@ def test_preload_carries_the_benchmark(stores):
     """Without it BETA and IDIO_VOL silently vanish from every backtest."""
     from quant import backtest as BT
     with _use_store(stores[0]):
-        pre = BT._preload(Spec(), pd.DatetimeIndex([pd.Timestamp('2024-01-31')]),
-                          date(2024, 1, 1), date(2024, 3, 1))
+        pre = BT._preload(Spec(), date(2024, 1, 1), date(2024, 3, 1))
         assert config.BENCHMARK_TICKER in pre.ohlc[0].columns
-        r = BT._score_at(pre, Spec(), 'relative_strength', date(2024, 1, 31), 10)
+        r = BT._Scorer(Spec(), 'relative_strength', pre).run(date(2024, 1, 31), 10)
     assert not any('IDIO_VOL' in w for w in r.warnings)
 
 
@@ -453,15 +450,6 @@ def test_data_version_moves_on_every_factor_source(tmp_path):
             v = factorcache.data_version()
             assert v not in seen, f'inserting into {table.name} did not move the version'
             seen.add(v)
-
-
-def test_pead_factor_discriminates_and_respects_the_window(scored_at_cutoff):
-    """EARNINGS_SURPRISE must vary across names; the drift filter must bite."""
-    from quant import factors as FA
-    s = scored_at_cutoff[('base', 'live', 'earnings_drift')].scores
-    assert len(s) > 0
-    assert len(s) < len(TICKERS), 'the 45-day drift window should exclude names'
-    assert FA.FACTOR_DIRECTION['EARNINGS_SURPRISE'] is True
 
 
 def test_every_strategy_factor_varies_across_the_universe(stores):

@@ -175,28 +175,45 @@ def _render_strategies(horizon):
 
     items = []
     for key, strat in sorted(pool.items(), key=lambda kv: (kv[1].horizon, kv[0])):
-        rows = FD.strategy_breakdown(strat)
-        table = pd.DataFrame([{
-            'Factor': r['label'],
-            'Family': r['family'],
-            'Weight': r['weight'],
-            'Share %': r['weight_pct'],
-            'Direction': r['direction'],
-        } for r in rows])
+        if strat.is_meta:
+            table = pd.DataFrame(
+                [{'Family': fam, 'Member strategies': ', '.join(
+                    ST.get(m).name for m in members), 'Vote': 'average percentile ≥ '
+                    f'{strat.vote_pct:.0%}'} for fam, members in strat.components.items()]
+                + [{'Family': fam, 'Member strategies': f'factor {f}',
+                    'Vote': '+1 at ≥ +1, −1 at ≤ −1'}
+                   for fam, f in strat.factor_votes.items()])
+            composite = (
+                'composite = votes + 0.5 × mean family percentile\n\n'
+                '  votes  = families voting for the name\n'
+                '         − 1 if on the avoid list ('
+                + ', '.join(ST.get(v).name for v in strat.veto) + ')\n'
+                '  ranked only when two or more families scored it\n'
+                '  run `python cli.py consensus-test` to check it predicts')
+            rows = []
+        else:
+            rows = FD.strategy_breakdown(strat)
+            table = pd.DataFrame([{
+                'Factor': r['label'],
+                'Family': r['family'],
+                'Weight': r['weight'],
+                'Share %': r['weight_pct'],
+                'Direction': r['direction'],
+            } for r in rows])
 
-        filters = strat.filters or {}
-        filter_text = ', '.join(f'{k} = {v}' for k, v in filters.items()) or 'none'
+            filters = strat.filters or {}
+            filter_text = ', '.join(f'{k} = {v}' for k, v in filters.items()) or 'none'
 
-        formula_lines = []
-        for r in rows:
-            formula_lines.append(f"  {r['weight_pct']:>5.1f}%  {r['label']}")
-        composite = (
-            'composite = weighted mean of sector-relative z-scores\n\n'
-            + '\n'.join(formula_lines)
-            + f"\n\n  neutralization : {strat.neutralize}"
-            + f"\n  hard filters   : {filter_text}"
-            + (f"\n  trade setup    : {strat.setup}" if strat.needs_trade_plan else '')
-        )
+            formula_lines = []
+            for r in rows:
+                formula_lines.append(f"  {r['weight_pct']:>5.1f}%  {r['label']}")
+            composite = (
+                'composite = weighted mean of sector-relative z-scores\n\n'
+                + '\n'.join(formula_lines)
+                + f"\n\n  neutralization : {strat.neutralize}"
+                + f"\n  hard filters   : {filter_text}"
+                + (f"\n  trade setup    : {strat.setup}" if strat.needs_trade_plan else '')
+            )
 
         body = html.Div([
             html.Div(strat.description,
@@ -212,7 +229,9 @@ def _render_strategies(horizon):
                     if strat.needs_trade_plan else 'exit: thesis-based, no levels',
                     color='dark', className='ms-2',
                     style={'border': f'1px solid {TH.BORDER}'}),
-                dbc.Badge(f'{len(strat.weights)} factors', color='dark',
+                dbc.Badge(f'{len(strat.components) + len(strat.factor_votes)} families'
+                          if strat.is_meta else f'{len(strat.weights)} factors',
+                          color='dark',
                           className='ms-2',
                           style={'border': f'1px solid {TH.BORDER}'}),
             ], className='mb-3'),

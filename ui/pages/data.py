@@ -274,8 +274,10 @@ def _run_validation(n_clicks, universe, survivorship):
     if survivorship and 'yes' in survivorship and universe != 'ALL':
         for yr_back in (1, 3, 5):
             try:
-                as_of = date(date.today().year - yr_back, date.today().month,
-                             date.today().day)
+                # DateOffset, not date(year - n, ...): that raised on Feb 29
+                # and the except below silently skipped the check.
+                as_of = (pd.Timestamp(date.today())
+                         - pd.DateOffset(years=yr_back)).date()
                 findings += V.check_survivorship(universe, as_of)
             except Exception as exc:                 # noqa: BLE001
                 log.debug('survivorship %dY failed: %s', yr_back, exc)
@@ -308,6 +310,7 @@ def _run_validation(n_clicks, universe, survivorship):
         ])
 
     verdict = 'pass' if not errors else 'FAIL'
+    verdict_color = TH.POS if not errors else TH.NEG
 
     return html.Div([
         header,
@@ -364,6 +367,7 @@ def _health_badge(active_tab):
             color, verdict = TH.POS, 'All sources fresh'
             suffix = ''
 
+        last = SY.last_session()
         last_pulled = fresh['last refreshed'].replace('never', pd.NaT)
         last_pulled = pd.to_datetime(last_pulled, errors='coerce')
         newest_pull = last_pulled.max()

@@ -12,7 +12,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Explicit path: cron and launchd start in another directory, and the
+# scheduled email must read the same .env as an interactive run.
+load_dotenv(Path(__file__).parent.resolve() / '.env')
 
 # ─────────────────────────────────────────────
 # PATHS
@@ -22,6 +24,7 @@ ROOT = Path(__file__).parent.resolve()
 DB_DIR = ROOT / 'db'
 CACHE_DIR = ROOT / 'cache'
 REPORT_DIR = ROOT / 'reports' / 'out'
+
 for _d in (DB_DIR, CACHE_DIR, REPORT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -90,6 +93,10 @@ RATE_LIMITS = {
     'wikimedia.org': 5.0,
     'news.google.com': 2.0,
     'www.federalregister.gov': 5.0,
+    'api.stlouisfed.org': 5.0,
+    'fred.stlouisfed.org': 2.0,
+    'api.nasdaq.com': 1.0,
+    'finnhub.io': 1.0,
     '_default': 3.0,
 }
 
@@ -104,6 +111,8 @@ CACHE_TTL_SECONDS = {
     'news': 60 * 30,
     'policy': 60 * 60 * 6,
     'members': 60 * 60 * 24 * 7,
+    'macro': 60 * 60 * 6,
+    'earnings': 60 * 60 * 12,
     '_default': 60 * 60,
 }
 
@@ -220,12 +229,20 @@ TRADING_DAYS = {
     '1W': 5, '1M': 21, '3M': 63, '6M': 126,
     '1Y': 252, '2Y': 504, '3Y': 756, '5Y': 1260,
 }
+
+
 # ─────────────────────────────────────────────
 # BACKTEST
 # ─────────────────────────────────────────────
 
 BENCHMARK_TICKER = 'SPY'
-RISK_FREE_RATE = 0.05             # annualised, used for Sharpe / Sortino
+RISK_FREE_RATE = 0.05             # annual fallback when no FRED T-bill data is stored
+# Largest share of a shortlist or backtest portfolio that one sector may
+# take. A ranking is sector-relative, but its very top can still be one
+# theme: in spring 2026 thirteen of the twenty highest momentum scores were
+# semiconductor and memory names. Concentration like that is a bet on a
+# sector, not on the strategy, and it reverses all at once.
+MAX_SECTOR_SHARE = 0.30
 TRANSACTION_COST_BPS = 10.0      # one-way, per trade
 SLIPPAGE_BPS = 5.0
 
@@ -234,7 +251,9 @@ SLIPPAGE_BPS = 5.0
 # SEC / XBRL
 # ─────────────────────────────────────────────
 
-# XBRL tag maps live in data/taxonomy.py.
+# Tag maps live in data/taxonomy.py for independent testability. Re-exported
+# here so existing imports (config.SEC_TAG_MAP) keep working.
+from data.taxonomy import SEC_DEI_TAG_MAP, SEC_TAG_MAP  # noqa: E402, F401
 
 # 8-K item codes worth treating as structured corporate events. These need no
 # NLP at all — the SEC already classified them.
@@ -254,6 +273,8 @@ EIGHTK_ITEMS = {
     '8.01': ('disclosure', 'Other events'),
 }
 
+# Form 4 codes that carry signal: open-market purchases (P) and sales (S).
+# Grants, exercises, gifts and tax withholding (A/M/G/F) are compensation noise.
 INSIDER_SIGNAL_CODES = {'P', 'S'}
 
 
@@ -310,6 +331,9 @@ POLICY_THEMES = {
 # NEWS / LLM
 # ─────────────────────────────────────────────
 
+# Longest a news refresh may take. Names not reached are first in line next
+# time, after your holdings, watchlist and the current top picks.
+NEWS_BUDGET_SECONDS = int(os.environ.get('QUANT_NEWS_BUDGET_SECONDS') or 900)
 NEWS_LOOKBACK_DAYS = 30
 MAX_NEWS_PER_TICKER = 25
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
@@ -335,6 +359,11 @@ LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'auto')
 
 LLM_MAX_ARTICLES = int(os.environ.get('LLM_MAX_ARTICLES', '12'))
 
+# Earnings reviews (nlp/earnings_review.py): one LLM call per new results
+# filing. 'auto' runs them whenever an LLM key is configured; 'off' disables.
+QUANT_LLM_REVIEWS = os.environ.get('QUANT_LLM_REVIEWS', 'auto')
+QUANT_LLM_MAX_REVIEWS = int(os.environ.get('QUANT_LLM_MAX_REVIEWS', '25'))
+
 
 # ─────────────────────────────────────────────
 # EMAIL / REPORTS
@@ -349,6 +378,59 @@ SMTP_USER = (os.environ.get('SMTP_USER') or '').strip() or None
 # so they are stripped here rather than leaving the user to discover that a
 # copy-paste straight from Google fails authentication.
 SMTP_PASS = (os.environ.get('SMTP_PASS') or '').replace(' ', '').strip() or None
+FRED_API_KEY = os.environ.get('FRED_API_KEY')
+
+# ── Daily routine (cli.py daily) ─────────────────────────────────
+# Read here rather than by the shell script: .env holds values with spaces
+# (SEC_USER_AGENT) that `source .env` would try to execute as commands.
+QUANT_EMAIL = (os.environ.get('QUANT_EMAIL') or '').strip() or None
+QUANT_INDEX = (os.environ.get('QUANT_INDEX') or 'SPY').strip().upper()
+
+# ── Web access (app.py, core/auth.py) ────────────────────────────
+# The UI listens on this computer only (127.0.0.1); a phone reaches it
+# through `tailscale serve`. `python cli.py set-password` sets the login.
+QUANT_USER = (os.environ.get('QUANT_USER') or 'admin').strip()
+QUANT_PASSWORD_HASH = (os.environ.get('QUANT_PASSWORD_HASH') or '').strip() or None
+QUANT_SECRET_KEY = (os.environ.get('QUANT_SECRET_KEY') or '').strip() or None
+# Explicit bind address only. Deliberately not the generic HOST variable:
+# some shells export HOST=<this Mac's name>, which would put the UI on the
+# Wi-Fi without anyone asking for it.
+QUANT_HOST = (os.environ.get('QUANT_HOST') or '').strip() or None
+# Trust X-Forwarded-* from any peer, not only from a proxy on this computer.
+# For Docker, where the host's proxy is the only way in (docker-compose.yml).
+QUANT_BEHIND_PROXY = (os.environ.get('QUANT_BEHIND_PROXY') or '').strip().lower() in (
+    '1', 'true', 'yes', 'on')
+
+# ── Storage retention (core/maintenance.py: housekeeping) ───────
+# Applied at the end of every routine run so disk use levels off instead of
+# growing with each day. Nothing here touches prices, filings, fundamentals
+# or index membership — the history backtests are built on.
+RETENTION = {
+    'factor_detail_days': 30,   # per-factor breakdown behind each screen run
+    'daily_runs_days': 120,     # after this, keep one run per week per strategy
+    'news_days': 180,           # articles (the digest and Intel read recent ones)
+    'attention_days': 800,      # Wikipedia pageviews (the factor needs ~400)
+    'cache_days': 30,           # downloaded responses not refreshed since
+    'log_days': 30,
+    'report_days': 180,         # daily / news report files (monthly ones are kept)
+    'backups': 3,               # compressed database copies
+}
+
+# Built-in scheduler (`python cli.py scheduler`, used by the Docker setup).
+QUANT_TZ = (os.environ.get('QUANT_TZ') or 'America/New_York').strip()
+QUANT_MORNING_TIME = (os.environ.get('QUANT_MORNING_TIME') or '07:00').strip()
+QUANT_EVENING_TIME = (os.environ.get('QUANT_EVENING_TIME') or '18:30').strip()
+
+# Names you hold or are watching. They lead the daily brief and the weekend
+# digest, and are ingested even when they are not in QUANT_INDEX.
+# Comma- or space-separated: QUANT_WATCHLIST=AAPL, MSFT, BRK.B
+WATCHLIST = [
+    t.strip().upper().replace('.', '-')
+    for t in (os.environ.get('QUANT_WATCHLIST') or '').replace(',', ' ').split()
+    if t.strip()
+]
+
+
 # ─────────────────────────────────────────────
 # UI THEME
 # ─────────────────────────────────────────────

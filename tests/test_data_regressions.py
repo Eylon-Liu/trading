@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from data.taxonomy import SEC_TAG_MAP
+import config
 from quant import factors as FA
 from quant import fundamentals as F
 
@@ -131,9 +131,9 @@ def test_the_debt_tag_whitelist_covers_the_concepts_the_code_reads():
     ingested, so it is silently always NaN.
     """
     for concept in ('total_debt', 'long_term_debt', 'short_term_debt'):
-        assert concept in SEC_TAG_MAP, \
+        assert concept in config.SEC_TAG_MAP, \
             f'{concept} is read but has no tags to ingest it from'
-        assert SEC_TAG_MAP[concept], f'{concept} maps to no tags'
+        assert config.SEC_TAG_MAP[concept], f'{concept} maps to no tags'
 
 
 def test_combined_debt_tags_are_not_duplicated_across_concepts():
@@ -142,7 +142,7 @@ def test_combined_debt_tags_are_not_duplicated_across_concepts():
     """
     seen: dict[str, str] = {}
     for concept in ('total_debt', 'long_term_debt', 'short_term_debt'):
-        for tag in SEC_TAG_MAP[concept]:
+        for tag in config.SEC_TAG_MAP[concept]:
             assert tag not in seen, \
                 f'{tag} is mapped to both {seen[tag]} and {concept}'
             seen[tag] = concept
@@ -307,6 +307,7 @@ def test_a_ten_x_error_is_far_outside_the_agreement_tolerance():
     The Lam Research case, stated as a bound: the split fault produced a 0.1x
     ratio, which no sane tolerance can absorb.
     """
+    from quant import validate as V
     assert abs(0.1 - 1.0) > 0.15, 'tolerance must not be wide enough to hide it'
 
 
@@ -501,3 +502,18 @@ def test_report_ids_are_unique_per_build_not_per_file():
     src = inspect.getsource(RB.delete_report)
     assert 'COUNT(*)' in src and 'path' in src, \
         'delete_report must check whether the path is still referenced'
+
+
+def test_a_future_split_does_not_relax_a_historical_crosscheck():
+    """At a past date, a split that had not happened yet is not knowable."""
+    from datetime import date as _d
+
+    import pandas as pd
+
+    from quant import fundamentals as F
+    splits = pd.DataFrame({'ticker': ['PAST', 'FUTURE'],
+                           'date': ['2024-03-01', '2024-09-01'],
+                           'ratio': [2.0, 10.0]})
+    assert F.recent_splitters(splits, _d(2024, 6, 1)) == {'PAST'}
+    assert F.recent_splitters(splits, _d(2024, 12, 1)) == {'PAST', 'FUTURE'}
+    assert F.recent_splitters(None, _d(2024, 6, 1)) == set()

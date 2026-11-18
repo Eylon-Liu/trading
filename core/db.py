@@ -162,6 +162,18 @@ insider_txns = Table(
     Index('ix_insider_pit', 'ticker', 'filed'),
 )
 
+risk_factor_diffs = Table(
+    'risk_factor_diffs', metadata,
+    Column('ticker', String, primary_key=True),
+    Column('fy', Integer, primary_key=True),
+    Column('filed', Date, index=True),
+    Column('prev_filed', Date),
+    Column('pct_changed', Float),
+    Column('word_count', Integer),
+    Column('added_topics', Text),
+    Column('removed_topics', Text),
+)
+
 # Snapshot of provider-computed metrics that SEC does not carry (analyst
 # forward PE, beta). Accumulates a forward point-in-time record from the day
 # the app first runs — it can never be backfilled.
@@ -233,6 +245,14 @@ policy = Table(
     Column('affected_tickers', String),
 )
 
+macro = Table(
+    'macro', metadata,
+    Column('series_id', String, primary_key=True),
+    Column('date', Date, primary_key=True),
+    Column('value', Float),
+)
+
+
 # ─────────────────────────────────────────────
 # RUNS & SCORES
 # ─────────────────────────────────────────────
@@ -247,6 +267,8 @@ runs = Table(
     Column('params_json', Text),
     Column('universe_n', Integer),
     Column('created_at', DateTime),
+    # "Latest run of strategy S on or before D" is the report's hot query.
+    Index('ix_runs_lookup', 'strategy', 'as_of', 'created_at'),
 )
 
 factor_scores = Table(
@@ -300,6 +322,77 @@ custom_strategies = Table(
     Column('filters_json', Text),
     Column('neutralize', String),
     Column('setup', String),
+    Column('updated_at', DateTime),
+)
+
+# Upcoming earnings dates from a calendar provider. Estimated dates (from the
+# filing cadence) are computed on read, never stored, so a row here is always
+# a provider's published date.
+earnings_calendar = Table(
+    'earnings_calendar', metadata,
+    Column('ticker', String, primary_key=True),
+    Column('report_date', Date, primary_key=True),
+    Column('time', String),               # bmo | amc | unknown
+    Column('source', String),             # nasdaq | finnhub
+    Column('fiscal_period', String),
+    Column('eps_estimate', Float),
+    Column('fetched_at', DateTime),
+    Index('ix_earnings_date', 'report_date'),
+)
+
+# LLM reviews of earnings releases, one per 8-K results filing.
+#
+# `assessed_on` is the day the model produced the review, and it is the only
+# date a point-in-time read may use. A review written today about last
+# year's release would be written by a model that already knows how the
+# stock did afterwards — so reviews are never back-dated, and the factor built
+# on them has history only from the day the routine started writing them.
+llm_reviews = Table(
+    'llm_reviews', metadata,
+    Column('accession', String, primary_key=True),
+    Column('ticker', String, index=True),
+    Column('filed', Date),
+    Column('assessed_on', Date, index=True),
+    Column('model', String),
+    Column('version', Integer),
+    Column('score', Float),              # overall, -2 .. +2
+    Column('conviction', String),        # low | medium | high
+    Column('verdict', String),           # buy | accumulate | hold | avoid
+    Column('quarter_quality', Float),    # -2 .. +2
+    Column('outlook', Float),            # -2 .. +2
+    Column('guidance', String),          # raised | maintained | lowered | withdrawn | none
+    Column('valuation_view', String),    # cheap | fair | expensive | unclear
+    Column('summary', Text),
+    Column('detail_json', Text),
+    Column('created_at', DateTime),
+    Index('ix_llm_reviews_pit', 'ticker', 'assessed_on'),
+)
+
+# Names you follow. Distinct from positions: watching costs nothing and
+# carries no price levels.
+watchlist = Table(
+    'watchlist', metadata,
+    Column('ticker', String, primary_key=True),
+    Column('note', Text),
+    Column('added_at', DateTime),
+)
+
+# Your own holdings. One row per lot, so adding to a position later keeps
+# both cost bases; the portfolio view aggregates lots per ticker.
+positions = Table(
+    'positions', metadata,
+    Column('lot_id', String, primary_key=True),
+    Column('ticker', String, index=True),
+    Column('shares', Float),
+    Column('cost_basis', Float),          # per share, in the trade currency
+    Column('opened', Date),
+    Column('stop', Float),                # optional alert levels
+    Column('target', Float),
+    Column('strategy', String),           # which screen it came from, if any
+    Column('note', Text),
+    Column('status', String, index=True), # open | closed
+    Column('closed', Date),
+    Column('exit_price', Float),
     Column('updated_at', DateTime),
 )
 
@@ -357,8 +450,28 @@ def get_engine() -> Engine:
 
 def init_db() -> None:
     """Create every table and index if absent. Safe to run repeatedly."""
-    metadata.create_all(get_engine())
+    eng = get_engine()
+    metadata.create_all(eng)
+    _ensure_indexes(eng)
     log.info('schema ready at %s', config.DATABASE_URL)
+
+
+def _ensure_indexes(eng: Engine) -> None:
+    """
+    Create indexes declared in the schema but missing from the database.
+
+    `create_all` skips a table that already exists, *including* its indexes,
+    so an index added to the schema after a database was first built never
+    reached it. This closes that gap for existing stores; it is a no-op on a
+    fresh one.
+    """
+    with eng.begin() as conn:
+        for table in metadata.sorted_tables:
+            for ix in table.indexes:
+                try:
+                    ix.create(conn, checkfirst=True)
+                except Exception as exc:              # noqa: BLE001
+                    log.warning('could not create index %s: %s', ix.name, exc)
 
 
 @contextmanager
@@ -380,7 +493,8 @@ def execute(sql: str, params: dict | None = None) -> int:
         return result.rowcount or 0
 
 
-def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
+def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000,
+           on_conflict: str = 'update', conn=None) -> int:
     """
     Insert-or-replace rows keyed on the table's primary key.
 
@@ -394,13 +508,19 @@ def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
     and created_at to NULL, and the report then showed in the history with no
     file and no date. A caller that names a column intends to change it; one
     that omits it does not intend to erase it.
+
+    `on_conflict='ignore'` keeps the existing row untouched — first write
+    wins. `conn` joins an outer transaction so several writes commit or roll
+    back together.
     """
     rows = [r for r in rows if r]
     if not rows:
         return 0
+    if conn is None:
+        with get_engine().begin() as own:
+            return upsert(table, rows, chunk, on_conflict, conn=own)
 
-    eng = get_engine()
-    dialect = eng.dialect.name
+    dialect = conn.dialect.name
     total = 0
 
     if dialect == 'sqlite':
@@ -412,43 +532,45 @@ def upsert(table: Table, rows: Sequence[dict], chunk: int = 2000) -> int:
 
     pk_cols = [c.name for c in table.primary_key.columns]
 
-    with eng.begin() as conn:
-        for i in range(0, len(rows), chunk):
-            batch = rows[i:i + chunk]
-            if _insert is None:
-                conn.execute(table.insert(), batch)
+    for i in range(0, len(rows), chunk):
+        batch = rows[i:i + chunk]
+        if _insert is None:
+            conn.execute(table.insert(), batch)
+        else:
+            stmt = _insert(table).values(batch)
+            # Only what this batch actually carries. A column absent from
+            # every row in the batch is left alone rather than nulled.
+            supplied = {k for r in batch for k in r}
+            update_cols = {
+                c.name: stmt.excluded[c.name]
+                for c in table.columns
+                if c.name not in pk_cols and c.name in supplied
+            }
+            if update_cols and on_conflict == 'update':
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=pk_cols, set_=update_cols
+                )
             else:
-                stmt = _insert(table).values(batch)
-                # Only what this batch actually carries. A column absent from
-                # every row in the batch is left alone rather than nulled.
-                supplied = {k for r in batch for k in r}
-                update_cols = {
-                    c.name: stmt.excluded[c.name]
-                    for c in table.columns
-                    if c.name not in pk_cols and c.name in supplied
-                }
-                if update_cols:
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=pk_cols, set_=update_cols
-                    )
-                else:
-                    stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
-                conn.execute(stmt)
-            total += len(batch)
+                stmt = stmt.on_conflict_do_nothing(index_elements=pk_cols)
+            conn.execute(stmt)
+        total += len(batch)
 
     return total
 
 
 def record_ingest(source: str, key: str, rows: int = 0, error: str | None = None) -> None:
-    """Bookkeeping so the Data tab can show freshness and failures."""
-    upsert(ingest_log, [{
-        'source': source,
-        'key': key,
-        'last_success': pd.Timestamp.utcnow().to_pydatetime().replace(tzinfo=None)
-                        if error is None else None,
-        'last_error': error,
-        'rows': rows,
-    }])
+    """
+    Bookkeeping so the Data tab can show freshness and failures.
+
+    A failure records the error and leaves `last_success` alone. Writing NULL
+    there erased the time of the last good refresh, so one bad fetch made a
+    source look as if it had never been loaded.
+    """
+    row = {'source': source, 'key': key, 'last_error': error}
+    if error is None:
+        row['last_success'] = config.utc_now()
+        row['rows'] = rows
+    upsert(ingest_log, [row])
 
 
 # ─────────────────────────────────────────────

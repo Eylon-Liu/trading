@@ -1,4 +1,4 @@
-"""Application shell — header and the six tabs."""
+"""Application shell — header and the tabs."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ from dash import html
 
 from ui import components as C
 from ui import theme as TH
-from ui.pages import (builder, compare, data, intel, methodology, reports,
-                      research, screen)
+from ui.pages import (builder, compare, control, data, intel, methodology,
+                      portfolio, reports, research, screen)
 
 TABS = [
     ('tab-screen', '🎯 Screen', screen),
+    ('tab-portfolio', '💼 Portfolio', portfolio),
+    ('tab-control', '🎛️ Control', control),
     ('tab-intel', '🔎 Intel', intel),
     ('tab-compare', '🔄 Compare', compare),
     ('tab-reports', '📄 Reports', reports),
@@ -23,7 +25,16 @@ TABS = [
 
 
 def header() -> dbc.Card:
+    from core import auth
+    # Its own right-aligned line, not overlaid: on a phone the title wraps
+    # to the full width and an absolutely placed link sat on top of it.
+    signout = (html.Div(html.A('Sign out', href='/logout',
+                               style={'color': TH.MUTED, 'fontSize': '0.78rem'}),
+                        style={'textAlign': 'right', 'marginTop': '-6px',
+                               'marginBottom': '2px'})
+               if auth.configured() else None)
     return dbc.Card(dbc.CardBody(html.Div([
+        signout,
         html.H1('📊 Quant Research Terminal',
                 className='mb-1',
                 style={'color': TH.ACCENT, 'fontWeight': '800',
@@ -32,7 +43,7 @@ def header() -> dbc.Card:
                'filings intelligence and policy tracking',
                className='mb-0',
                style={'color': TH.MUTED, 'fontSize': '0.9rem'}),
-    ], className='text-center py-3')),
+    ], className='text-center py-3', style={'position': 'relative'})),
         className='mb-3',
         style={'background': f'linear-gradient(135deg,{TH.BG} 0%,{TH.PANEL} 100%)',
                'border': '1px solid rgba(17,153,142,0.32)'})

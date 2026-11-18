@@ -5,17 +5,25 @@ Two execution models, matching the two horizons:
 
   long  Periodic rebalance into the top-N ranked names, equal or inverse-vol
         weighted, held until the next rebalance. Exit is a re-rank, not a price.
-  mid   Every entry carries a stop, a target and a time stop, and the path is
-        walked bar by bar so a position can be closed between rebalances.
-        Backtesting a stop-based strategy with month-end snapshots would score
-        trades that a real stop would have closed weeks earlier.
+  mid   Every entry carries a stop, a target and a time stop. The portfolio is
+        simulated session by session: orders fill only if the market actually
+        reaches them, exits are checked on every bar, capital is finite, and
+        the equity curve is marked to market daily.
 
 The look-ahead discipline is structural rather than advisory: at each
 rebalance date the engine calls the same scoring path the live screen uses,
-gated to that date. Nothing filed later is visible, so a backtest cannot use
-information the strategy could not have had. Orders are filled from the
-session *after* the scoring date, never at the close the score was computed
-from.
+gated to that date. Nothing filed later is visible, and trades are filled no
+earlier than the session *after* the signal was computed.
+
+Execution conventions (both models)
+  * Signals are computed after the close of a real trading session — never a
+    calendar date that happens to be a weekend.
+  * Long horizon: fills at the close `execution_lag` sessions later (1).
+  * Mid horizon: market orders fill at the next session's open; pullback
+    limits fill only when a later bar trades down to them, within
+    `fill_window` sessions, or the order expires unfilled.
+  * A stop that the market gaps through fills at the open, not at the stop.
+  * Costs (commission + slippage) are charged on every trade, both sides.
 """
 
 from __future__ import annotations
@@ -32,10 +40,10 @@ from data import sec, yahoo
 from data.universe import UniverseSpec
 from quant import availability as AV
 from quant import engine as EN
-from quant import factors as FA
 from quant import factorcache
 from quant import strategies as ST
 from quant import tradeplan as TP
+from quant.factors import PRICE_LOOKBACK_DAYS
 from quant.fundamentals import adjust_shares_for_splits
 
 log = logging.getLogger(__name__)
@@ -92,6 +100,7 @@ class BacktestResult:
     holdings: pd.DataFrame
     trades: pd.DataFrame
     metrics: dict
+    rebalance_dates: list
     ic_series: pd.Series = field(default_factory=pd.Series)
 
     def summary(self) -> str:
@@ -103,111 +112,112 @@ class BacktestResult:
 
 
 # ─────────────────────────────────────────────
-# SHARED PRE-LOAD AND POINT-IN-TIME SCORING
+# SHARED: SESSIONS, PRE-LOADING, SCORING
 # ─────────────────────────────────────────────
+
+def rebalance_positions(sessions: pd.DatetimeIndex, rebalance: str) -> list[int]:
+    """
+    Index positions of the rebalance sessions: the first session, then the
+    last session of each period (month, quarter, half-year, year) after it.
+
+    Calendar period-ends were used before. When one fell on a weekend the
+    period ended at Friday's close and the next began at Monday's, so the
+    return between them belonged to neither period and silently vanished.
+    """
+    if len(sessions) == 0:
+        return []
+    s = pd.Series(range(len(sessions)), index=sessions)
+    if rebalance == 'Q':
+        key = sessions.year * 10 + sessions.quarter
+    elif rebalance == 'SA':
+        key = sessions.year * 10 + (sessions.month > 6).astype(int)
+    elif rebalance == 'A':
+        key = sessions.year
+    else:
+        key = sessions.year * 100 + sessions.month
+    last = s.groupby(np.asarray(key)).max().tolist()
+    return sorted({0, *[p for p in last if p > 0]})
+
 
 @dataclass
 class _Preload:
-    """Everything a walk-forward needs, read once for the whole window."""
+    tickers: list[str]
     facts: pd.DataFrame
+    version: str
     splits: pd.DataFrame
-    data_version: str
-    ohlc: tuple                      # (adj_close, adj_high, adj_low, raw_close)
+    ohlc: tuple
     insiders: pd.DataFrame
     events: pd.DataFrame
-    prev_fund: pd.DataFrame | None = None
-    prev_date: date | None = None
 
 
-def _preload(spec: UniverseSpec, dates: pd.DatetimeIndex, start: date,
-             end: date) -> _Preload:
-    """
-    One read per source covering every rebalance in the window.
-
-    Rows dated after a given rebalance are present in these frames, so every
-    consumer slices them to the as-of date — `facts` by `filed` in
-    `_score_at`, prices/insiders/events inside quant.factors. Nothing past
-    `end` is loaded at all.
-    """
-    tickers: set[str] = set()
-    for ts in dates:
+def _preload(spec: UniverseSpec, start: date, end: date,
+             rebalance: str = 'M') -> _Preload:
+    """Everything the scoring path needs, read once for the whole window."""
+    tickers: set[str] = set(spec.resolve(start))
+    for ts in pd.date_range(start, end, freq=REBALANCE_FREQ.get(rebalance, 'ME')):
         tickers.update(spec.resolve(ts.date()))
-    tickers_sorted = sorted(tickers)
-    last = dates[-1].date()
-
-    splits = (yahoo.split_factors(tickers_sorted) if tickers_sorted
-              else pd.DataFrame(columns=['ticker', 'date', 'ratio']))
-    facts = sec.facts_asof(tickers_sorted, last) if tickers_sorted else pd.DataFrame()
+    names = sorted(tickers)
+    facts = sec.facts_asof(names, end) if names else pd.DataFrame()
+    splits = yahoo.split_factors(names) if names else pd.DataFrame()
     if not facts.empty:
         facts = adjust_shares_for_splits(facts, splits)
-
-    # The benchmark rides along so BETA / IDIO_VOL can be computed: it is
-    # rarely a member of the universe being tested.
-    px_tickers = sorted(tickers | {config.BENCHMARK_TICKER})
-    ohlc = yahoo.bulk_ohlc(px_tickers,
-                           start=start - timedelta(days=FA.PRICE_LOOKBACK_DAYS),
-                           end=end)
-    insiders = sec.insiders_asof(
-        tickers_sorted, last,
-        lookback_days=(last - start).days + 180) if tickers_sorted else pd.DataFrame()
-    events = sec.events_asof(
-        tickers_sorted, last,
-        lookback_days=(last - start).days + 90) if tickers_sorted else pd.DataFrame()
-    log.info('pre-loaded %d tickers, %d price bars, %d facts',
-             len(tickers_sorted), len(ohlc[0]), len(facts))
-    return _Preload(facts, splits, factorcache.data_version(), ohlc,
+    lookback = PRICE_LOOKBACK_DAYS
+    # The benchmark rides along: BETA, IDIO_VOL and EARNINGS_REACTION are all
+    # measured against it. Loading only the universe left those factors empty
+    # in every backtest — silently, for the mid-term path, which never ran
+    # the degraded-run check.
+    ohlc = yahoo.bulk_ohlc(sorted(set(names) | {config.BENCHMARK_TICKER}),
+                           start=start - timedelta(days=lookback), end=end)
+    insiders = sec.insiders_asof(names, end,
+                                 lookback_days=(end - start).days + 180) \
+        if names else pd.DataFrame()
+    events = sec.events_asof(names, end, lookback_days=(end - start).days + 90) \
+        if names else pd.DataFrame()
+    return _Preload(names, facts, factorcache.data_version(), splits, ohlc,
                     insiders, events)
 
 
-def _score_at(pre: _Preload, spec: UniverseSpec, strategy_key, d0: date,
-              top_n: int, plan_params: TP.PlanParams | None = None
-              ) -> EN.RunResult:
-    """Run the live scoring path gated to `d0`, reusing unchanged fundamentals."""
-    facts = pre.facts
-    if facts.empty:
-        facts_d0, changed = None, None
-    else:
-        filed = facts['filed']
-        facts_d0 = facts[filed <= pd.Timestamp(d0)]
-        changed = (None if pre.prev_date is None else set(
-            facts.loc[(filed > pd.Timestamp(pre.prev_date))
-                      & (filed <= pd.Timestamp(d0)), 'ticker'].unique()))
+class _Scorer:
+    """Runs the live scoring path at successive dates, reusing prior work."""
 
-    result = EN.run(spec, strategy_key, as_of=d0, top_n=top_n, persist=False,
-                    plan_params=plan_params,
-                    _bt_facts=facts_d0,
-                    _bt_data_version=pre.data_version,
-                    _bt_prev_fund=pre.prev_fund,
-                    _bt_changed_tickers=changed,
-                    _bt_splits=pre.splits,
-                    _bt_splits_applied=True,
-                    _bt_ohlc=pre.ohlc,
-                    _bt_insiders=pre.insiders,
-                    _bt_events=pre.events)
-    pre.prev_fund, pre.prev_date = result._fund_raw, d0
-    return result
+    def __init__(self, spec, strategy_key, pre: _Preload):
+        self.spec, self.key, self.pre = spec, strategy_key, pre
+        self.prev_fund = None
+        self.prev_d0: date | None = None
 
-
-def _check_degraded(result: EN.RunResult, strategy: ST.Strategy, d0: date,
-                    strict: bool) -> None:
-    if strict and result.degraded:
-        raise DegradedBacktest(
-            f'{strategy.key} cannot be honestly backtested at {d0}: '
-            + '; '.join(result.warnings)
-            + '  (pass strict=False to measure the degraded variant anyway)')
+    def run(self, d0: date, top_n: int, plan_params=None):
+        facts = self.pre.facts
+        facts_d0 = facts[facts['filed'] <= pd.Timestamp(d0)] if not facts.empty \
+            else None
+        changed = None
+        if self.prev_d0 is not None and not facts.empty:
+            new = facts[(facts['filed'] > pd.Timestamp(self.prev_d0))
+                        & (facts['filed'] <= pd.Timestamp(d0))]
+            changed = set(new['ticker'].unique())
+        result = EN.run(self.spec, self.key, as_of=d0, top_n=top_n,
+                        persist=False, plan_params=plan_params,
+                        _bt_facts=facts_d0,
+                        _bt_data_version=self.pre.version,
+                        _bt_prev_fund=self.prev_fund,
+                        _bt_changed_tickers=changed,
+                        _bt_splits=self.pre.splits,
+                        _bt_splits_applied=True,
+                        _bt_ohlc=self.pre.ohlc,
+                        _bt_insiders=self.pre.insiders,
+                        _bt_events=self.pre.events)
+        self.prev_fund = result._fund_raw
+        self.prev_d0 = d0
+        return result
 
 
-def _next_session(sessions: pd.DatetimeIndex, d: date) -> pd.Timestamp | None:
-    """
-    First trading session strictly after `d`.
-
-    Scores use everything dated `d`, including filings that land after that
-    day's close, so the earliest honest fill is the following session.
-    Trading at the very close the signal was computed from would quietly
-    assume a filing published at 6pm was known at 4pm.
-    """
-    pos = sessions.searchsorted(pd.Timestamp(d), side='right')
-    return sessions[pos] if pos < len(sessions) else None
+def _risk_free(start: date, end: date) -> float:
+    """Average 3-month T-bill yield over the window; the config rate if unknown."""
+    try:
+        from data import macro
+        return macro.risk_free_rate(start, end)
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('risk-free lookup failed (%s) — using config rate', exc)
+        return config.RISK_FREE_RATE
 
 
 # ─────────────────────────────────────────────
@@ -216,7 +226,9 @@ def _next_session(sessions: pd.DatetimeIndex, d: date) -> pd.Timestamp | None:
 
 def _weights(scores: pd.DataFrame, n: int, scheme: str,
              vols: pd.Series | None = None) -> pd.Series:
-    picks = scores.head(n)
+    # The same sector-capped shortlist a live screen shows, so a backtest
+    # holds what the screen would have told you to hold.
+    picks = EN.diversified_head(scores, n)
     if picks.empty:
         return pd.Series(dtype=float)
 
@@ -244,17 +256,19 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                  rebalance: str | None = None,
                  weighting: str = 'equal',
                  cost_bps: float | None = None,
-                 strict: bool = True) -> BacktestResult:
+                 strict: bool = True,
+                 execution_lag: int = 1) -> BacktestResult:
     """
     Walk forward, re-scoring at each rebalance with only the data of that date.
 
-    Scores are computed as of each rebalance date and the portfolio is traded
-    at the close of the *next* session, held to the close of the session after
-    the following rebalance date.
+    The signal is computed after the close of a rebalance session; trades fill
+    at the close `execution_lag` sessions later (default 1). Filling at the
+    very close the signal was computed from assumes you could see that close
+    and trade on it in the same instant — and lets a filing published after
+    the bell on the signal day count as tradeable that day.
 
-    For an inverted (avoid-list) strategy the portfolio holds the names it
-    flags, so underperforming the benchmark is the strategy working; the IC is
-    reported on the un-inverted score so that positive still means "works".
+    The equity curve is marked to market daily, so drawdown, volatility and
+    Sharpe reflect what happened between rebalances, not only at them.
 
     `strict` (the default) refuses to return a number when the data cannot
     support the strategy at a rebalance date — see `DegradedBacktest`. Pass
@@ -262,109 +276,148 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     that comes back is then not the strategy you configured.
     """
     strategy = ST.get(strategy_key)
+    if strategy.invert:
+        raise ValueError(f'{strategy.name} is an avoid list; a long-only '
+                         f'backtest of it is meaningless.')
     start = pd.to_datetime(start).date()
     end = pd.to_datetime(end or date.today()).date()
+    meta_notes: list[str] = []
+    if strategy.is_meta:
+        # Only the families whose data reaches back to `start` take part,
+        # for the whole run; forward-only votes (the AI review) never do.
+        strategy, meta_notes = AV.meta_members_at(strategy, start,
+                                                  spec.preset or 'SPY')
+        if len(strategy.components) < 2:
+            raise DegradedBacktest(
+                f'{strategy.name}: fewer than two strategy families are '
+                f'backtestable from {start}: ' + '; '.join(meta_notes))
+        strategy_key = strategy
     rebalance = rebalance or ST.HORIZONS[strategy.horizon]['rebalance']
     n_holdings = n_holdings or ST.HORIZONS[strategy.horizon]['default_holdings']
     cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
-    round_trip = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
+    # Charged on every unit of weight traded, buys and sells alike.
+    one_way = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
+    lag = max(0, int(execution_lag))
 
     _require_honest_window(spec, strategy_key, start, strict)
 
-    dates = pd.date_range(start, end, freq=REBALANCE_FREQ.get(rebalance, 'ME'))
-    if len(dates) < 2:
-        raise ValueError('backtest window too short for the rebalance frequency')
-
-    log.info('backtest %s | %s -> %s | %d rebalances | top %d',
-             strategy.name, start, end, len(dates), n_holdings)
-
-    pre = _preload(spec, dates, start, end)
-    adj_close = pre.ohlc[0]
-    if adj_close.empty:
+    pre = _preload(spec, start, end, rebalance)
+    adj_close_all = pre.ohlc[0].ffill() if not pre.ohlc[0].empty else pd.DataFrame()
+    if adj_close_all.empty:
         raise ValueError('no stored prices for this universe and window')
-    sessions = adj_close.index
-    last_session = sessions[-1]
 
-    def fill_at(d: date) -> pd.Timestamp:
-        return _next_session(sessions, d) or last_session
+    sessions = adj_close_all.index[(adj_close_all.index >= pd.Timestamp(start))
+                                   & (adj_close_all.index <= pd.Timestamp(end))]
+    signal_pos = rebalance_positions(sessions, rebalance)
+    if len(signal_pos) < 2 or signal_pos[0] + lag >= len(sessions) - 1:
+        raise ValueError('backtest window too short for the rebalance frequency')
+    dates = [sessions[p] for p in signal_pos]
+    log.info('backtest %s | %s -> %s | %d rebalances | top %d | lag %d',
+             strategy.name, start, end, len(dates), n_holdings, lag)
 
-    ic_sign = -1.0 if strategy.invert else 1.0
-    prev_w = pd.Series(dtype=float)
-    equity, turnover_log, holdings_log, trades, ics = [1.0], [], [], [], []
-    equity_dates = [fill_at(dates[0].date())]
+    scorer = _Scorer(spec, strategy_key, pre)
+    prev_w = pd.Series(dtype=float)        # drifted weights held going in
+    curve: list[pd.Series] = []
+    equity_now = 1.0
+    turnover_log, holdings_log, trades, ics = [], [], [], []
 
-    for i in range(len(dates) - 1):
-        d0, d1 = dates[i].date(), dates[i + 1].date()
-        t0, t1 = fill_at(d0), fill_at(d1)
+    for k, p0 in enumerate(signal_pos):
+        d0 = sessions[p0].date()
+        # Hold from this rebalance's fill to the next one's fill.
+        p_in = p0 + lag
+        p_out = (min(signal_pos[k + 1] + lag, len(sessions) - 1)
+                 if k + 1 < len(signal_pos) else len(sessions) - 1)
+        if p_in >= p_out:
+            break
 
-        if t1 <= t0:
-            break                       # no session left to trade in
+        result = scorer.run(d0, n_holdings)
+        if strict and result.degraded:
+            raise DegradedBacktest(
+                f'{strategy.key} cannot be honestly backtested at {d0}: '
+                + '; '.join(result.warnings)
+                + '  (pass strict=False to measure the degraded variant anyway)')
 
-        result = _score_at(pre, spec, strategy_key, d0, n_holdings)
-        _check_degraded(result, strategy, d0, strict)
+        seg_index = sessions[p_in:p_out + 1]
+        w = pd.Series(dtype=float)
+        if not result.scores.empty:
+            w = _weights(result.scores, n_holdings, weighting,
+                         result.scores.get('VOL_1Y'))
+        seg = pd.DataFrame(index=seg_index)
+        if not w.empty:
+            # A name with no price at the fill is not bought; its share is cash.
+            seg = adj_close_all.reindex(columns=w.index).loc[seg_index]
+            priced = (seg.iloc[0].notna() & (seg.iloc[0] > 0)).to_numpy()
+            w, seg = w[priced], seg.loc[:, priced]
 
-        w = (_weights(result.scores, n_holdings, weighting,
-                      result.scores.get('VOL_1Y'))
-             if not result.scores.empty else pd.Series(dtype=float))
-        px = adj_close.loc[t0:t1]
+        if curve:
+            # The fill bar closed the previous segment; it opens this one
+            # with the post-cost value instead of appearing twice.
+            curve[-1] = curve[-1].iloc[:-1]
+
         if w.empty:
-            # Nothing held for the period: carry the curve flat, and liquidate
-            # what was held before, which costs a trade.
-            exit_cost = float(prev_w.abs().sum()) * round_trip
-            equity.append(equity[-1] * (1.0 - exit_cost))
-            equity_dates.append(t1)
-            if exit_cost:
-                turnover_log.append(float(prev_w.abs().sum()))
+            traded = float(prev_w.abs().sum())
+            equity_now *= 1.0 - traded * one_way
+            curve.append(pd.Series(equity_now, index=seg_index))
             prev_w = pd.Series(dtype=float)
             continue
 
-        # Forward-filled only inside the holding window, so a name that stops
-        # trading keeps its last price rather than borrowing a future one.
-        held = px.reindex(columns=w.index).ffill()
-        period_ret = (held.iloc[-1] / held.iloc[0] - 1.0).fillna(0.0)
-        gross = float((w * period_ret).sum())
+        rel = seg.ffill() / seg.iloc[0]
+        cash_w = max(0.0, 1.0 - float(w.sum()))
+        port_rel = rel.mul(w, axis=1).sum(axis=1) + cash_w
 
-        traded = float((w.subtract(prev_w, fill_value=0.0)).abs().sum())
-        equity.append(equity[-1] * (1.0 + gross - traded * round_trip))
-        equity_dates.append(t1)
-        turnover_log.append(traded)
+        traded = float(w.subtract(prev_w, fill_value=0.0).abs().sum())
+        start_value = equity_now * (1.0 - traded * one_way)
+        seg_curve = start_value * port_rel
+        curve.append(seg_curve)
+        equity_now = float(seg_curve.iloc[-1])
+        if k > 0:
+            turnover_log.append(traded)
 
-        # Rank IC over the same window the portfolio was exposed to.
+        prior = prev_w
+        period_ret = rel.iloc[-1] - 1.0
+        # Weights drift with prices until the next rebalance; turnover is
+        # measured against what is actually held then, not the old targets.
+        prev_w = (w * rel.iloc[-1]) / float(port_rel.iloc[-1])
+
+        # Rank IC over the same holding window, across every scored name.
         if len(result.scores) >= 8:
-            cols = px.columns.intersection(result.scores.index)
-            all_px = px[cols].ffill()
-            fwd = all_px.iloc[-1] / all_px.iloc[0] - 1.0
-            pair = pd.concat([result.scores['composite'] * ic_sign, fwd],
-                             axis=1).dropna()
+            cols = adj_close_all.columns.intersection(result.scores.index)
+            px = adj_close_all.loc[seg_index, cols]
+            fwd = px.iloc[-1] / px.iloc[0] - 1.0
+            pair = pd.concat([result.scores['composite'], fwd], axis=1).dropna()
+            pair.columns = ['score', 'fwd']
             if len(pair) >= 8:
-                ics.append({'date': d1, 'ic': pair.iloc[:, 0].corr(
-                    pair.iloc[:, 1], method='spearman')})
+                ics.append({'date': seg_index[-1].date(),
+                            'ic': pair['score'].corr(pair['fwd'], method='spearman')})
 
         for t, weight in w.items():
             holdings_log.append({'date': d0, 'ticker': t, 'weight': weight,
-                                 'period_return': period_ret.get(t, 0.0)})
-        for t in w.index.difference(prev_w.index):
-            trades.append({'date': d0, 'ticker': t, 'action': 'buy',
-                           'weight': w[t]})
-        for t in prev_w.index.difference(w.index):
-            trades.append({'date': d0, 'ticker': t, 'action': 'sell',
-                           'weight': prev_w[t]})
-        # Weights drift with returns over the period; the next rebalance trades
-        # from the drifted book, not from the targets set at this one.
-        drifted = w * (1.0 + period_ret)
-        prev_w = drifted / drifted.sum() if drifted.sum() > 0 else w
+                                 'period_return': float(period_ret.get(t, 0.0))})
+        fill_day = seg_index[0].date()
+        for t in set(w.index) - set(prior.index):
+            trades.append({'date': fill_day, 'ticker': t, 'action': 'buy',
+                           'weight': float(w[t])})
+        for t in set(prior.index) - set(w.index):
+            trades.append({'date': fill_day, 'ticker': t, 'action': 'sell',
+                           'weight': float(prior[t])})
 
-    eq = pd.Series(equity, index=pd.DatetimeIndex(equity_dates), name='strategy')
+    eq = pd.concat(curve) if curve else pd.Series(dtype=float)
     eq = eq[~eq.index.duplicated(keep='last')]
-    bench = _benchmark_curve(eq.index[0].date(), eq.index[-1].date(), eq.index)
+    eq.name = 'strategy'
+    bench = (_benchmark_curve(eq.index[0].date(), eq.index[-1].date(), eq.index)
+             if len(eq) else pd.Series(dtype=float))
 
-    metrics = compute_metrics(eq, bench)
+    rf = _risk_free(start, end)
+    metrics = compute_metrics(eq, bench, rf=rf)
     metrics['turnover'] = float(np.mean(turnover_log)) * _periods_per_year(rebalance) \
         if turnover_log else 0.0
-    metrics['n_rebalances'] = len(dates) - 1
+    metrics['n_rebalances'] = len(dates)
     metrics['avg_holdings'] = n_holdings
-    if strategy.invert:
-        metrics['inverted'] = True
+    metrics['execution_lag'] = lag
+    if strategy.is_meta:
+        metrics['families_used'] = ', '.join(strategy.components)
+        if meta_notes:
+            metrics['families_note'] = '; '.join(meta_notes)
 
     ic_series = pd.Series(dtype=float)
     if ics:
@@ -379,222 +432,279 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     return BacktestResult(
         equity=eq, benchmark=bench,
         holdings=pd.DataFrame(holdings_log), trades=pd.DataFrame(trades),
-        metrics=metrics, ic_series=ic_series)
+        metrics=metrics, rebalance_dates=[d.date() for d in dates],
+        ic_series=ic_series)
 
 
 # ─────────────────────────────────────────────
 # MID-HORIZON BACKTEST  (stop / target aware)
 # ─────────────────────────────────────────────
 
-# Sessions a pullback limit order stays working before it is cancelled.
-ENTRY_WINDOW_SESSIONS = 5
-
-
-def _simulate_trade(plan: pd.Series, hi: pd.Series, lo: pd.Series,
-                    cl: pd.Series, time_stop_days: int) -> dict | None:
+def simulate_trades(bars: dict[str, pd.DataFrame], signals: dict,
+                    params: TP.PlanParams, one_way: float,
+                    fill_window: int = 5, max_gross_pct: float = 100.0
+                    ) -> tuple[pd.Series, pd.DataFrame, dict]:
     """
-    Walk one plan through the sessions after its scan date.
+    Session-by-session portfolio simulation of trade plans.
 
-    `hi`/`lo`/`cl` start at the first session after the scan and are on the
-    same adjusted basis as the plan's levels. Returns None when the order is
-    never filled or the setup is already broken at the fill.
+    `bars` holds adjusted open/high/low/close wide frames over the sessions to
+    simulate; `signals` maps a session Timestamp to the plans produced after
+    that session's close (a frame indexed by ticker, best first, with entry,
+    entry_type, stop, target and weight_pct).
 
-      market    filled at the first session's close.
-      pullback  a limit at `entry`, working for ENTRY_WINDOW_SESSIONS; it
-                fills only on a session whose low reaches it, at the lower of
-                the limit and that session's high (a gap down fills below).
-                Assuming every limit fills — and at the limit — books the
-                discount on exactly the trades where price never came back.
+    Returns (daily equity starting at 1.0, closed trades, stats).
 
-    After the fill, a session that touches the stop exits at the stop, or at
-    the session's high when it gapped through; one that touches the target
-    exits at the target. When both are touched on the same day the stop is
-    assumed, since daily bars cannot reveal the order. Otherwise the position
-    is closed at the close `time_stop_days` sessions after the fill.
+    What the previous version got wrong, and this one does not:
+      * every plan was assumed filled at its entry price — including pullback
+        limits set below the market that price never came back to;
+      * the bar walk began *on the signal day*, so that day's range, which
+        happened before the signal existed, could trigger a stop or target;
+      * positions overlapped across monthly scans with no capital limit, so
+        exposure could reach several hundred percent;
+      * P&L was booked only at exits, so open losses never showed in the
+        drawdown;
+      * a gap through the stop was filled at the stop instead of the open.
     """
-    entry, stop, target = (float(plan['entry']), float(plan['stop']),
-                           float(plan['target']))
-    if cl.empty:
-        return None
+    o, h, l, c = bars['open'], bars['high'], bars['low'], bars['close']
+    sessions = c.index
+    closes_ff = c.ffill()
+    cash = 1.0
+    positions: dict[str, dict] = {}
+    pending: dict[str, dict] = {}
+    closed: list[dict] = []
+    equity = []
+    stats = {'orders': 0, 'filled': 0, 'expired': 0, 'skipped_capacity': 0,
+             'skipped_gap_below_stop': 0}
+    exposure = []
 
-    limit = plan.get('entry_type') == 'pullback'
-    if limit:
-        window = lo.iloc[:ENTRY_WINDOW_SESSIONS]
-        touched = window.index[window <= entry]
-        if len(touched) == 0:
-            return None
-        fill_day = touched[0]
-        day_hi = float(hi.get(fill_day, np.nan))
-        fill = min(entry, day_hi) if np.isfinite(day_hi) else entry
-    else:
-        fill_day = cl.index[0]
-        fill = float(cl.iloc[0])
+    def value_of(i: int) -> float:
+        row = closes_ff.iloc[i]
+        return cash + sum(p['shares'] * float(row.get(t, p['entry']))
+                          for t, p in positions.items())
 
-    if not (stop < fill < target):
-        return None                                    # setup broken before entry
+    def close_position(t: str, price: float, reason: str, i: int) -> None:
+        nonlocal cash
+        p = positions.pop(t)
+        cash += p['shares'] * price * (1.0 - one_way)
+        gross = price / p['entry'] - 1.0
+        risk = (p['entry'] - p['stop']) / p['entry']
+        closed.append({
+            'signal_date': p['signal_date'], 'entry_date': p['entry_date'],
+            'exit_date': sessions[i].date(), 'ticker': t,
+            'entry': round(p['entry'], 4), 'exit': round(price, 4),
+            'stop': p['stop'], 'target': p['target'], 'reason': reason,
+            'weight': p['weight'], 'gross_return': gross,
+            'net_return': (1 + gross) * (1 - one_way) / (1 + one_way) - 1,
+            'r_multiple': gross / risk if risk > 0 else np.nan,
+            'days_held': i - p['bar'],
+        })
 
-    fill_pos = cl.index.get_loc(fill_day)
-    planned_exit = fill_pos + time_stop_days
-    last_pos = min(planned_exit, len(cl) - 1)
-    exit_price, exit_day = float(cl.iloc[last_pos]), cl.index[last_pos]
-    reason = 'time' if planned_exit <= len(cl) - 1 else 'end'   # window ran out
+    for i, day in enumerate(sessions):
+        eq_prev = equity[-1] if equity else 1.0
 
-    # A market fill happens at the close, so the walk starts next session. A
-    # limit fills intraday: its own session can still stop out, but a high on
-    # that day may have printed before the dip, so it cannot count as target.
-    first_walk = fill_pos if limit else fill_pos + 1
-    for day in cl.index[first_walk:last_pos + 1]:
-        day_lo, day_hi = lo.get(day, np.nan), hi.get(day, np.nan)
-        if np.isfinite(day_lo) and day_lo <= stop:
-            gapped = np.isfinite(day_hi) and day_hi < stop
-            exit_price, reason, exit_day = (day_hi if gapped else stop), 'stop', day
-            break
-        if day != fill_day and np.isfinite(day_hi) and day_hi >= target:
-            exit_price, reason, exit_day = target, 'target', day
-            break
+        # 1. fills — orders placed after an earlier close
+        for t, order in list(pending.items()):
+            if i > order['expires']:
+                stats['expired'] += 1
+                del pending[t]
+                continue
+            op, lo_ = o.at[day, t] if t in o else np.nan, l.at[day, t] if t in l else np.nan
+            if not (np.isfinite(op) and np.isfinite(lo_)):
+                continue
+            if order['entry_type'] == 'market':
+                fill = op
+            elif op <= order['entry']:
+                fill = op                       # opened below the limit
+            elif lo_ <= order['entry']:
+                fill = order['entry']
+            else:
+                continue
+            del pending[t]
+            if fill <= order['stop']:
+                # Already through the stop before we were in: the setup is
+                # invalid, and nobody enters a trade below its own stop.
+                stats['skipped_gap_below_stop'] += 1
+                continue
+            invested = sum(p['shares'] * float(closes_ff.iloc[max(i - 1, 0)].get(t2, p['entry']))
+                           for t2, p in positions.items())
+            room = max(0.0, max_gross_pct / 100.0 * eq_prev - invested)
+            want = order['weight'] * eq_prev
+            alloc = min(want, room, cash / (1.0 + one_way))
+            if alloc < params.min_weight_pct / 100.0 * eq_prev:
+                stats['skipped_capacity'] += 1
+                continue
+            shares = alloc / fill
+            cash -= alloc * (1.0 + one_way)
+            positions[t] = {'shares': shares, 'entry': fill, 'stop': order['stop'],
+                            'target': order['target'], 'bar': i,
+                            'limit': order['entry_type'] != 'market',
+                            'entry_date': day.date(), 'signal_date': order['signal_date'],
+                            'weight': alloc / eq_prev}
+            stats['filled'] += 1
 
-    return {'fill_date': fill_day.date(), 'fill': fill, 'exit_date': exit_day.date(),
-            'exit': exit_price, 'reason': reason}
+        # 2. exits — stop first: within one bar the order is unknowable, so
+        #    assume the worse outcome.
+        for t, p in list(positions.items()):
+            op = o.at[day, t] if t in o else np.nan
+            hi = h.at[day, t] if t in h else np.nan
+            lo_ = l.at[day, t] if t in l else np.nan
+            cl = c.at[day, t] if t in c else np.nan
+            if not np.isfinite(cl):
+                continue
+            fresh = p['bar'] == i
+            if not fresh and np.isfinite(op) and op <= p['stop']:
+                close_position(t, op, 'stop', i)
+            elif np.isfinite(lo_) and lo_ <= p['stop']:
+                close_position(t, p['stop'], 'stop', i)
+            elif not fresh and np.isfinite(op) and op >= p['target']:
+                close_position(t, op, 'target', i)
+            elif (np.isfinite(hi) and hi >= p['target']
+                  and not (fresh and p['limit'])):
+                close_position(t, p['target'], 'target', i)
+            elif i - p['bar'] >= params.time_stop_days:
+                close_position(t, cl, 'time', i)
+
+        # 3. mark to market
+        v = value_of(i)
+        equity.append(v)
+        exposure.append((v - cash) / v if v > 0 else 0.0)
+
+        # 4. new signals after this close → orders from the next session
+        plans = signals.get(day)
+        if plans is not None and not plans.empty:
+            for t, plan in plans.iterrows():
+                if t in positions or t in pending or t not in c.columns:
+                    continue
+                pending[t] = {'entry': float(plan['entry']),
+                              'entry_type': str(plan.get('entry_type', 'market')),
+                              'stop': float(plan['stop']),
+                              'target': float(plan['target']),
+                              'weight': float(plan['weight_pct']) / 100.0,
+                              'expires': i + fill_window,
+                              'signal_date': day.date()}
+                stats['orders'] += 1
+
+    # Anything still open is closed at the last close of the window.
+    last = len(sessions) - 1
+    for t in list(positions):
+        px = float(closes_ff.iloc[last].get(t, positions[t]['entry']))
+        close_position(t, px, 'end', last)
+    if equity:
+        equity[-1] = cash
+
+    stats['avg_exposure'] = float(np.mean(exposure)) if exposure else 0.0
+    stats['fill_rate'] = stats['filled'] / stats['orders'] if stats['orders'] else 0.0
+    return (pd.Series(equity, index=sessions, name='strategy'),
+            pd.DataFrame(closed), stats)
 
 
-def run_trade_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
+def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
                        start: date | str, end: date | str | None = None,
                        n_positions: int = 10,
                        params: TP.PlanParams | None = None,
                        cost_bps: float | None = None,
+                       fill_window: int = 5,
+                       max_gross_pct: float = 100.0,
                        strict: bool = True) -> BacktestResult:
     """
-    Backtest a mid-term strategy honouring its own exit rules.
+    Backtest a mid-term strategy honouring its own entry and exit rules.
 
-    At each month-end scan the engine builds plans from data of that date,
-    then walks the following sessions to see whether the entry filled and
-    which of stop, target or time stop came first (see `_simulate_trade`).
+    Scans after the last session of each month; the resulting plans become
+    orders for the following sessions and the portfolio is simulated bar by
+    bar (see `simulate_trades`). Gross exposure never exceeds `max_gross_pct`
+    of equity, and a name already held or on order is not bought again.
 
-    The book is one portfolio: a name already held is not bought again, and a
-    new position only takes the weight still uninvested, so overlapping scans
-    can never add up to more than 100% exposure.
+    `strict` refuses a scan date where the strategy's factors are missing,
+    exactly as the long-horizon backtest does; without it a strategy that
+    had lost half its weight was reported under its own name.
     """
     strategy = ST.get(strategy_key)
-    if strategy.horizon != 'mid':
-        raise ValueError(f'{strategy.key} is a long-horizon strategy; '
-                         f'use run_backtest instead')
     if strategy.invert:
-        raise ValueError(f'{strategy.key} is an avoid list, not a trade; '
-                         f'use run_backtest to test whether its names lag')
+        raise ValueError(f'{strategy.name} is an avoid list (rank 1 is the worst '
+                         f'name); a long-only backtest of it is meaningless. Its '
+                         f'live track record grades it the right way round.')
+    if strategy.horizon != 'mid':
+        raise ValueError(f'{strategy_key} is a long-horizon strategy; '
+                         f'use run_backtest instead')
 
     start = pd.to_datetime(start).date()
     end = pd.to_datetime(end or date.today()).date()
     params = params or TP.PlanParams()
     cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
-    round_trip = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
+    one_way = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
 
-    _require_honest_window(spec, strategy_key, start, strict)
-
-    scan_dates = pd.date_range(start, end, freq='ME')
-    if len(scan_dates) == 0:
-        raise ValueError('backtest window too short for a monthly scan')
-
-    pre = _preload(spec, scan_dates, start, end)
-    adj_c, adj_h, adj_l, _raw = pre.ohlc
-    if adj_c.empty:
-        raise ValueError('no stored prices for this universe and window')
-
-    trades: list[dict] = []
-    open_book: list[dict] = []          # {'ticker', 'exit_date', 'weight'}
-    unfilled = 0
-
-    for ts in scan_dates:
-        d0 = ts.date()
-        result = _score_at(pre, spec, strategy_key, d0, n_positions,
-                           plan_params=params)
-        _check_degraded(result, strategy, d0, strict)
-        if result.plans.empty:
-            continue
-
-        # Positions whose exit is on or before the scan are closed by now.
-        open_book = [p for p in open_book if p['exit_date'] > d0]
-        held = {p['ticker'] for p in open_book}
-        capacity = 1.0 - sum(p['weight'] for p in open_book)
-
-        after = adj_c.index[adj_c.index > pd.Timestamp(d0)]
-        if len(after) == 0:
-            continue
-        # Rank order, not the order the plans happened to be built in.
-        for t in [x for x in result.scores.index if x in result.plans.index]:
-            if capacity <= 1e-9:
-                break
-            if t in held or t not in adj_c.columns:
-                continue
-            plan = result.plans.loc[t]
-            cl = adj_c.loc[after, t].dropna()
-            hi = adj_h[t].reindex(cl.index) if t in adj_h else pd.Series(np.nan, index=cl.index)
-            lo = adj_l[t].reindex(cl.index) if t in adj_l else pd.Series(np.nan, index=cl.index)
-            sim = _simulate_trade(plan, hi, lo, cl, params.time_stop_days)
-            if sim is None:
-                unfilled += 1
-                continue
-
-            weight = min(float(plan['weight_pct']) / 100.0, capacity)
-            capacity -= weight
-            open_book.append({'ticker': t, 'exit_date': sim['exit_date'],
-                              'weight': weight})
-
-            gross = sim['exit'] / sim['fill'] - 1.0
-            risk = (sim['fill'] - float(plan['stop'])) / sim['fill']
-            trades.append({
-                'scan_date': d0,
-                'entry_date': sim['fill_date'], 'exit_date': sim['exit_date'],
-                'ticker': t, 'entry': round(sim['fill'], 2),
-                'exit': round(sim['exit'], 2), 'reason': sim['reason'],
-                'weight': weight, 'gross_return': gross,
-                'net_return': gross - 2 * round_trip,
-                'r_multiple': (gross / risk) if risk > 0 else np.nan,
-                'days_held': (sim['exit_date'] - sim['fill_date']).days,
-            })
-
-    trades_df = pd.DataFrame(trades)
-    if trades_df.empty:
+    pre = _preload(spec, start, end, 'M')
+    bars = yahoo.adjusted_bars(pre.tickers, start=start, end=end)
+    if bars['close'].empty:
         return BacktestResult(pd.Series(dtype=float), pd.Series(dtype=float),
                               pd.DataFrame(), pd.DataFrame(),
-                              {'note': 'no trades generated',
-                               'unfilled_orders': unfilled})
+                              {'note': 'no stored prices in the window'}, [])
+    sessions = bars['close'].index
+    scan_pos = rebalance_positions(sessions, 'M')
 
-    # Equity: weighted P&L booked on each exit date.
-    trades_df = trades_df.sort_values('exit_date')
-    daily = (trades_df.assign(contrib=trades_df['net_return'] * trades_df['weight'])
-                      .groupby('exit_date')['contrib'].sum())
-    eq = (1.0 + daily).cumprod()
-    eq.index = pd.to_datetime(eq.index)
-    eq = pd.concat([pd.Series([1.0], index=[pd.Timestamp(start)]), eq])
+    _require_honest_window(spec, strategy_key, start, strict)
+    scorer = _Scorer(spec, strategy_key, pre)
+    signals: dict = {}
+    for p in scan_pos:
+        d0 = sessions[p]
+        result = scorer.run(d0.date(), n_positions, plan_params=params)
+        if strict and result.degraded:
+            raise DegradedBacktest(
+                f'{strategy.key} cannot be honestly backtested at {d0.date()}: '
+                + '; '.join(result.warnings)
+                + '  (pass strict=False to measure the degraded variant anyway)')
+        if result.plans.empty:
+            continue
+        order = [t for t in result.scores.index if t in result.plans.index]
+        signals[d0] = result.plans.loc[order].head(n_positions)
 
-    bench = _benchmark_curve(start, end, eq.index)
-    metrics = compute_metrics(eq, bench)
+    eq, trades_df, stats = simulate_trades(bars, signals, params, one_way,
+                                           fill_window, max_gross_pct)
+    scan_dates = [sessions[p].date() for p in scan_pos]
+    if trades_df.empty:
+        return BacktestResult(eq, pd.Series(dtype=float), pd.DataFrame(),
+                              pd.DataFrame(),
+                              {'note': 'no trades filled', **stats}, scan_dates)
+
+    bench = _benchmark_curve(eq.index[0].date(), eq.index[-1].date(), eq.index)
+    metrics = compute_metrics(eq, bench, rf=_risk_free(start, end))
     wins = trades_df['net_return'] > 0
     metrics.update({
         'n_trades': int(len(trades_df)),
-        'unfilled_orders': unfilled,
         'win_rate': float(wins.mean()),
         'avg_win': float(trades_df.loc[wins, 'net_return'].mean()) if wins.any() else 0.0,
         'avg_loss': float(trades_df.loc[~wins, 'net_return'].mean()) if (~wins).any() else 0.0,
         'avg_r': float(trades_df['r_multiple'].mean()),
         'avg_days_held': float(trades_df['days_held'].mean()),
         'exit_mix': trades_df['reason'].value_counts().to_dict(),
+        **stats,
     })
-    if metrics['avg_loss'] != 0:
-        metrics['profit_factor'] = abs(
-            (metrics['avg_win'] * wins.sum()) /
-            (metrics['avg_loss'] * (~wins).sum()))
+    gains = trades_df.loc[wins, 'net_return'].sum()
+    losses = trades_df.loc[~wins, 'net_return'].sum()
+    metrics['profit_factor'] = float(gains / abs(losses)) if losses < 0 else np.inf
 
     return BacktestResult(equity=eq, benchmark=bench, holdings=pd.DataFrame(),
-                          trades=trades_df, metrics=metrics)
+                          trades=trades_df, metrics=metrics,
+                          rebalance_dates=scan_dates)
 
 
 # ─────────────────────────────────────────────
 # METRICS
 # ─────────────────────────────────────────────
 
-def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> dict:
-    """Standard performance statistics for an equity curve."""
+def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None,
+                    rf: float | None = None) -> dict:
+    """
+    Standard performance statistics for an equity curve.
+
+    Sharpe is the mean periodic excess return over its standard deviation,
+    annualised — the textbook definition. (CAGR over volatility, used before,
+    understates by roughly half the variance and penalises volatile
+    strategies twice.) Sortino divides by the downside *deviation* below the
+    risk-free rate, counting every period, rather than by the standard
+    deviation of the losing periods alone. `rf` is annual; it defaults to
+    config.RISK_FREE_RATE.
+    """
     if equity is None or len(equity) < 2:
         return {}
 
@@ -608,13 +718,15 @@ def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> di
     cagr = float((eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1.0)
 
     ppy = len(rets) / years
-    vol = float(rets.std() * np.sqrt(ppy)) if len(rets) > 1 else 0.0
-    rf = config.RISK_FREE_RATE
-    sharpe = float((cagr - rf) / vol) if vol > 0 else 0.0
+    rf = config.RISK_FREE_RATE if rf is None else float(rf)
+    rf_p = (1.0 + rf) ** (1.0 / ppy) - 1.0
+    excess = rets - rf_p
+    sd = float(rets.std()) if len(rets) > 1 else 0.0
+    vol = sd * np.sqrt(ppy)
+    sharpe = float(excess.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
 
-    downside = rets[rets < 0]
-    dvol = float(downside.std() * np.sqrt(ppy)) if len(downside) > 1 else 0.0
-    sortino = float((cagr - rf) / dvol) if dvol > 0 else 0.0
+    downside = np.sqrt(float((np.minimum(excess, 0.0) ** 2).mean()))
+    sortino = float(excess.mean() / downside * np.sqrt(ppy)) if downside > 0 else 0.0
 
     dd = eq / eq.cummax() - 1.0
     max_dd = float(dd.min())
@@ -625,12 +737,14 @@ def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> di
         'calmar': float(cagr / abs(max_dd)) if max_dd < 0 else 0.0,
         'best_period': float(rets.max()), 'worst_period': float(rets.min()),
         'hit_rate': float((rets > 0).mean()), 'years': years,
+        'risk_free': rf,
     }
 
     if benchmark is not None and len(benchmark) > 1:
         b = benchmark.reindex(eq.index).ffill().dropna()
         if len(b) > 1:
-            b_cagr = float((b.iloc[-1] / b.iloc[0]) ** (1 / years) - 1.0)
+            b_years = max((b.index[-1] - b.index[0]).days / 365.25, 1e-9)
+            b_cagr = float((b.iloc[-1] / b.iloc[0]) ** (1 / b_years) - 1.0)
             out['benchmark_cagr'] = b_cagr
             out['excess_cagr'] = cagr - b_cagr
             joined = pd.concat([rets, b.pct_change()], axis=1).dropna()
@@ -639,6 +753,9 @@ def compute_metrics(equity: pd.Series, benchmark: pd.Series | None = None) -> di
                 te = float(active.std() * np.sqrt(ppy))
                 out['tracking_error'] = te
                 out['information_ratio'] = float(active.mean() * ppy / te) if te > 0 else 0.0
+                bvar = float(joined.iloc[:, 1].var())
+                if bvar > 0:
+                    out['beta'] = float(joined.iloc[:, 0].cov(joined.iloc[:, 1]) / bvar)
     return out
 
 

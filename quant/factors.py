@@ -62,30 +62,23 @@ def _ret(px: pd.DataFrame, lookback: int, skip: int = 0) -> pd.Series:
         return (end / start - 1.0).replace([np.inf, -np.inf], np.nan)
 
 
-def rsi(px: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Wilder's RSI (exponential smoothing, alpha = 1/period) for every column.
-
-    A simple rolling mean reacts differently and matches no published RSI.
-    """
+def _vectorized_rsi(px: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder's RSI for every column at once — replaces per-ticker loop."""
     delta = px.diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    val = 100.0 - 100.0 / (1.0 + rs)
-    # No losses in the window is RSI 100 by definition, not missing.
-    val = val.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
-    result = val.iloc[-1]
+    # A zero average loss gives rs = inf and RSI = 100; a flat series gives NaN.
+    rsi = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    result = rsi.iloc[-1]
     result[px.count() < period + 1] = np.nan
     return result.replace([np.inf, -np.inf], np.nan)
 
 
-def atr(high: pd.DataFrame, low: pd.DataFrame,
-        close: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range (Wilder) for every column — the volatility unit
-    for stops and sizing."""
+def _vectorized_atr(high: pd.DataFrame, low: pd.DataFrame,
+                    close: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ATR for every column at once — replaces per-ticker loop."""
     prev_close = close.shift(1)
     tr = np.maximum(
         np.maximum(high - low, (high - prev_close).abs()),
@@ -96,9 +89,50 @@ def atr(high: pd.DataFrame, low: pd.DataFrame,
     return result.replace([np.inf, -np.inf], np.nan)
 
 
+def earnings_reaction(px: pd.DataFrame, events: pd.DataFrame | None,
+                      as_of: date, benchmark: str,
+                      window_days: int = 63) -> pd.Series:
+    """
+    Pure: market-adjusted return over the three sessions around the latest
+    results filing (8-K Item 2.02) in the last `window_days`.
+
+    This is the earnings-announcement return that post-earnings drift is
+    measured on: stocks keep drifting in the direction of their reaction for
+    weeks. The window runs from the close before the filing day to the close
+    after it, which covers a release before the open and one after the close
+    alike. On the filing day itself only the bars already printed are used.
+
+    `px` must already be cut at `as_of`.
+    """
+    if events is None or events.empty or px.empty or benchmark not in px.columns:
+        return pd.Series(dtype=float)
+    cutoff = pd.Timestamp(as_of)
+    filed = pd.to_datetime(events['filed'])
+    ev = events[(events['item_code'].astype(str) == '2.02') & (filed <= cutoff)
+                & (filed >= cutoff - pd.Timedelta(days=window_days))]
+    if ev.empty:
+        return pd.Series(dtype=float)
+    latest = pd.to_datetime(ev['filed']).groupby(ev['ticker']).max()
+    idx, bench = px.index, px[benchmark]
+    out = {}
+    for t, f in latest.items():
+        if t not in px.columns:
+            continue
+        p_f = int(idx.searchsorted(f, side='left'))
+        start, end = p_f - 1, min(p_f + 1, len(idx) - 1)
+        if start < 0 or end <= start:
+            continue
+        s0, s1 = px[t].iloc[start], px[t].iloc[end]
+        b0, b1 = bench.iloc[start], bench.iloc[end]
+        if np.isfinite([s0, s1, b0, b1]).all() and s0 > 0 and b0 > 0:
+            out[t] = (s1 / s0 - 1.0) - (b1 / b0 - 1.0)
+    return pd.Series(out, dtype=float)
+
+
 def price_factors(tickers: list[str], as_of: date | str,
                   benchmark: str | None = None,
-                  _bt_ohlc: tuple | None = None) -> pd.DataFrame:
+                  _bt_ohlc: tuple | None = None,
+                  _events: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Every price-derived factor, computed only from bars at or before `as_of`.
     """
@@ -110,8 +144,7 @@ def price_factors(tickers: list[str], as_of: date | str,
         adj_c, adj_h, adj_l, _raw_c = _bt_ohlc
         window = slice(pd.Timestamp(start), pd.Timestamp(as_of))
         avail = adj_c.columns.intersection(sorted(set(tickers) | {benchmark}))
-        # Label slicing then column selection already returns new frames;
-        # no defensive copies of the whole preloaded matrix.
+        # Label slicing plus column selection already returns new frames.
         px = adj_c.loc[window, avail]
         high = adj_h.loc[window, adj_h.columns.intersection(avail)]
         low = adj_l.loc[window, adj_l.columns.intersection(avail)]
@@ -186,16 +219,22 @@ def price_factors(tickers: list[str], as_of: date | str,
 
     # ── oscillators & volatility units ────────────────────────────
     px_for_rsi = px[[t for t in out.index if t in px.columns]]
-    out['RSI_14'] = rsi(px_for_rsi).reindex(out.index)
+    out['RSI_14'] = _vectorized_rsi(px_for_rsi).reindex(out.index)
 
     common = out.index.intersection(high.columns).intersection(
         low.columns).intersection(adj_close.columns)
     if len(common):
-        out['ATR_14'] = atr(
+        out['ATR_14'] = _vectorized_atr(
             high[common], low[common], adj_close[common]).reindex(out.index)
         out['ATR_PCT'] = out['ATR_14'] / last.reindex(out.index)
 
     out['PRICE'] = last.reindex(out.index)
+
+    # ── earnings reaction (needs results filings) ─────────────────
+    events = _events if _events is not None else sec.events_asof(
+        list(out.index), as_of, lookback_days=70)
+    out['EARNINGS_REACTION'] = earnings_reaction(
+        px, events, as_of, benchmark).reindex(out.index)
     return out
 
 
@@ -254,9 +293,9 @@ def fundamental_factors(tickers: list[str], as_of: date | str,
     # by this point shares and price already share one basis. Without that,
     # Lam Research showed a $3.1B market cap in 2018 against ~$30B actual.
     if _bt_close is not None:
-        recent = slice(pd.Timestamp(as_of) - pd.Timedelta(days=30),
-                       pd.Timestamp(as_of))
-        px_close = yahoo.last_close(_bt_close.loc[recent]).reindex(tickers)
+        cutoff = pd.Timestamp(as_of)
+        close_slice = _bt_close.loc[:cutoff]
+        px_close = yahoo.last_close(close_slice).reindex(tickers)
     else:
         px_close = yahoo.latest_prices(tickers, as_of, field='close')
     est = fund['shares_diluted'].reindex(fund.index) * px_close.reindex(fund.index)
@@ -328,14 +367,6 @@ def fundamental_factors(tickers: list[str], as_of: date | str,
             if 'trailing_pe' in prof else np.nan
 
     out['PIOTROSKI_F'] = fund['piotroski_f']
-
-    # ── earnings surprise (post-earnings drift) ───────────────────
-    # SUE itself is a property of the filings. How long ago the quarter
-    # became public depends on the as-of date, so it is computed here rather
-    # than in the fundamentals row, which is reused across dates.
-    out['EARNINGS_SURPRISE'] = fund['earnings_surprise']
-    out['DAYS_SINCE_RESULTS'] = (
-        pd.Timestamp(as_of) - pd.to_datetime(fund['last_quarter_filed'])).dt.days
     out['DATA_AS_OF'] = fund['last_filed']
     return out
 
@@ -443,8 +474,9 @@ def alt_factors(tickers: list[str], as_of: date | str,
 
             signal['buy_val'] = np.where(signal['shares'] > 0,
                                          signal['value'].fillna(0), 0.0)
-            signal['sell_val'] = np.where(signal['shares'] < 0,
+            signal['sell_raw'] = np.where(signal['shares'] < 0,
                                           signal['value'].fillna(0), 0.0)
+            signal['sell_val'] = signal['sell_raw']
 
             # Weight sells by % of holdings: a director selling 3% of their
             # position is routine diversification; a CEO selling 40% is a
@@ -453,13 +485,16 @@ def alt_factors(tickers: list[str], as_of: date | str,
             if 'post_txn_shares' in signal.columns:
                 signal['sell_conviction'] = signal.apply(
                     _sell_conviction_weight, axis=1)
-                signal['sell_val'] = signal['sell_val'] * signal['sell_conviction']
+                signal['sell_val'] = signal['sell_raw'] * signal['sell_conviction']
 
             agg = signal.groupby('ticker').agg(
                 buy=('buy_val', 'sum'), sell=('sell_val', 'sum'),
+                sell_raw=('sell_raw', 'sum'),
                 n_buyers=('insider', lambda s: s[signal.loc[s.index, 'shares'] > 0].nunique()),
             )
-            total = agg['buy'] + agg['sell']
+            # Unweighted denominator: with the weighted one, any sell-only name
+            # came out at exactly -1 whatever its conviction weight.
+            total = agg['buy'] + agg['sell_raw']
             out['INSIDER_NET_BUY'] = ((agg['buy'] - agg['sell'])
                                       / total.replace(0, np.nan)).reindex(out.index)
             # Several distinct insiders buying at once is the stronger form.
@@ -486,6 +521,15 @@ def alt_factors(tickers: list[str], as_of: date | str,
     att = _attention_zscore(tickers, as_of)
     if att is not None:
         out['ATTENTION_Z'] = att.reindex(out.index)
+
+    # ── LLM earnings reviews (point-in-time on the day written) ───
+    try:
+        from nlp import earnings_review as ERV
+        view = ERV.view_factor(tickers, as_of)
+        if not view.empty:
+            out['LLM_EARNINGS_VIEW'] = view.reindex(out.index)
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('LLM earnings view unavailable: %s', exc)
 
     return out
 
@@ -594,7 +638,8 @@ def build_all(tickers: list[str], as_of: date | str,
     bt_close = _bt_ohlc[3] if _bt_ohlc is not None else None
 
     def _build_price():
-        return price_factors(tickers, as_of, _bt_ohlc=_bt_ohlc)
+        return price_factors(tickers, as_of, _bt_ohlc=_bt_ohlc,
+                             _events=_bt_events)
 
     def _build_fund():
         return fundamental_factors(tickers, as_of,
@@ -632,6 +677,16 @@ def build_all(tickers: list[str], as_of: date | str,
     out = frames[0]
     for f in frames[1:]:
         out = out.join(f, how='outer')
+
+    # Only the names asked for. A backtest hands in facts preloaded for every
+    # ticker the window will ever touch, and the fundamentals built from them
+    # came back for all of those — so through the outer join a 2020 date also
+    # ranked companies that did not join the index until years later (61 of
+    # them at 2020-01-31), with fundamentals but no price factors. Being
+    # picked before you were a member is exactly the look-ahead the
+    # point-in-time universe exists to prevent.
+    if tickers:
+        out = out[out.index.isin(set(tickers))]
 
     if tickers:
         ph = ','.join(f':t{i}' for i in range(len(tickers)))
@@ -711,8 +766,8 @@ FACTOR_DIRECTION: dict[str, bool] = {
     'NET_MARGIN': True, 'OPERATING_MARGIN': True, 'ASSET_TURNOVER': True,
     'CURRENT_RATIO': True, 'PIOTROSKI_F': True, 'FCF_CONVERSION': True,
     'EVENT_RESULTS': True,          # a recent results filing opens the drift window
-    'EARNINGS_SURPRISE': True,      # SUE: y/y quarterly change / its own volatility
-    'DAYS_SINCE_RESULTS': False,    # fresher results, more drift left
+    'EARNINGS_REACTION': True,      # drift continues in the reaction's direction
+    'LLM_EARNINGS_VIEW': True,      # model's buy/avoid judgement, -2..+2
     'ACCRUALS': False, 'DEBT_TO_EQUITY': False, 'NET_DEBT_TO_EQUITY': False,
     'REVENUE_GROWTH_1Y': True, 'REVENUE_CAGR_3Y': True,
     'EARNINGS_GROWTH_1Y': True, 'EQUITY_CAGR_3Y': True, 'EPS_CAGR_3Y': True,

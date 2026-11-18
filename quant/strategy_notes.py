@@ -86,6 +86,27 @@ NOTES: dict[str, StrategyNote] = {
                    'specific combination selected.',
     ),
 
+    'ai_earnings': StrategyNote(
+        differentiator='The only strategy driven by reading text: a language '
+                       'model grades each new earnings release, and that grade '
+                       'is the main factor.',
+        benefit='Sees what ratios cannot — a guidance raise buried in the '
+                'release, a weak segment behind a headline beat, margin '
+                'commentary — and states its reasoning, so a pick comes with '
+                'an argument you can check.',
+        drawback='Covers only names that reported recently and were reviewed, '
+                 'so the list is short and turns over each earnings season. '
+                 'Every review is a paid model call.',
+        risk='No backtest can validate it: a model asked about an old quarter '
+             'already knows what happened next, so reviews are never back-'
+             'dated. Its edge is unproven until the live track record has '
+             'several quarters. Models can be confidently wrong.',
+        best_when='Right after earnings season, when most names have a fresh '
+                  'review.',
+        worst_when='Late in a quarter, when the reviews are two months old and '
+                   'the market has moved on.',
+    ),
+
     'shareholder_yield': StrategyNote(
         differentiator='Counts buybacks alongside dividends, so it sees the '
                        'whole of capital returned rather than only the taxable '
@@ -138,6 +159,27 @@ NOTES: dict[str, StrategyNote] = {
 
     # ── MID TERM ─────────────────────────────────────────────────
 
+    'balanced': StrategyNote(
+        differentiator='The only screen here that asks for cheapness and a '
+                       'rising price in a single ranking, with profitability '
+                       'and the last earnings reaction as tie-breakers.',
+        benefit='Value and momentum lose at different times, so the blend is '
+                'steadier than either: across 6-month holds on the S&P 500 '
+                'from 2020 it avoided the long losing stretch each pure '
+                'style had.',
+        drawback='Rarely the best screen in any single year — it gives up '
+                 'the extremes of both styles by design.',
+        risk='Not shown to beat SPY. Month-by-month cohorts held six months '
+             'averaged about 5% a year ahead, but a walk-forward test with '
+             'costs through November 2026 put it level with SPY at best and '
+             '3% a year behind when rotated quarterly. Treat it as a way to '
+             'build a diversified shortlist, not as an edge.',
+        best_when='Broad markets where both cheap and rising names are rewarded.',
+        worst_when='Narrow rallies led by a few of the largest companies '
+                   '(2023), and sharp momentum reversals (late 2026).',
+        horizon_note='About six months; reviewed half-yearly.',
+    ),
+
     'momentum_trend': StrategyNote(
         differentiator='The straightforward trend-follower: buy what is already '
                        'rising and above its moving averages.',
@@ -149,7 +191,7 @@ NOTES: dict[str, StrategyNote] = {
              'so the worst losses arrive in a cluster rather than spread out.',
         best_when='Clear directional trends with expanding breadth.',
         worst_when='Choppy, mean-reverting markets; sharp regime turns.',
-        horizon_note='Days to months, with a stop and a target.',
+        horizon_note='Three to six months, with a stop, a target and a six-month limit.',
     ),
 
     'breakout': StrategyNote(
@@ -164,7 +206,7 @@ NOTES: dict[str, StrategyNote] = {
              'failure mode is a fast reversal straight back into the range.',
         best_when='Expanding-breadth bull phases.',
         worst_when='Range-bound markets, where most breakouts fail.',
-        horizon_note='Weeks to months.',
+        horizon_note='Three to six months.',
     ),
 
     'pullback': StrategyNote(
@@ -180,16 +222,18 @@ NOTES: dict[str, StrategyNote] = {
         best_when='Established uptrends with orderly, shallow corrections.',
         worst_when='Trend exhaustion, where the first pullback becomes the '
                    'first leg down.',
-        horizon_note='Days to weeks.',
+        horizon_note='An entry setup: weeks, up to three months.',
     ),
 
     'earnings_drift': StrategyNote(
-        differentiator='Event-driven rather than price-driven: it ranks on the '
-                       'size of the latest earnings surprise (SUE), not a '
-                       'chart pattern.',
+        differentiator='Event-driven rather than price-driven: it ranks on '
+                       'how the market reacted to the latest results (the '
+                       'three-day return around the 8-K, net of the market), '
+                       'not on a chart pattern.',
         benefit='Post-earnings announcement drift is among the most persistent '
-                'documented anomalies, and SUE is computed from filed quarters '
-                'alone — no analyst estimates, so it backtests honestly.',
+                'documented anomalies, and the 8-K item code dates the event '
+                'deterministically rather than by parsing text. Names with no '
+                'report in the last 63 days are not scored at all.',
         drawback='The window is short and crowded. The effect has weakened as '
                  'it has become widely known and traded.',
         risk='Concentrated event risk — one disappointing follow-up quarter '
@@ -197,7 +241,7 @@ NOTES: dict[str, StrategyNote] = {
         best_when='Immediately following earnings season.',
         worst_when='Between reporting seasons, when there is nothing to drift '
                    'from.',
-        horizon_note='Days to a few weeks after the filing.',
+        horizon_note='Up to three months after the filing; the drift fades within a quarter.',
     ),
 
     'insider_cluster': StrategyNote(
@@ -211,7 +255,7 @@ NOTES: dict[str, StrategyNote] = {
              'still be followed by months of further decline.',
         best_when='After sector-wide selloffs.',
         worst_when='Blackout periods; quiet markets.',
-        horizon_note='Weeks to months.',
+        horizon_note='Three to six months.',
     ),
 
     'mean_reversion': StrategyNote(
@@ -226,7 +270,7 @@ NOTES: dict[str, StrategyNote] = {
              'side of a repricing that will not revert.',
         best_when='Range-bound, high-volatility markets.',
         worst_when='Strong trends, where the cheap keeps getting cheaper.',
-        horizon_note='Days to weeks.',
+        horizon_note='An entry setup: weeks, up to three months.',
     ),
 
     'relative_strength': StrategyNote(
@@ -241,7 +285,29 @@ NOTES: dict[str, StrategyNote] = {
              'precede shocks — the calm is often the setup, not the safety.',
         best_when='Steady trending markets.',
         worst_when='Volatility regime shifts, where past volatility misleads.',
-        horizon_note='Weeks to months.',
+        horizon_note='Three to six months.',
+    ),
+
+    'consensus': StrategyNote(
+        differentiator='Scores names by how many *independent* strategy '
+                       'families rank them in their top 20% — quality & value, '
+                       'momentum & trend, insider buying, earnings reaction, '
+                       'and the AI earnings review — rather than by factors.',
+        benefit='Agreement across different kinds of evidence is harder to get '
+                'by luck than a high score on one. Correlated strategies are '
+                'grouped so they vote once, and the avoid list can veto.',
+        drawback='Agreement is rare, so the strongest list is short, and it '
+                 'favours names that are good on everything over names that '
+                 'are exceptional on one thing.',
+        risk='If the families are not really independent in a given market, '
+             'agreement is just a crowded trade. Run `cli.py consensus-test` '
+             'to check that more agreement actually meant higher returns on '
+             'your universe before trusting it.',
+        best_when='Holding for quarters, where waiting for several signals to '
+                  'line up costs little.',
+        worst_when='Sharp regime turns, when the trend family flips first and '
+                   'the slower fundamental families still say yes.',
+        horizon_note='About six months; review half-yearly and exit when agreement falls away.',
     ),
 
     'quality_breakdown': StrategyNote(

@@ -14,7 +14,6 @@ import pathlib
 import re
 from datetime import date
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -65,66 +64,6 @@ def test_one_month_return_is_not_used_as_positive_momentum():
         if strat.horizon == 'long' and not strat.invert:
             assert 'RETURN_1M' not in strat.weights, key
     assert ST.DEFAULT_STYLE_PROXIES['momentum'] != 'RETURN_1M'
-
-
-def test_pead_ranks_on_surprise_size_and_has_a_window():
-    """A count of results filings is ~1 for everyone; it cannot rank."""
-    s = ST.ALL_STRATEGIES['earnings_drift']
-    assert 'EVENT_RESULTS' not in s.weights
-    assert max(s.weights, key=s.weights.get) == 'EARNINGS_SURPRISE'
-    assert s.filters.get('max_days_since_results')
-
-
-def test_drift_window_filter_drops_stale_and_undated_names():
-    raw = pd.DataFrame({'DAYS_SINCE_RESULTS': [10.0, 80.0, np.nan]},
-                       index=['fresh', 'old', 'undated'])
-    s = ST.Strategy('t', 't', 'mid', '', {'MOM_6_1': 1.0},
-                    filters={'max_days_since_results': 45})
-    assert list(EN.apply_filters(raw, s)) == ['fresh']
-
-
-# ─────────────────────────────────────────────
-# EARNINGS SURPRISE (SUE)
-# ─────────────────────────────────────────────
-
-def _ni_facts(values, filed_lag=35):
-    ends = pd.date_range('2020-03-31', periods=len(values), freq='QE')
-    return pd.DataFrame([{
-        'ticker': 'X', 'concept': 'net_income', 'tag': 'NetIncomeLoss',
-        'unit': 'USD', 'period_start': e - pd.offsets.QuarterBegin(startingMonth=1),
-        'period_end': e, 'filed': e + pd.Timedelta(days=filed_lag),
-        'form': '10-Q', 'fy': e.year, 'fp': 'Q', 'val': float(v)}
-        for e, v in zip(ends, values)])
-
-
-def test_sue_is_latest_yoy_change_over_its_own_volatility():
-    vals = [10, 11, 12, 13, 11, 12, 14, 13, 12, 13, 15, 14, 20]
-    sue, filed = F.earnings_surprise(_ni_facts(vals))
-    changes = np.array(vals[4:]) - np.array(vals[:-4])
-    expected = changes[-1] / np.std(changes[-8:-1], ddof=1)
-    assert sue == pytest.approx(expected)
-    assert filed == pd.Timestamp('2023-03-31') + pd.Timedelta(days=35)
-
-
-def test_sue_needs_two_years_of_history():
-    sue, filed = F.earnings_surprise(_ni_facts([10, 11, 12, 13, 14, 15, 16]))
-    assert np.isnan(sue) and filed is None
-
-
-def test_sue_is_scale_free():
-    vals = [10, 11, 12, 13, 11, 12, 14, 13, 12, 13, 15, 14, 20]
-    a, _ = F.earnings_surprise(_ni_facts(vals))
-    b, _ = F.earnings_surprise(_ni_facts([v * 1000 for v in vals]))
-    assert a == pytest.approx(b)
-
-
-def test_sue_only_sees_quarters_filed_by_the_as_of_date():
-    """facts_asof gates on `filed`; the latest quarter here is not yet public."""
-    facts = _ni_facts([10, 11, 12, 13, 11, 12, 14, 13, 12, 13, 15, 14, 99])
-    as_of = facts['filed'].iloc[-1] - pd.Timedelta(days=1)
-    gated = facts[facts['filed'] <= as_of]
-    _, filed = F.earnings_surprise(gated)
-    assert filed < as_of
 
 
 # ─────────────────────────────────────────────

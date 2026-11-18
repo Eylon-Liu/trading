@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 
+import pandas as pd
 import pytest
 
 from data.members import _normalize_company, normalize_ticker
@@ -78,8 +79,6 @@ def test_universe_resolution_is_reproducible():
     The original shuffled and truncated, so identical requests produced
     different universes and cross-sectional scores were not comparable.
     """
-    from core import db
-    db.init_db()                    # a fresh checkout has no tables yet
     spec = UniverseSpec(preset='DIA', min_market_cap=None,
                         min_dollar_adv=None, min_price=None)
     first = spec.resolve(date.today())

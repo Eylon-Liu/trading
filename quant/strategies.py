@@ -8,12 +8,25 @@ LONG-TERM (a year and up) is a *screen to accumulate*. It asks which
 businesses are worth owning, so it leans on fundamentals that only mean
 anything over years: returns on capital, balance-sheet strength, valuation,
 earnings durability. There is no exit level, because the exit is a broken
-thesis, not a price. Turnover should be low and rebalancing quarterly.
+thesis, not a price. Turnover should be low.
 
-MID-TERM (days to months) is a *trade*. Fundamentals act as a quality filter
-rather than the thesis; what drives it is trend, catalyst, and positioning.
-Every candidate gets a full plan — entry, stop, target, time stop, size — from
-quant/tradeplan.py, because a position with no exit rule is not a trade.
+Both horizons rebalance every six months. That is a measured choice, not a
+convention: on the S&P 500 from 2020 every strategy tested did better held
+six months than rotated every three — by two to three points a year, in a
+walk-forward test with costs and in month-by-month cohorts alike. Rotating
+quarterly sells names whose trend or re-rating has not finished.
+
+MID-TERM (three to six months) is a *position*. What drives it has to last
+that long: 12- and 6-month momentum, the drift after an earnings surprise,
+cash returned to owners, insider buying — not last week's oversold reading.
+Every candidate gets a plan — entry, stop, target, a six-month time stop,
+size — from quant/tradeplan.py, because a position with no exit rule is not
+a plan.
+
+Evidence, not assertion: docs/strategy-research.md measures every strategy
+here on the S&P 500 from 2020 over 3- and 6-month holds. Its plain
+conclusion is that none is proven to beat SPY; read it before trusting a
+ranking with money.
 
 A strategy is a declarative dict, so adding one is configuration rather than
 code.
@@ -34,16 +47,17 @@ HORIZONS = {
     'long': {
         'label': 'Long-term (1 year+)',
         'blurb': 'Screen for businesses worth owning and accumulating.',
-        'rebalance': 'Q',
+        'rebalance': 'SA',
         'needs_trade_plan': False,
         'default_holdings': 25,
     },
     'mid': {
-        'label': 'Mid-term (1-6 months)',
-        'blurb': 'Time-bound trades with a defined entry, stop and target.',
-        'rebalance': 'M',
+        'label': 'Mid-term (3-6 months)',
+        'blurb': 'Positions held three to six months, with an entry, a stop '
+                 'and a six-month time limit.',
+        'rebalance': 'SA',
         'needs_trade_plan': True,
-        'default_holdings': 10,
+        'default_holdings': 20,
     },
 }
 
@@ -62,6 +76,17 @@ class Strategy:
     setup: str = 'momentum'                       # informs the trade plan
     thesis: str = ''
     invert: bool = False                          # rank worst-first (avoid lists)
+    # A meta-strategy scores names by *agreement between other strategies*
+    # instead of weighting factors (see quant/consensus.py). Each family is a
+    # group of correlated strategies and casts one vote.
+    components: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    factor_votes: dict[str, str] = field(default_factory=dict)  # family -> factor
+    veto: tuple[str, ...] = ()                    # avoid lists that cost a vote
+    vote_pct: float = 0.80                        # family percentile that counts as a vote
+
+    @property
+    def is_meta(self) -> bool:
+        return bool(self.components)
 
     @property
     def factors(self) -> list[str]:
@@ -69,9 +94,7 @@ class Strategy:
 
     @property
     def needs_trade_plan(self) -> bool:
-        # An inverted strategy is an avoid list. A long entry/stop/target on
-        # the names it ranks worst would be a plan to buy exactly what it says
-        # to stay away from.
+        # An avoid list ranks what not to own; a long entry plan would buy it.
         return HORIZONS[self.horizon]['needs_trade_plan'] and not self.invert
 
 
@@ -100,19 +123,21 @@ STYLE_PROXIES: dict[str, list[tuple[str, str]]] = {
         ('EPS_CAGR_3Y', 'EPS CAGR (3Y)'),
     ],
     'momentum': [
-        ('RETURN_1M', '1-month total return'),
-        ('RETURN_6M', '6-month total return'),
+        ('MOM_12_1', 'Momentum 12-1 (skips last month)'),
         ('MOM_6_1', 'Momentum 6-1 (skips last month)'),
+        ('RETURN_6M', '6-month total return'),
+        ('RETURN_1M', '1-month total return (reverses — see note)'),
     ],
 }
 
+# The momentum default was RETURN_1M. One-month returns are the textbook
+# *reversal* horizon — last month's winners tend to give some of it back — which
+# is exactly why 12-1 momentum skips the latest month. As the default momentum
+# leg of a quarterly-rebalanced, long-horizon screen it pointed the wrong way.
 DEFAULT_STYLE_PROXIES: dict[str, str] = {
     'value': 'EARNINGS_YIELD',
     'growth': 'REVENUE_GROWTH_1Y',
-    # Not RETURN_1M: a one-month return is the short-term *reversal* window,
-    # so as a higher-is-better default it ranks against the momentum premium
-    # this style is meant to capture. It stays selectable for comparison.
-    'momentum': 'MOM_6_1',
+    'momentum': 'MOM_12_1',
 }
 
 STYLE_FACTORS_KEY = 'style_factors'
@@ -195,11 +220,12 @@ LONG_TERM = {
         # rank correlations of 0.88 and 0.87 on live data. Weighting all three
         # put two-thirds of the strategy on one signal counted three times,
         # which is a concentrated momentum bet wearing a diversified label.
+        # One medium-horizon measure, one short, and the quality overlay.
         #
-        # One momentum measure, skipping the latest month, plus the quality
-        # overlay. RETURN_1M used to carry 0.8 here, but the last month is the
-        # short-term reversal window: rewarding it positively in a quarterly
-        # strategy bought last month's winners just as they tend to give back.
+        # RETURN_1M (+0.8) is gone as well. Over one month, returns *reverse*
+        # rather than persist, so on a quarterly rebalance it rewarded the very
+        # names most likely to give back their last month. 12-1 momentum is the
+        # standard construction precisely because it skips that month.
         weights={
             'MOM_12_1': 1.5,
             'ROIC': 0.8, 'ACCRUALS': 0.6, 'NET_DEBT_TO_EQUITY': 0.4,
@@ -236,6 +262,22 @@ LONG_TERM = {
             'NET_DEBT_TO_EQUITY': 0.5,
         },
     ),
+    'ai_earnings': Strategy(
+        key='ai_earnings', name='AI Earnings Review', horizon='long',
+        description='Names whose latest results an LLM judged worth buying, '
+                    'checked against quality and the market\'s own reaction.',
+        thesis='A model reads each new earnings release — guidance, segment '
+               'trends, margin commentary that no ratio captures — and grades '
+               'it for a 6-18 month holder. The market reaction and two quality '
+               'gauges keep a persuasive release from outranking the numbers. '
+               'Only names reviewed in the last 120 days are scored. Forward-'
+               'only: judge it by its live track record, not a backtest.',
+        weights={
+            'LLM_EARNINGS_VIEW': 2.0, 'EARNINGS_REACTION': 0.8,
+            'ROIC': 0.5, 'FCF_YIELD': 0.5,
+        },
+        filters={'min_market_cap': 2e9},
+    ),
     'shareholder_yield': Strategy(
         key='shareholder_yield', name='Total Shareholder Yield', horizon='long',
         description='All cash returned to owners — dividends plus buybacks.',
@@ -254,6 +296,33 @@ LONG_TERM = {
 # ─────────────────────────────────────────────
 
 MID_TERM = {
+    # Value and momentum are the two best-documented return patterns, and
+    # they fail at different times: on the S&P 500 the value screens beat
+    # SPY in 2020-2023 while every momentum screen lagged, and from 2024 it
+    # was the reverse (their excess returns correlate about -0.3). This
+    # blends them in one ranking — with profitability and the earnings
+    # reaction as tie-breakers, and a trend gate so that cheap-and-falling
+    # is not bought. It is steadier than either style alone; it is not
+    # shown to beat SPY (docs/strategy-research.md).
+    'balanced': Strategy(
+        key='balanced', name='Balanced: Value + Momentum + Quality', horizon='mid',
+        description='Cash-generative, reasonably priced businesses that are '
+                    'also in an uptrend — three styles in one ranking.',
+        thesis='Cheap stocks can stay cheap and rising stocks can be '
+               'expensive; a name that is both cheap on cash flow and already '
+               'rising has two independent reasons to be owned, and the two '
+               'styles have historically lost money at different times. '
+               'Hold about six months; exit on the stop, at the six-month '
+               'limit, or when the name falls out of the top of the ranking '
+               'at the half-yearly review.',
+        weights={
+            'EARNINGS_YIELD': 1.0, 'FCF_YIELD': 1.0, 'BUYBACK_YIELD': 1.0,
+            'MOM_12_1': 1.5, 'MOM_6_1': 0.75, 'PCT_FROM_52W_HIGH': 0.75,
+            'ROIC': 0.75, 'ACCRUALS': 0.5, 'EARNINGS_REACTION': 0.75,
+        },
+        filters={'min_above_ma200': 1},
+        setup='momentum',
+    ),
     'momentum_trend': Strategy(
         key='momentum_trend', name='Momentum + Trend', horizon='mid',
         description='12-1 momentum in confirmed uptrends, scaled by volatility.',
@@ -279,9 +348,12 @@ MID_TERM = {
     ),
     'pullback': Strategy(
         key='pullback', name='Pullback in Uptrend', horizon='mid',
-        description='Oversold entries inside intact long-term uptrends.',
+        description='Oversold entries inside intact long-term uptrends — a '
+                    'way into a trend, usually resolved within weeks.',
         thesis='Buy temporary weakness in a strong name; exit if the pullback '
-               'becomes a trend change.',
+               'becomes a trend change. An entry technique more than a '
+               'three-to-six-month thesis: over 6-month holds it was level '
+               'with SPY from 2020 and behind it from 2024.',
         weights={
             'PCT_VS_MA200': 1.2, 'MOM_12_1': 1.0,
             'REVERSAL_1M': 1.2, 'ROIC': 0.5,
@@ -291,23 +363,21 @@ MID_TERM = {
     ),
     'earnings_drift': Strategy(
         key='earnings_drift', name='Post-Earnings Drift', horizon='mid',
-        description='Large positive earnings surprises, bought while the drift '
-                    'window is still open (PEAD).',
-        thesis='Prices under-react to earnings news, so a big positive '
-               'surprise keeps drifting for weeks after it is public. Ranked on '
-               'standardized unexpected earnings (SUE), restricted to quarters '
-               'filed in the last 45 days; exit at the target or when the '
-               'drift window closes.',
-        # EVENT_RESULTS was the previous anchor: a count of 8-K item 2.02
-        # filings, which nearly every company makes once a quarter — so it was
-        # ~1 for everyone and ranked nothing. SUE measures the *size* of the
-        # surprise, and the filter supplies the timing that count was
-        # standing in for.
+        description='Names whose latest results drew a strong positive reaction (PEAD).',
+        thesis='Prices under-react to earnings news; exit at the target or when '
+               'the drift window closes.',
+        # This used to have no measure of the reaction at all. EVENT_RESULTS
+        # only says a results 8-K was filed in the last 90 days — true of
+        # nearly every company every quarter — and RETURN_3M / MOM_6_1 are
+        # plain momentum. The drift literature sorts on the announcement
+        # return itself, which EARNINGS_REACTION now measures; names without
+        # a report in the last 63 days fall below the coverage floor and are
+        # not scored, which is the point.
         weights={
-            'EARNINGS_SURPRISE': 2.0, 'MOM_6_1': 0.8,
-            'EARNINGS_GROWTH_1Y': 0.6, 'PCT_VS_MA50': 0.6,
+            'EARNINGS_REACTION': 2.0, 'EARNINGS_GROWTH_1Y': 0.8,
+            'MOM_6_1': 0.6, 'PCT_VS_MA50': 0.4,
         },
-        filters={'min_above_ma200': 1, 'max_days_since_results': 45},
+        filters={'min_above_ma200': 1},
         setup='momentum',
     ),
     'insider_cluster': Strategy(
@@ -323,8 +393,11 @@ MID_TERM = {
     ),
     'mean_reversion': Strategy(
         key='mean_reversion', name='Quality Mean Reversion', horizon='mid',
-        description='Deeply oversold but fundamentally sound — a contrarian bounce.',
-        thesis='Fade the overshoot in a quality name; exit quickly if it keeps falling.',
+        description='Deeply oversold but fundamentally sound — a contrarian '
+                    'bounce, usually over weeks rather than months.',
+        thesis='Fade the overshoot in a quality name; exit quickly if it keeps '
+               'falling. The bounce is a short-horizon effect: over 6-month '
+               'holds it beat SPY in 2020-2022 and trailed it every year since.',
         weights={
             'REVERSAL_1M': 1.5, 'ROIC': 1.0, 'FCF_YIELD': 0.8,
             'DEBT_TO_EQUITY': 0.8, 'PIOTROSKI_F': 0.6,
@@ -362,7 +435,38 @@ MID_TERM = {
 }
 
 
-ALL_STRATEGIES: dict[str, Strategy] = {**LONG_TERM, **MID_TERM}
+# ─────────────────────────────────────────────
+# META — agreement between strategies
+# ─────────────────────────────────────────────
+
+META = {
+    'consensus': Strategy(
+        key='consensus', name='Multi-Strategy Consensus', horizon='long',
+        description='Names that several independent strategy families rank '
+                    'near the top at the same time.',
+        thesis='Agreement between methods that look at different evidence — '
+               'business quality and valuation, price trend, insider buying, '
+               'the earnings reaction, and an AI read of the latest results — '
+               'is better evidence than any single score. Correlated strategies '
+               'are grouped into families and each family casts one vote, so '
+               'three momentum variants agreeing count once, not three times. '
+               'A name on the Deteriorating Quality avoid list loses a vote. '
+               'Built for holds of about six months: review half-yearly and '
+               'exit when agreement falls away.',
+        weights={},
+        components={
+            'Quality & value': ('buffett', 'shareholder_yield'),
+            'Momentum & trend': ('quality_momentum', 'momentum_trend',
+                                 'relative_strength'),
+            'Insider buying': ('insider_conviction', 'insider_cluster'),
+            'Earnings reaction': ('earnings_drift',),
+        },
+        factor_votes={'AI earnings review': 'LLM_EARNINGS_VIEW'},
+        veto=('quality_breakdown',),
+    ),
+}
+
+ALL_STRATEGIES: dict[str, Strategy] = {**LONG_TERM, **MID_TERM, **META}
 
 
 # ─────────────────────────────────────────────
@@ -408,13 +512,18 @@ def by_horizon(horizon: str) -> dict[str, Strategy]:
     return {k: s for k, s in ALL_STRATEGIES.items() if s.horizon == horizon}
 
 
-def options(horizon: str | None = None, grouped: bool = False) -> list[dict]:
+def options(horizon: str | None = None, grouped: bool = False,
+            include_meta: bool = True) -> list[dict]:
     """Dropdown options for the UI.
 
     With ``grouped=True``, returns option-groups keyed by horizon label so
-    Dash renders them under section headers.
+    Dash renders them under section headers. `include_meta=False` leaves out
+    strategies with no factor weights of their own (the consensus), for
+    places that copy weights.
     """
     pool = ALL_STRATEGIES if horizon is None else by_horizon(horizon)
+    if not include_meta:
+        pool = {k: s for k, s in pool.items() if not s.is_meta}
     if not grouped or horizon is not None:
         return [{'label': s.name, 'value': k} for k, s in sorted(pool.items())]
 
@@ -436,7 +545,7 @@ def summary_table() -> list[dict]:
         'key': s.key, 'name': s.name,
         'horizon': HORIZONS[s.horizon]['label'],
         'description': s.description, 'thesis': s.thesis,
-        'factors': len(s.weights),
-        'trade_plan': ('yes' if s.needs_trade_plan else
-                       'no (avoid list)' if s.invert else 'no (thesis-based exit)'),
+        'factors': len(s.weights) if not s.is_meta else 0,
+        'trade_plan': ('no (exit when agreement falls away)' if s.is_meta
+                       else 'yes' if s.needs_trade_plan else 'no (thesis-based exit)'),
     } for s in sorted(ALL_STRATEGIES.values(), key=lambda x: (x.horizon, x.key))]

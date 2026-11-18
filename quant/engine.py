@@ -20,11 +20,12 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 
 import numpy as np
 import pandas as pd
 
+import config
 from core import db
 from data import sync as SY
 from data.universe import UniverseSpec
@@ -42,6 +43,7 @@ class RunResult:
     as_of: date
     strategy: ST.Strategy
     scores: pd.DataFrame          # ranked, one row per name
+    factor_detail: pd.DataFrame   # per factor/ticker scoring intermediates
     plans: pd.DataFrame           # mid-term only; empty for long-term
     universe: list[str]
     sync: SY.SyncReport | None = None     # what the pull phase did
@@ -59,7 +61,45 @@ class RunResult:
         return self.strategy.horizon
 
     def top(self, n: int = 20) -> pd.DataFrame:
-        return self.scores.head(n)
+        """The shortlist: best-ranked first, no sector over its share."""
+        return diversified_head(self.scores, n)
+
+
+def diversified_head(scores: pd.DataFrame, n: int,
+                     max_share: float | None = None) -> pd.DataFrame:
+    """
+    The first `n` rows of a ranking with at most `max_share` of them from
+    any one sector (config.MAX_SECTOR_SHARE; at least two names). Names
+    passed over stay in the ranking — only the shortlist skips them. Rows
+    with no known sector are never capped, and the cap gives way rather
+    than return fewer than `n` names.
+    """
+    if scores.empty or n <= 0:
+        return scores.head(0)
+    share = config.MAX_SECTOR_SHARE if max_share is None else max_share
+    if 'sector' not in scores or share >= 1.0:
+        return scores.head(n)
+    cap = max(2, int(np.ceil(n * share)))
+    n = min(n, len(scores))
+    # The cap is a preference, not a rule that can leave the list short: in
+    # a narrow universe (a single-sector screen, a small watchlist) it is
+    # relaxed one name at a time until the shortlist is full.
+    while True:
+        taken: dict[str, int] = {}
+        keep = []
+        for ticker, sector in scores['sector'].items():
+            known = isinstance(sector, str) and sector and sector != 'Unknown'
+            if known and taken.get(sector, 0) >= cap:
+                continue
+            keep.append(ticker)
+            if known:
+                taken[sector] = taken.get(sector, 0) + 1
+            if len(keep) == n:
+                break
+        if len(keep) == n or cap >= n:
+            break
+        cap += 1
+    return scores.loc[keep]
 
 
 # ─────────────────────────────────────────────
@@ -169,10 +209,17 @@ def _apply_size_filters(raw: pd.DataFrame, spec: UniverseSpec) -> pd.DataFrame:
     return raw[keep]
 
 
+FILTER_KEYS = frozenset({'min_above_ma200', 'rsi_max', 'rsi_min', 'min_market_cap'})
+
+
 def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
     """Names that satisfy the strategy's hard gates."""
     keep = pd.Series(True, index=raw.index)
     f = strategy.filters
+    unknown = set(f) - FILTER_KEYS
+    if unknown:
+        log.warning('%s: filters %s are not understood and do not apply',
+                    strategy.key, sorted(unknown))
 
     if f.get('min_above_ma200') and 'ABOVE_MA200' in raw:
         keep &= raw['ABOVE_MA200'].fillna(0) >= 1
@@ -183,20 +230,8 @@ def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
     if f.get('min_market_cap') and 'MARKET_CAP' in raw:
         mcap = pd.to_numeric(raw['MARKET_CAP'], errors='coerce')
         keep &= mcap.isna() | (mcap >= f['min_market_cap'])
-    if f.get('max_days_since_results'):
-        # Outside the drift window there is nothing to drift; a name with no
-        # dated quarter is not inside it either.
-        days = pd.to_numeric(raw.get('DAYS_SINCE_RESULTS'), errors='coerce') \
-            if 'DAYS_SINCE_RESULTS' in raw else pd.Series(np.nan, index=raw.index)
-        keep &= days.notna() & (days <= f['max_days_since_results'])
 
     return raw.index[keep]
-
-
-# Every filter key apply_filters understands. A strategy naming any other key
-# would have it silently ignored, so tests check strategies against this.
-FILTER_KEYS = frozenset({'min_above_ma200', 'rsi_max', 'rsi_min',
-                         'min_market_cap', 'max_days_since_results'})
 
 
 # ─────────────────────────────────────────────
@@ -211,21 +246,28 @@ def _long_term_signal(row: pd.Series) -> tuple[str, float, str]:
     Raw factor values (ROIC, Piotroski, D/E, etc.) are already weighted into
     the composite, so re-scoring them here would double-count and can promote
     a mediocre-composite name into "Buy."
+
+    Tiers come from the composite's *percentile* in the screened universe.
+    They used to be absolute cut-offs (composite > 1.0 = "top decile"), but the
+    composite is an average of z-scores whose spread shrinks with every extra,
+    partly independent factor: an eleven-factor strategy almost never cleared
+    1.0 while a five-factor momentum blend cleared it routinely. Buy counts
+    were not comparable across strategies and "top decile" was often untrue.
     """
     score, reasons = 0.0, []
-    comp = row.get('composite', np.nan)
+    pct = row.get('composite_pct', np.nan)
 
-    if np.isfinite(comp):
-        if comp > 1.0:
-            score += 3; reasons.append('Very strong composite')
-        elif comp > 0.5:
-            score += 2; reasons.append('Strong composite')
-        elif comp > 0:
-            score += 1; reasons.append('Above-average composite')
-        elif comp > -0.5:
-            score -= 1; reasons.append('Below-average composite')
+    if pct is not None and np.isfinite(pct):
+        if pct >= 0.90:
+            score += 3; reasons.append('Top-decile composite')
+        elif pct >= 0.75:
+            score += 2; reasons.append('Top-quartile composite')
+        elif pct >= 0.50:
+            score += 1; reasons.append('Above-median composite')
+        elif pct >= 0.25:
+            score -= 1; reasons.append('Below-median composite')
         else:
-            score -= 2; reasons.append('Weak composite')
+            score -= 2; reasons.append('Bottom-quartile composite')
 
     ma200 = row.get('PCT_VS_MA200')
     if ma200 is not None and np.isfinite(ma200):
@@ -262,16 +304,17 @@ def _mid_term_signal(row: pd.Series) -> tuple[str, float, str]:
     they are not re-scored here.
     """
     score, reasons = 0.0, []
-    comp = row.get('composite', np.nan)
+    pct = row.get('composite_pct', np.nan)
 
-    if np.isfinite(comp):
-        if comp > 1.0:
-            score += 3; reasons.append('Top-ranked setup')
-        elif comp > 0.5:
+    # Percentile tiers, for the reason given in _long_term_signal.
+    if pct is not None and np.isfinite(pct):
+        if pct >= 0.90:
+            score += 3; reasons.append('Top-decile setup')
+        elif pct >= 0.75:
             score += 2; reasons.append('Strong setup')
-        elif comp > 0:
+        elif pct >= 0.50:
             score += 1; reasons.append('Positive setup')
-        elif comp > -0.3:
+        elif pct >= 0.30:
             score -= 0.5; reasons.append('Marginal setup')
         else:
             score -= 2; reasons.append('Weak setup')
@@ -303,28 +346,39 @@ def _mid_term_signal(row: pd.Series) -> tuple[str, float, str]:
     return label, score, '; '.join(reasons)
 
 
-# ─────────────────────────────────────────────
-# SIGNALS — AVOID LISTS (inverted strategies)
-# ─────────────────────────────────────────────
-
 def _avoid_signal(row: pd.Series) -> tuple[str, float, str]:
     """
-    Grade a name on an inverted (worst-first) strategy.
+    Grade a name on an avoid list (an inverted strategy).
 
-    The composite has already been negated, so a high value means a bad
-    business. Grading it with the buy-side ladders would print "Enter — full
-    size" on the name the strategy ranks worst.
+    Rank 1 there is the *worst* name, so its signals must say avoid. Graded
+    with the long/mid labels, the deteriorating-quality list used to tell you
+    to "🟢 Enter — full size" on exactly the companies it had flagged, and
+    the daily brief counted them as Buy signals in the consensus.
     """
-    comp = row.get('composite', np.nan)
-    if not np.isfinite(comp):
-        return '⚪ No flag', 0.0, ''
-    if comp > 1.0:
-        return '🔴 Avoid — review if held', comp, 'Severe deterioration'
-    if comp > 0.5:
-        return '🟠 Reduce / watch closely', comp, 'Clear deterioration'
-    if comp > 0:
-        return '🟡 Watch', comp, 'Mild deterioration'
-    return '⚪ No flag', comp, 'No meaningful deterioration'
+    pct = row.get('composite_pct', np.nan)
+    reasons = []
+    pf = row.get('PIOTROSKI_F')
+    if pf is not None and np.isfinite(pf) and pf <= 3:
+        reasons.append(f'Piotroski {pf:.0f}/9')
+    ma = row.get('PCT_VS_MA200')
+    if ma is not None and np.isfinite(ma) and ma < 0:
+        reasons.append(f'{ma*100:.0f}% below 200-day')
+    ins = row.get('INSIDER_NET_BUY')
+    if ins is not None and np.isfinite(ins) and ins < -0.3:
+        reasons.append('Insiders net sellers')
+    for col, text in (('EVENT_MANAGEMENT', 'Management change filed'),
+                      ('EVENT_RESTRUCTURING', 'Restructuring filed')):
+        v = row.get(col)
+        if v is not None and np.isfinite(v) and v > 0:
+            reasons.append(text)
+    acc = row.get('ACCRUALS')
+    if acc is not None and np.isfinite(acc) and acc > 0.05:
+        reasons.append('Earnings well ahead of cash flow')
+    if pct is not None and np.isfinite(pct) and pct >= 0.90:
+        return '🔴 Avoid — deteriorating', -3.0, '; '.join(reasons)
+    if pct is not None and np.isfinite(pct) and pct >= 0.75:
+        return '🟠 Caution — weakening', -1.5, '; '.join(reasons)
+    return '⚪ No flag', 0.0, '; '.join(reasons)
 
 
 def generate_signals(scores: pd.DataFrame, raw: pd.DataFrame,
@@ -334,6 +388,7 @@ def generate_signals(scores: pd.DataFrame, raw: pd.DataFrame,
         return scores
 
     merged = scores.join(raw.drop(columns=['sector'], errors='ignore'), how='left')
+    merged['composite_pct'] = merged['composite'].rank(pct=True)
     if invert:
         fn = _avoid_signal
     else:
@@ -396,7 +451,7 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     if not universe:
         log.warning('universe resolved to zero names for %s', spec.describe())
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), [],
+                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [],
                          sync_report)
 
     if sync and not is_historical:
@@ -427,7 +482,7 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                        _bt_events=_bt_events)
     if raw.empty:
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), universe,
+                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report)
 
     # Size filters are applied here, not during universe resolution. At
@@ -439,26 +494,39 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     if raw.empty:
         log.warning('size filters removed every name for %s', spec.describe())
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), universe,
+                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report)
 
-    eligible = apply_filters(raw, strategy)
-    if len(eligible) == 0:
-        log.warning('all %d names filtered out by %s gates', len(raw), strategy.key)
-        return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), universe,
-                         sync_report)
-    log.info('filters: %d/%d names eligible', len(eligible), len(raw))
+    if strategy.is_meta:
+        # Agreement between other strategies, scored on this same factor
+        # frame — the members are re-ranked here, not read from stored runs,
+        # so a backtest date sees only what each member could see then.
+        from quant import consensus as CONS
+        raw_eligible = raw
+        scores, detail, warnings = CONS.score(raw, strategy, as_of)
+        if scores.empty:
+            return RunResult(str(uuid.uuid4()), as_of, strategy,
+                             pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+                             universe, sync_report, warnings)
+        scores = CONS.signals(scores, strategy)
+    else:
+        eligible = apply_filters(raw, strategy)
+        if len(eligible) == 0:
+            log.warning('all %d names filtered out by %s gates', len(raw), strategy.key)
+            return RunResult(str(uuid.uuid4()), as_of, strategy,
+                             pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                             sync_report)
+        log.info('filters: %d/%d names eligible', len(eligible), len(raw))
 
-    raw_eligible = raw.loc[eligible]
-    scores, detail, warnings = score_universe(raw_eligible, strategy, as_of)
-    if scores.empty:
-        return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), universe,
-                         sync_report, warnings)
+        raw_eligible = raw.loc[eligible]
+        scores, detail, warnings = score_universe(raw_eligible, strategy, as_of)
+        if scores.empty:
+            return RunResult(str(uuid.uuid4()), as_of, strategy,
+                             pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                             sync_report, warnings)
 
-    scores = generate_signals(scores, raw_eligible, strategy.horizon,
-                              invert=strategy.invert)
+        scores = generate_signals(scores, raw_eligible, strategy.horizon,
+                                  invert=strategy.invert)
     scores = scores.dropna(subset=['composite'])
     scores['rank'] = range(1, len(scores) + 1)
 
@@ -470,8 +538,9 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
             scores[col] = raw_eligible[col].reindex(scores.index)
 
     plans = pd.DataFrame()
+    # An avoid list gets no long entry, stop or target.
     if strategy.needs_trade_plan:
-        shortlist = scores.head(top_n)
+        shortlist = diversified_head(scores, top_n)
         plans = TP.build_plans(
             raw_eligible.loc[raw_eligible.index.intersection(shortlist.index)],
             as_of, setup=strategy.setup, params=plan_params)
@@ -484,40 +553,86 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     if persist:
         _persist(run_id, as_of, spec, strategy, universe, scores, detail)
 
-    return RunResult(run_id, as_of, strategy, scores, plans, universe,
+    return RunResult(run_id, as_of, strategy, scores, detail, plans, universe,
                      sync_report, warnings,
                      _fund_raw=fund_stash.get('result'))
+
+
+def superseded_runs(conn, strategy_key: str, as_of: date,
+                    spec_json: str) -> list[str]:
+    """Stored runs a new run of the same strategy, date and universe replaces."""
+    from sqlalchemy import text
+    rows = conn.execute(text(
+        'SELECT run_id FROM runs WHERE strategy = :s AND as_of = :d '
+        'AND universe_spec_json = :u'),
+        {'s': strategy_key, 'd': str(as_of), 'u': spec_json}).fetchall()
+    return [r[0] for r in rows]
+
+
+def delete_runs(conn, run_ids: list[str]) -> int:
+    """Remove runs together with their scores and factor detail."""
+    from sqlalchemy import bindparam, text
+    if not run_ids:
+        return 0
+    for table in ('factor_scores', 'scores', 'runs'):
+        conn.execute(
+            text(f'DELETE FROM {table} WHERE run_id IN :ids')
+            .bindparams(bindparam('ids', expanding=True)),
+            {'ids': list(run_ids)})
+    return len(run_ids)
 
 
 def _persist(run_id: str, as_of: date, spec: UniverseSpec,
              strategy: ST.Strategy, universe: list[str],
              scores: pd.DataFrame, detail: pd.DataFrame) -> None:
-    """Store the run so future dates can be compared against it."""
-    db.upsert(db.runs, [{
-        'run_id': run_id, 'as_of': as_of, 'strategy': strategy.key,
-        'universe_spec_json': spec.to_json(),
-        'universe_tickers': ','.join(universe),
-        'params_json': json.dumps(strategy.weights),
-        'universe_n': len(universe), 'created_at': datetime.utcnow(),
-    }])
+    """
+    Store the run so future dates can be compared against it.
 
-    db.upsert(db.scores, [{
-        'run_id': run_id, 'ticker': t,
-        'composite': _num(r.get('composite')), 'rank': int(r.get('rank', 0)),
-        'signal': r.get('signal'), 'signal_score': _num(r.get('signal_score')),
-        'reasons': r.get('reasons'), 'coverage': _num(r.get('coverage')),
-        'sector': r.get('sector'),
-    } for t, r in scores.iterrows()])
+    One transaction, and one stored run per (strategy, as-of date, universe).
 
-    if not detail.empty:
-        db.upsert(db.factor_scores, [{
-            'run_id': run_id, 'ticker': r['ticker'], 'factor': r['factor'],
-            'raw': _num(r.get('raw')), 'winsorized': _num(r.get('winsorized')),
-            'z': _num(r.get('z')), 'sector_z': _num(r.get('sector_z')),
-            'pct_rank': _num(r.get('pct_rank')),
-        } for _i, r in detail.iterrows()])
+    Every run used to get a fresh id and nothing was ever replaced. The
+    scheduled routine screens every strategy twice a day, and each S&P 500
+    run writes ~500 score rows and ~5,000 factor rows, so the tables grew by
+    well over 100k rows a day of near-identical copies that only the newest
+    of was ever read. The three writes were also separate transactions: a
+    failure between them left a run with no scores, which the report then
+    skipped instead of falling back to an earlier run.
+    """
+    spec_json = spec.to_json()
+    with db.connect() as conn:
+        replaced = delete_runs(
+            conn, superseded_runs(conn, strategy.key, as_of, spec_json))
 
-    log.info('persisted run %s (%d names)', run_id[:8], len(scores))
+        db.upsert(db.runs, [{
+            'run_id': run_id, 'as_of': as_of, 'strategy': strategy.key,
+            'universe_spec_json': spec_json,
+            'universe_tickers': ','.join(universe),
+            'params_json': json.dumps(
+                strategy.weights if not strategy.is_meta else {
+                    'components': {k: list(v) for k, v in strategy.components.items()},
+                    'factor_votes': strategy.factor_votes,
+                    'veto': list(strategy.veto), 'vote_pct': strategy.vote_pct}),
+            'universe_n': len(universe), 'created_at': config.utc_now(),
+        }], conn=conn)
+
+        db.upsert(db.scores, [{
+            'run_id': run_id, 'ticker': t,
+            'composite': _num(r.get('composite')), 'rank': int(r.get('rank', 0)),
+            'signal': r.get('signal'), 'signal_score': _num(r.get('signal_score')),
+            'reasons': r.get('reasons'), 'coverage': _num(r.get('coverage')),
+            'sector': r.get('sector'),
+        } for t, r in scores.iterrows()], conn=conn)
+
+        if not detail.empty:
+            db.upsert(db.factor_scores, [{
+                'run_id': run_id, 'ticker': r['ticker'], 'factor': r['factor'],
+                'raw': _num(r.get('raw')), 'winsorized': _num(r.get('winsorized')),
+                'z': _num(r.get('z')), 'sector_z': _num(r.get('sector_z')),
+                'pct_rank': _num(r.get('pct_rank')),
+            } for _i, r in detail.iterrows()], conn=conn)
+
+    log.info('persisted run %s (%d names%s)', run_id[:8], len(scores),
+             f', replaced {replaced} earlier run(s) for {as_of}' if replaced else '')
 
 
 def _num(v):

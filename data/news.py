@@ -16,7 +16,11 @@ which is why the strategies lean on those instead.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import threading
+import time
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
@@ -34,8 +38,22 @@ YAHOO_RSS = 'https://feeds.finance.yahoo.com/rss/2.0/headline'
 GOOGLE_RSS = 'https://news.google.com/rss/search'
 
 
-def _mk_id(ticker: str, title: str, published) -> str:
-    raw = f'{ticker}|{(title or "").strip().lower()}|{published}'
+def normalize_title(title: str | None) -> str:
+    """Case- and whitespace-insensitive form of a headline, for identity."""
+    return re.sub(r'\s+', ' ', (title or '').strip().lower())
+
+
+def _mk_id(ticker: str, title: str, published=None) -> str:
+    """
+    Stable article id: ticker plus normalised headline.
+
+    The publish time used to be part of the id. Items with no timestamp were
+    stamped with the fetch time, so each refresh (every three hours) minted a
+    new id for the same article and stored it again — and the copy then read
+    as fresh news in the next report. `published` is accepted and ignored so
+    older callers keep working.
+    """
+    raw = f'{ticker}|{normalize_title(title)}'
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -43,14 +61,50 @@ def _mk_id(ticker: str, title: str, published) -> str:
 # SOURCES
 # ─────────────────────────────────────────────
 
-def _from_yfinance(ticker: str) -> list[dict]:
-    """yfinance `.news` — richest of the three, includes a real summary."""
+class NewsUnavailable(RuntimeError):
+    """No news source answered — distinct from "answered, nothing new"."""
+
+
+# What the last update_news() call saw, for the sync report.
+LAST_RUN: dict = {'tickers': 0, 'failed': 0, 'written': 0}
+
+# A source that fails this many times in a row is left alone for the rest of
+# the run. Each failed request costs its retries and backoff; with a feed
+# down, 500 tickers of that was most of an hour spent learning one fact.
+_BREAKER_LIMIT = 5
+_strikes: dict[str, int] = {}
+_strikes_lock = threading.Lock()
+
+
+def _source_open(name: str) -> bool:
+    return _strikes.get(name, 0) < _BREAKER_LIMIT
+
+
+def _note(name: str, ok: bool) -> None:
+    with _strikes_lock:
+        _strikes[name] = 0 if ok else _strikes.get(name, 0) + 1
+        if not ok and _strikes[name] == _BREAKER_LIMIT:
+            log.warning('news: %s failed %d times in a row — skipping it for '
+                        'the rest of this run', name, _BREAKER_LIMIT)
+
+
+def _from_yfinance(ticker: str) -> list[dict] | None:
+    """yfinance `.news` — richest of the three, includes a real summary.
+
+    Returns None when the source could not be reached, [] when it answered
+    with nothing. The difference matters: the first is an outage to report,
+    the second is a quiet day.
+    """
+    if not _source_open('yfinance'):
+        return None
     try:
         import yfinance as yf
         items = yf.Ticker(ticker).news or []
     except Exception as exc:                       # noqa: BLE001
         log.debug('yfinance news failed for %s: %s', ticker, exc)
-        return []
+        _note('yfinance', False)
+        return None
+    _note('yfinance', True)
 
     out = []
     for it in items:
@@ -74,16 +128,22 @@ def _from_yfinance(ticker: str) -> list[dict]:
     return out
 
 
-def _from_rss(url: str, params: dict, ticker: str, source: str) -> list[dict]:
-    raw = http.fetch(url, params=params, category='news')
+def _from_rss(url: str, params: dict, ticker: str, source: str) -> list[dict] | None:
+    """None when the feed could not be fetched or parsed; [] when it is empty."""
+    if not _source_open(source):
+        return None
+    raw = http.fetch(url, params=params, category='news', retries=2)
     if not raw:
-        return []
+        _note(source, False)
+        return None
     try:
         import feedparser
         feed = feedparser.parse(raw)
     except Exception as exc:                       # noqa: BLE001
         log.debug('rss parse failed (%s): %s', source, exc)
-        return []
+        _note(source, False)
+        return None
+    _note(source, True)
 
     out = []
     for entry in feed.entries[:config.MAX_NEWS_PER_TICKER]:
@@ -105,19 +165,92 @@ def _from_rss(url: str, params: dict, ticker: str, source: str) -> list[dict]:
     return out
 
 
+# Syndicated market-research releases ("… Market Report 2026: Size, Share,
+# Trends and Forecast to 2030 | 18.6% CAGR with Microsoft, NVIDIA…") name a
+# dozen large companies to ride their feeds. They carry words like
+# "forecast" and "capacity", so the extractor tagged them as guidance — and
+# they led the material-events section of a real weekend digest.
+_PROMO = re.compile(
+    r'market (report|size|share|outlook|analysis|forecast)\b|\bcagr\b|'
+    r'researchandmarkets|market research|forecasts? to 20\d\d|'
+    r'\b(size|share), (share|trends|growth)\b', re.I)
+
+# Words too generic to identify a company on their own.
+_NAME_NOISE = {'inc', 'corp', 'corporation', 'company', 'co', 'the', 'group',
+               'holdings', 'plc', 'ltd', 'limited', 'class', 'and', 'of',
+               'international', 'global', 'american', 'united', 'general',
+               'national', 'first', 'new', 'financial', 'energy', 'services',
+               'technologies', 'technology', 'systems', 'industries',
+               'communications', 'resources', 'partners', 'trust', 'bancorp'}
+# A company better known by a brand than by its registered name.
+_ALIASES = {
+    'GOOGL': ('google', 'youtube', 'waymo'), 'GOOG': ('google', 'youtube', 'waymo'),
+    'META': ('facebook', 'instagram', 'whatsapp'), 'AMZN': ('aws',),
+    'BRK-B': ('berkshire', 'buffett'), 'JPM': ('jpmorgan', 'jp morgan'),
+    'XOM': ('exxon',), 'JNJ': ('j&j', 'johnson & johnson'), 'PG': ('p&g', 'procter'),
+    'KO': ('coca-cola', 'coke'), 'T': ('at&t',), 'BAC': ('bank of america', 'bofa'),
+    'GS': ('goldman',), 'MS': ('morgan stanley',), 'UNH': ('unitedhealth', 'optum'),
+    'HD': ('home depot',), 'LLY': ('eli lilly', 'lilly'), 'GM': ('general motors',),
+    'GE': ('general electric', 'ge aerospace'), 'BA': ('boeing',),
+}
+
+
+def _name_keys(ticker: str, company_name: str | None) -> list[str]:
+    """Lower-case strings whose presence means the article is about this company."""
+    keys = list(_ALIASES.get(ticker, ()))
+    words = [w for w in re.sub(r'[^a-z0-9& ]', ' ', (company_name or '').lower()).split()
+             if w not in _NAME_NOISE]
+    if words:
+        keys.append(words[0] if len(words[0]) >= 4 else ' '.join(words[:2]))
+    return [k for k in keys if k]
+
+
+def is_about(ticker: str, company_name: str | None, title: str, body: str) -> bool:
+    """
+    Does the article mention the company at all — by name, brand, or symbol?
+
+    A ticker feed also carries pieces about peers and suppliers ("Arbutus
+    reports third quarter…" in Pfizer's feed). Those are worth keeping as
+    context, but an event found in one is not this company's event. With no
+    name on file there is nothing to check against, so the answer is yes.
+    """
+    keys = _name_keys(ticker, company_name)
+    if not keys:
+        return True
+    text = f'{title} {body}'
+    low = text.lower()
+    if any(k in low for k in keys):
+        return True
+    sym = re.escape(ticker.replace('-', '.'))
+    # "(NYSE: PFE)", "$PFE", or the bare symbol when it is not also a word.
+    if re.search(rf'[:$(]\s?{sym}\b', text) or \
+            (len(ticker) >= 3 and re.search(rf'\b{sym}\b', text)):
+        return True
+    return False
+
+
 def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]:
-    """Gather, deduplicate, score and structure coverage for one ticker."""
-    items = _from_yfinance(ticker)
-    items += _from_rss(YAHOO_RSS, {'s': ticker, 'region': 'US', 'lang': 'en-US'},
-                       ticker, 'Yahoo RSS')
+    """Gather, deduplicate, score and structure coverage for one ticker.
+
+    Raises NewsUnavailable when every source failed. One source answering —
+    even with nothing — is a real answer, and the others are redundancy.
+    """
     query = f'{company_name} stock' if company_name else f'{ticker} stock'
-    items += _from_rss(GOOGLE_RSS, {'q': query, 'hl': 'en-US', 'gl': 'US',
-                                    'ceid': 'US:en'}, ticker, 'Google News')
+    answers = [
+        _from_yfinance(ticker),
+        _from_rss(YAHOO_RSS, {'s': ticker, 'region': 'US', 'lang': 'en-US'},
+                  ticker, 'Yahoo RSS'),
+        _from_rss(GOOGLE_RSS, {'q': query, 'hl': 'en-US', 'gl': 'US',
+                               'ceid': 'US:en'}, ticker, 'Google News'),
+    ]
+    if all(a is None for a in answers):
+        raise NewsUnavailable(f'no news source answered for {ticker}')
+    items = [it for a in answers if a for it in a]
 
     seen, unique = set(), []
     for it in items:
         key = (it['title'] or '').strip().lower()[:90]
-        if key and key not in seen:
+        if key and key not in seen and not _PROMO.search(it['title'] or ''):
             seen.add(key)
             unique.append(it)
 
@@ -131,6 +264,10 @@ def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]
         text = f"{it['title']}. {it['body']}"
         sent = SENT.score(text)
         ex = EX.extract(text)
+        if ex.events and not is_about(ticker, company_name, it['title'], it['body']):
+            # Kept as context, but someone else's buyback or guidance is not
+            # a material event for this company.
+            ex.events = []
         rows.append({
             'id': _mk_id(ticker, it['title'], it['published']),
             'ticker': ticker, 'published': it['published'],
@@ -139,17 +276,53 @@ def fetch_for_ticker(ticker: str, company_name: str | None = None) -> list[dict]
             'body_summary': SUM.summarize(it['body'], max_sentences=2) if it['body'] else '',
             'sentiment': sent['polarity'], 'sentiment_label': sent['label'],
             'events': ','.join(ex.events)[:200],
-            'extracted_json': pd.io.json.dumps(ex.to_dict())
-            if hasattr(pd.io.json, 'dumps') else str(ex.to_dict()),
+            # json, not repr: pandas 2 removed pd.io.json.dumps, and the
+            # fallback stored a Python repr that no JSON reader can parse.
+            'extracted_json': json.dumps(ex.to_dict(), default=str),
             'fetched_at': datetime.utcnow(),
         })
     return rows
 
 
-def update_news(tickers: list[str]) -> int:
-    """Fetch and store coverage for each ticker."""
+def _fetch_order(tickers: list[str]) -> list[str]:
+    """
+    The names you hold or watch and the current top picks first, then the
+    rest oldest-refresh-first — so when the time budget runs out, what is
+    left unfetched is what matters least and waited least.
+    """
+    wanted = set(tickers)
+    first: list[str] = []
+    try:
+        mine = db.read_sql("SELECT ticker FROM positions WHERE status = 'open' "
+                           "UNION SELECT ticker FROM watchlist")['ticker'].tolist()
+        picks = db.read_sql(
+            "SELECT DISTINCT s.ticker FROM scores s JOIN runs r ON r.run_id = s.run_id "
+            "WHERE r.as_of = (SELECT MAX(as_of) FROM runs) AND s.rank <= 20")['ticker'].tolist()
+        first = [t for t in dict.fromkeys(mine + sorted(picks)) if t in wanted]
+    except Exception as exc:                       # noqa: BLE001
+        log.debug('news priority unavailable: %s', exc)
+    seen = db.read_sql("SELECT key, last_success FROM ingest_log WHERE source = 'news'")
+    # Never refreshed (or only ever failed) sorts first, as the oldest.
+    age = {k: ('' if pd.isna(v) else str(v))
+           for k, v in zip(seen['key'], seen['last_success'])}
+    rest = sorted(wanted - set(first), key=lambda t: (age.get(t, ''), t))
+    return first + rest
+
+
+def update_news(tickers: list[str], budget_seconds: float | None = None) -> int:
+    """
+    Fetch and store coverage for each ticker, within a time budget.
+
+    The budget (config.NEWS_BUDGET_SECONDS) keeps the morning email on time
+    whatever the feeds are doing: names not reached stay stale and are first
+    in line, after your own, at the next refresh.
+    """
     if not tickers:
         return 0
+    budget = config.NEWS_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    deadline = time.monotonic() + budget
+    with _strikes_lock:
+        _strikes.clear()
 
     names = {}
     ph = ','.join(f':t{i}' for i in range(len(tickers)))
@@ -159,21 +332,44 @@ def update_news(tickers: list[str]) -> int:
         names = dict(zip(meta['ticker'], meta['name']))
 
     written = 0
+    failed: list[str] = []
+    skipped = 0
     with ThreadPoolExecutor(max_workers=max(2, config.MAX_WORKERS // 2)) as pool:
         futures = {pool.submit(fetch_for_ticker, t, names.get(t)): t
-                   for t in sorted(set(tickers))}
+                   for t in _fetch_order(tickers)}
         for fut in as_completed(futures):
             t = futures[fut]
+            if fut.cancelled():
+                continue
             try:
                 rows = fut.result()
             except Exception as exc:               # noqa: BLE001
+                # Recorded as a failure, not as "0 articles": a feed that is
+                # down used to be logged as a successful refresh, and a
+                # weekend digest with no news looked like a quiet weekend.
                 log.warning('news failed for %s: %s', t, exc)
+                failed.append(t)
+                db.record_ingest('news', t, error=str(exc)[:200])
                 continue
             if rows:
-                written += db.upsert(db.news, rows)
+                # First sighting wins: an article already stored keeps its
+                # original publish time instead of being re-dated to now.
+                written += db.upsert(db.news, rows, on_conflict='ignore')
             db.record_ingest('news', t, rows=len(rows) if rows else 0)
+            if time.monotonic() > deadline and not skipped:
+                skipped = sum(1 for f in futures if f.cancel())
+                if skipped:
+                    log.warning('news: time budget of %ds reached — %d tickers '
+                                'left for the next refresh', int(budget), skipped)
 
-    log.info('news: %d articles across %d tickers', written, len(tickers))
+    n = len(set(tickers)) - skipped
+    LAST_RUN.update(tickers=n, failed=len(failed), written=written, skipped=skipped)
+    log.info('news: %d articles across %d tickers (%d unreachable, %d left '
+             'for next time)', written, n, len(failed), skipped)
+    if failed and len(failed) == n:
+        raise NewsUnavailable(
+            f'no news source answered for any of {n} tickers — check the '
+            f'network; Yahoo and Google News feeds were both unreachable')
     return written
 
 

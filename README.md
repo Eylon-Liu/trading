@@ -2,7 +2,7 @@
 
 A local web app for **mid- and long-horizon** equity research. It stores everything it fetches, so you can re-run a screen **as of any past date**, compare today against a month or a year ago, and backtest a strategy without accidentally using information that did not exist yet.
 
-Runs entirely on your machine — `python3 app.py`, then open `http://localhost:8050`. Uses only free data sources; **no API keys required** for data, screening, or backtesting. An optional [AI analysis layer](#optional-ai-analysis-layer) adds natural-language interpretation when a Gemini or Anthropic key is set.
+Runs on your machine — `python3 app.py`, then open `http://localhost:8050`; [reachable from your phone](docs/remote-access.md) through Tailscale once you set a login. Uses only free data sources; **no API keys required** for data, screening, or backtesting. An optional [AI analysis layer](#optional-ai-analysis-layer) adds natural-language interpretation when a Gemini or Anthropic key is set.
 
 ```bash
 bash run.sh          # install, create the database, load the Dow 30, launch
@@ -24,14 +24,28 @@ bash run.sh          # install, create the database, load the Dow 30, launch
 
 The app treats these as separate questions rather than one ranked list, because they are.
 
-| | **Long-term** (1 year+) | **Mid-term** (1–6 months) |
+| | **Long-term** (1 year+) | **Mid-term** (3–6 months) |
 |---|---|---|
-| Question | *Is this business worth owning?* | *Is this worth trading now?* |
-| Driven by | Returns on capital, balance sheet, valuation, earnings durability | Trend, catalyst, positioning; fundamentals only as a filter |
-| Output | Rank, signal, and the reasoning behind it | Entry, stop, target, time stop, position size |
-| Exit | A broken thesis — no price level | Stop hit, target hit, time stop, or trend break |
-| Rebalance | Quarterly | Monthly, with intra-period stops |
-| Strategies | Buffett Quality, Quality Momentum, Style Factors, Insider Conviction, Total Shareholder Yield | Momentum + Trend, 52-Week Breakout, Pullback, Post-Earnings Drift, Insider Cluster, Quality Mean Reversion, Low-Vol Relative Strength, Deteriorating Quality (avoid list) |
+| Question | *Is this business worth owning?* | *Is this worth holding for the next two quarters?* |
+| Driven by | Returns on capital, balance sheet, valuation, earnings durability | What lasts that long: 6–12 month momentum, earnings drift, cash returned to owners, insider buying |
+| Output | Rank, signal, and the reasoning behind it | Entry, stop, target, six-month time stop, position size |
+| Exit | A broken thesis — no price level | Stop hit, target hit, six-month limit, or dropping out at the half-yearly review |
+| Rebalance | Every six months | Every six months, with stops in between |
+| Strategies | Buffett Quality, Quality Momentum, Style Factors, Insider Conviction, AI Earnings Review, Total Shareholder Yield, **Multi-Strategy Consensus** | **Balanced (Value + Momentum + Quality)**, Momentum + Trend, 52-Week Breakout, Low-Vol Relative Strength, Post-Earnings Drift, Insider Cluster; shorter entry setups: Pullback, Mean Reversion |
+
+**Do they beat SPY?** Measured, not assumed — and the answer is *not
+provably*. **[docs/strategy-research.md](docs/strategy-research.md)** tests
+every strategy on the S&P 500 from 2020 over 3- and 6-month holds. Held six
+months, with costs, Buffett Quality, Shareholder Yield, Momentum + Trend and
+the Consensus finished 0.4–1.4% a year ahead of SPY and the Balanced blend
+slightly behind — margins too small to distinguish from luck. Rotated every
+three months, all of them did worse, which is why both horizons now
+rebalance half-yearly. Value screens won in 2020–2023 and momentum screens
+afterwards; neither did both.
+
+A shortlist (and a backtest portfolio) never takes more than 30% of its
+names from one sector: the top of a ranking can be a single theme, and a
+theme reverses all at once.
 
 Position sizes are **percentages of portfolio** implied by a risk budget and the stop distance — a wider stop earns a smaller position. The app knows nothing about your account and never asks.
 
@@ -107,6 +121,36 @@ Most of the engineering here is about not fooling yourself.
 
 **Predictive power is reported, not just returns.** Every backtest shows rank IC alongside CAGR, and the UI flags it when the correlation is near zero — which means any outperformance came from a few positions rather than from the ranking working.
 
+### How signals are graded
+
+Each strategy's composite is an average of sector-relative z-scores, so its
+spread depends on how many factors it blends. Buy / Hold / Sell tiers are
+therefore set on the composite's **percentile** within the screened universe
+(top decile, top quartile, above median, …), which makes a "Buy" mean the same
+thing in an eleven-factor strategy as in a five-factor one.
+
+**Deteriorating Quality is an avoid list.** Rank 1 is the *worst* name. It
+gets avoid/caution labels and no trade plan, it is kept out of the daily
+brief's consensus and Buy counts, it appears in its own "Avoid list" section
+(flagging anything you hold or watch), a holding that lands on it raises an
+alert, and its live track record counts it as working when its names *lag*
+the market.
+
+### How the backtests trade
+
+| | Long horizon (`run_backtest`) | Mid horizon (`run_trade_backtest`) |
+|---|---|---|
+| Signal | after the close of a real session — the last session of each month/quarter, never a weekend date | after the close of the last session of each month |
+| Entry | the close one session later (`execution_lag=1`) | market orders at the next open; pullback limits only if a later bar trades down to them within 5 sessions, else the order expires |
+| Exit | the next rebalance fill | stop (checked first), target, or time stop — never on the signal day's own bar; a gap through the stop fills at the open |
+| Capital | weights sum to 1; turnover measured against *drifted* weights | gross exposure capped at 100%; a name already held or on order is not bought twice |
+| Curve | marked to market daily | marked to market daily (open losses count in the drawdown) |
+| Costs | commission + slippage on every unit traded | the same, on entry and exit |
+
+Sharpe is the textbook mean excess return over volatility; Sortino uses downside deviation; the risk-free rate is the average 3-month T-bill over the backtest window (from FRED), not a fixed 5%. The IC research forward returns start at the signal close.
+
+**One limitation the code cannot fix:** the free price source has no history for delisted tickers. Point-in-time membership puts companies that later failed or were acquired back into the universe, but with no prices they cannot pass the liquidity filter, so they are never picked. The availability check refuses windows where that gap is large; it is still worth knowing that older results lean optimistic.
+
 ---
 
 ## Data sources — all free, no keys
@@ -120,6 +164,8 @@ Most of the engineering here is about not fooling yourself.
 | **Yahoo chart API** | Daily OHLCV | ✅ full history |
 | **Wikimedia pageviews** | Retail attention proxy | ✅ full daily history |
 | **Federal Register** | Rules and executive orders, mapped to sectors | ✅ full history |
+| **FRED** (keyless CSV, or API with `FRED_API_KEY`) | T-bills, Treasuries, curve, high-yield spread, VIX, Fed funds | ✅ full history |
+| **Earnings calendar** — Nasdaq's public calendar; Yahoo (via yfinance) for your portfolio and watchlist names it misses; Finnhub first if `FINNHUB_API_KEY` is set | Upcoming report dates. Anything still missing is estimated from the company's own 8-K Item 2.02 cadence and labelled as an estimate | ⚠️ forward only |
 | Yahoo / Google News RSS | Company coverage, sentiment, direction extraction | ⚠️ **forward only** |
 
 The last row is the honest exception: free news APIs return only recent items, so news signals work live from day one but cannot be backfilled. Everything else carries a filing or publication date and is backtestable immediately — which is why the strategies lean on filings rather than headlines.
@@ -165,7 +211,43 @@ ANTHROPIC_API_KEY=...     # needs: pip install anthropic
 | **Compare** | What changed between two run dates, and which factors drove the rotation |
 | **Data** | Whether the layer is live, and on which backend |
 
-**It never changes a score, a rank, or a trade level.** Those stay deterministic and reproducible from the formulas in the Methodology tab — the model is handed *computed* figures and asked to interpret them, so a hallucination can mislead a reader but cannot corrupt a backtest. Every panel is labelled with the model that wrote it.
+**The commentary panels never change a score, a rank, or a trade level.** Those stay deterministic and reproducible from the formulas in the Methodology tab — the model is handed *computed* figures and asked to interpret them, so a hallucination can mislead a reader but cannot corrupt a backtest. Every panel is labelled with the model that wrote it.
+
+**The one place AI does enter scoring is opt-in and dated:** the *earnings reviews* below feed the `LLM_EARNINGS_VIEW` factor, which only the AI Earnings Review strategy and one vote of the Multi-Strategy Consensus use. Every other strategy is untouched.
+
+### AI earnings reviews
+
+For each new results filing (8-K Item 2.02) the press release is pulled from EDGAR and read by the configured model together with the computed figures — growth, margins, ROIC, valuation yields, the market's reaction, the consensus EPS estimate and recent headlines. It answers one question for a 6–18 month holder, *is this worth buying?*, as structured JSON: verdict (buy / accumulate / hold / avoid), score −2…+2, conviction, guidance direction, valuation view, and its positives and negatives. The daily brief and the weekend digest show new reviews, your names first.
+
+```bash
+python3 cli.py review --run         # review new results filings (the routine does this daily)
+python3 cli.py review AAPL NVDA     # show stored reviews
+```
+
+Reviews are **dated the day they are written and never back-dated**. A model asked today about a 2023 quarter already knows how the stock did afterwards, so a back-dated review would leak the future into any backtest. The factor therefore has history only from the day the routine started, and whether it adds anything is answered by `python3 cli.py track`, not by a backtest. Cost is bounded: one call per filing, your portfolio and watchlist first, at most `QUANT_LLM_MAX_REVIEWS` (25) per run.
+
+### Multi-strategy consensus — and a test of it
+
+`consensus` ranks names by how many **independent strategy families** put them in their top 20% at once:
+
+| Family | Strategies (vote together, once) |
+|---|---|
+| Quality & value | Buffett Quality, Total Shareholder Yield |
+| Momentum & trend | Quality Momentum, Momentum + Trend, Low-Vol Relative Strength |
+| Insider buying | Insider Conviction, Insider Cluster Buying |
+| Earnings reaction | Post-Earnings Drift |
+| AI earnings review | +1 at a view of +1 or better, −1 at −1 or worse |
+
+Grouping matters: three momentum variants agreeing is one opinion said three times. A screen's hard filter excluding the name counts as a "no"; a name on the Deteriorating Quality avoid list loses a vote; a name needs at least two families scoring it to be ranked. The daily brief shows it as **🏆 Multi-strategy consensus**.
+
+Whether agreement actually predicts returns is an empirical question, so it comes with a test:
+
+```bash
+python3 cli.py consensus-test --start 2021-01-01            # study + backtest
+python3 cli.py consensus-test --start 2021-01-01 --compare  # …next to every member strategy
+```
+
+The **agreement study** groups every ranked name at each date by how many families agreed, and reports its forward return versus SPY (6 months by default), hit rate, and the rank correlation between votes and returns — then says plainly whether more agreement meant higher returns on your universe. The **backtest** runs the consensus walk-forward — top names held six months, next-close fills, costs included — and with `--compare` every member strategy the same way. Families whose data does not reach back to `--start` are left out for the whole run, and the AI vote is never part of a backtest.
 
 The app is fully functional without a key: every panel degrades to a stated reason rather than a blank space, and a missing key, an expired key, a rate limit, a network failure and a safety refusal are each handled and logged distinctly.
 
@@ -191,7 +273,10 @@ python3 cli.py screen --strategy momentum_trend --top 10   # mid-term + plans
 
 python3 cli.py backtest --strategy buffett --start 2020-01-01
 python3 cli.py report --kind daily --email you@example.com
+python3 cli.py report --kind news                       # closed-market digest
+python3 cli.py daily                                    # the scheduled routine
 python3 cli.py status                                   # coverage and freshness
+python3 cli.py db status                                # size, backups, clean-ups
 ```
 
 ### Universe expressions
@@ -202,25 +287,168 @@ sector=Information Technology,mcap>10B     compose filters
 SPY,sector=Health Care,adv>25M,top=50      cap by size rank, never at random
 ```
 
+### The daily email
+
+`python3 cli.py daily` is the whole routine in one command — pull, screen,
+build, email — and the **NYSE calendar** decides what goes out:
+
+| Day | Email |
+|---|---|
+| Trading day (incl. 1 p.m. half-days) | **Full brief** — alerts on your positions, market snapshot, macro regime, your portfolio and watchlist, earnings in the next two weeks, screens for every strategy as of the last completed session compared with the session before it, consensus picks, signal shifts, news and policy. On the first session of each week: the live track record |
+| Weekend, or an NYSE holiday (Thanksgiving, Good Friday, Juneteenth, …) | **News-only digest** — what was published since the last close: news on your portfolio and watchlist, news on current picks, material events, 8-K filings, policy, and who reports soon. No prices, ranks or signals, because nothing traded |
+
+Holidays are computed by rule (and one-off closures are listed in
+`core/market_calendar.py`), so nothing needs updating each year. A report
+already emailed for a date is never sent twice, so a job that launchd re-runs
+after the machine wakes up is harmless. If the price ingest failed, the brief
+says so at the top instead of quietly showing yesterday's numbers.
+
+Configure it in `.env`:
+
+```bash
+QUANT_EMAIL=you@example.com          # comma-separate several
+QUANT_WATCHLIST=AAPL, MSFT, NVDA     # optional: leads every email
+QUANT_INDEX=SPY                      # optional: universe to screen
+```
+
+```bash
+python3 cli.py daily --dry-run                   # what would be sent today
+python3 cli.py daily --dry-run --date 2026-11-26 # …on Thanksgiving
+python3 cli.py daily                             # do it
+```
+
 ### Scheduling
 
+macOS (launchd — fills in this checkout's paths for you):
+
+```bash
+bash tools/setup_schedule.sh install   # 07:00 daily email; 18:30 Mon–Fri prep + backup
+bash tools/setup_schedule.sh test      # dry run
+```
+
+Linux, or cron anywhere — `bash tools/setup_schedule.sh cron` prints these
+with your paths filled in:
+
 ```cron
-0 18 * * 1-5  cd /path/to/trading && python3 cli.py ingest --index SPY --full
-0  7 * * 1-5  cd /path/to/trading && python3 cli.py report --kind daily \
-                  --strategy buffett --email you@example.com
-0  8 1 * *    cd /path/to/trading && python3 cli.py report --kind monthly \
-                  --strategy buffett --email you@example.com
+0 7 * * *     cd /path/to/trading && python3 cli.py daily >> logs/daily.log 2>&1
+30 18 * * 1-5 cd /path/to/trading && python3 cli.py daily --mode full --no-email --backup >> logs/daily.log 2>&1
+0 8 1 * *     cd /path/to/trading && python3 cli.py report --kind monthly --email you@example.com
+```
+
+The morning job sends the one email of the day. The evening job pulls every
+source (SEC filings, insiders, profiles) and pre-runs the screens for that
+day's close, so the next morning's brief is quick; it never emails.
+
+### Database upkeep
+
+The store holds things that cannot be re-downloaded — membership history,
+profile snapshots, news — so it is worth protecting.
+
+```bash
+python3 cli.py db status     # size, row counts, backups, anything cleanable
+python3 cli.py db backup     # consistent, compressed copy to db/backups/ (keeps 3)
+python3 cli.py db check      # SQLite integrity check + consistency counts
+python3 cli.py db clean      # backup, then remove duplicate runs / news rows,
+                             # orphans; --vacuum to return space to disk
+```
+
+The evening job backs up automatically (`--backup`). On a store built before
+this version, run `db clean --vacuum` once: earlier versions kept every
+re-run of every screen, which is usually most of the file.
+
+### Disk and memory: it levels off
+
+Every routine run ends with housekeeping (`config.RETENTION`), so the
+footprint stops growing instead of adding a little every day:
+
+| What | Kept | Why it is safe |
+|---|---|---|
+| Downloaded responses (`cache/`) | gzip-compressed; dropped 30 days after their last refresh | everything in them is already in the database |
+| Per-factor detail behind each screen | 30 days | rankings and signals are kept; only the breakdown goes |
+| Daily screen runs | every day for 120 days, then one a week | the track record and Compare need cohorts, not five a week |
+| News articles | 180 days | the digest and Intel read recent news only |
+| Backups | 3, gzip-compressed | each is a full copy |
+| Logs, daily report files | 30 / 180 days | monthly reports are kept |
+
+Prices, filings, fundamentals and index membership — what backtests are
+built on — are never pruned. Measured on the S&P 500: about 1.3 GB in all
+(database 1.0 GB, cache 0.3 GB) where the cache alone had been 2.4 GB, and
+the daily routine peaks near 1.1 GB of memory, down from 2.5 GB.
+
+```bash
+python3 cli.py db status           # where the space is
+python3 cli.py db tidy             # apply the retention schedule now
+python3 cli.py db tidy --vacuum    # …and hand freed space back to the disk
+python3 cli.py db restore          # unpack the newest backup beside the live file
 ```
 
 ---
 
-## The six tabs
+## Portfolio, watchlist and alerts
+
+Tell the terminal what you own and what you follow; the daily email then
+leads with it.
+
+```bash
+python3 cli.py watch add AMD XOM --note "semis / energy"
+python3 cli.py portfolio add NVDA 20 160 --date 2026-07-01 --stop 150 --target 320
+python3 cli.py portfolio set NVDA --stop 175          # trail the stop up
+python3 cli.py portfolio                              # holdings, P&L, alerts
+python3 cli.py portfolio close NVDA --price 310       # or omit --price: last close
+python3 cli.py portfolio import lots.csv              # ticker,shares,cost_basis[,opened,stop,target]
+```
+
+Or use the **💼 Portfolio** tab. Each purchase is a lot, so adding to a
+position keeps both cost bases. P&L is price return on the raw close against
+your cost, restated through any split since you bought. Alerts: stop or
+target touched, within 3% of the stop, an unusually large one-day move for
+that stock, earnings within a week, and a holding that most strategies now
+rate Sell/Avoid.
+
+```bash
+python3 cli.py track       # live track record: what each strategy's stored picks did next
+python3 cli.py earnings    # upcoming reports for your names (--index SPY for all)
+python3 cli.py macro       # rates, credit, VIX and regime flags
+python3 cli.py review      # AI earnings reviews (--run to write new ones)
+python3 cli.py consensus-test --start 2021-01-01   # does agreement predict returns?
+```
+
+The **live track record** is the honest counterpart to a backtest: every
+screen the routine stores is a dated prediction, graded against what prices
+did afterwards (bought at the next close, versus SPY, with rank IC). Daily
+cohorts overlap, so it reports how many *independent* periods the numbers
+rest on.
+
+---
+
+## Use it from your phone
+
+```bash
+python3 cli.py set-password                  # the login
+bash tools/setup_schedule.sh install-web     # keep the UI running on the Mac
+tailscale serve --bg 8050                    # private https address for your phone
+```
+
+The UI listens on this computer only, never on the Wi-Fi. Your phone reaches
+it through Tailscale (free), and every page asks for the login (30-day
+sessions, rate-limited, scrypt-hashed). The **🎛️ Control** tab runs the
+routine from the phone: send today's email, full refresh, AI reviews,
+backups, with a live log. Step by step, plus why a cloud server isn't
+needed: **[docs/remote-access.md](docs/remote-access.md)**. A Cloudflare
+Tunnel and an always-on `docker compose` server (web UI + scheduler) are
+covered there too.
+
+---
+
+## The tabs
 
 **Screen** — universe builder and ranked results; the horizon toggle changes what the page is for.
+**Portfolio** — your positions with P&L and alert levels, watchlist, alerts, earnings dates, macro regime, and the live track record.
+**Control** — status at a glance and one-tap jobs (email, refresh, AI reviews, backup) with a live log; built for the phone.
 **Compare** — two run dates, rank migration, entrants and dropouts, signal changes.
 **Research** — backtest with equity curve, drawdown, and the rank-IC honesty panel.
 **Intel** — company direction, 8-K events, insider activity, and a policy panel.
-**Reports** — generate, preview and email daily or monthly briefs.
+**Reports** — generate, preview and email daily briefs, closed-market news digests, or monthly reviews.
 **Data** — coverage, freshness, and where the membership sources disagree (shown, not hidden).
 
 ---
@@ -232,13 +460,16 @@ config.py            tunables, sector map, SEC tag map, agency→sector map
 cli.py               headless interface (cron-able)
 app.py               Dash entry point
 core/                db.py (SQLAlchemy schema), http.py (throttle + cache)
-data/                members, yahoo, sec, classify, news, policy, altdata, universe
+core/                market_calendar.py (NYSE sessions), maintenance.py (backups)
+data/                members, yahoo, sec, classify, news, policy, altdata,
+                     universe, macro (FRED), earnings (calendar)
 quant/               fundamentals, factors, transforms, strategies,
-                     tradeplan, engine, backtest, compare, availability
+                     tradeplan, signals/engine, risk, backtest, research,
+                     portfolio (your positions), track (live track record)
 nlp/                 sentiment (Loughran-McDonald), extract, summarize
 reports/             builder (HTML), email
 ui/                  theme, components, layout, pages/
-tests/               look-ahead and execution-timing assertions included
+tests/               350+ tests, including the look-ahead assertions
 ```
 
 Storage is SQLite by default (~250–300 MB for 500 tickers × 10 years). Because the data layer is SQLAlchemy, moving to a hosted database is a `DATABASE_URL` change — Turso is the easiest since it *is* SQLite.
@@ -251,12 +482,10 @@ Storage is SQLite by default (~250–300 MB for 500 tickers × 10 years). Becaus
 python3 -m pytest -q
 ```
 
+The suite runs against a throwaway database, never `db/quant.sqlite`. To run
+the data-dependent tests against your real store, set `QUANT_TEST_REAL_DB=1`.
+
 The suite covers the transforms against hand-computed values, Wilder RSI against a reference, TTM assembly from a fixture containing the real Apple duplicate-duration case and a restatement, trade-plan sizing arithmetic, backtest metrics against an analytically known curve, and the point-in-time assertions — including that a factor computed as of date `T` references no row dated after `T`.
-
-Two suites guard the backtest's honesty end to end, on a synthetic store built in the test:
-
-- **`tests/test_backtest_integrity.py`** — *future-perturbation invariance*: a second store rewrites everything dated after a cutoff (prices, a later restatement, a post-cutoff split, insider trades, 8-Ks, that day's pageviews) and every built-in strategy must score identically at the cutoff, on both the live and the backtest path. It also checks that the backtest path equals a fresh live screen (including the incremental fundamentals carry across a share count going stale), that fills land strictly after the scan, that the mid-term book never exceeds 100% or double-holds, and that every factor source moves the cache version.
-- **`tests/test_strategy_sanity.py`** — every strategy's filters are understood by the engine, every factor is documented and sourced, avoid lists get no long plans, no long strategy rewards the one-month reversal window, SUE arithmetic, and a dead-code guard that fails on any top-level definition referenced nowhere.
 
 ---
 
@@ -266,7 +495,10 @@ Two suites guard the backtest's honesty end to end, on a synthetic store built i
 - **News cannot be backfilled** (above). It accumulates forward.
 - **SIC → GICS is approximate.** Alphabet lands in Information Technology rather than Communication Services, for instance.
 - **`yfinance.info` is unreliable.** Market cap and forward P/E fall back to SEC-derived estimates when it is throttled; the app is built not to depend on it.
-- **Backtests ignore borrow costs, taxes, and market impact.** Scores are computed as of each rebalance date and filled at the *next* session's close; pullback limits fill only if a later session trades down to them. Daily bars carry no open, so a gap through a stop fills at that day's high — real gaps fill at the open, which can be worse.
+- **Backtests ignore borrow costs, taxes, and market impact.** Long-horizon fills are at the close one session after the signal.
+- **Delisted tickers have no price history** from the free source, so names that later failed cannot be picked in a historical backtest (see *How the backtests trade*). Companies that merely changed symbol (FB→META, BK→BNY…) are mapped; companies removed from the index but still trading can be loaded, which brings the S&P 500 gap under 10% for every year from 2020.
+- **No strategy here is proven to beat SPY.** Over 2020–2026 the best were about 1% a year ahead with six-month holds and costs, well inside the noise; treat rankings as a way to narrow a list, not as a forecast (docs/strategy-research.md).
+- **Headline sentiment is lexicon-based** and misreads some headlines ("first-ever close above $350" scored negative). The optional AI layer reads them properly.
 
 ---
 

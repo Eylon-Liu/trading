@@ -80,6 +80,9 @@ def fetch_policy(days_back: int = 30, per_page: int = 100,
         params['conditions[type][]'] = DOC_TYPES
 
         payload = http.fetch_json(FR_API, params=params, category='policy')
+        if payload is None and page == 1:
+            # Unreachable is an error to report, not an empty month.
+            raise RuntimeError('Federal Register did not answer')
         if not payload or not payload.get('results'):
             break
 

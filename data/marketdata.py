@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 FINNHUB_PROFILE = 'https://finnhub.io/api/v1/stock/profile2'
 
+
 def available() -> bool:
     return bool(config.FINNHUB_API_KEY)
 

@@ -2,6 +2,7 @@
 dash>=2.14.0
 dash-bootstrap-components>=1.5.0
 plotly>=5.18.0
+waitress>=3.0.0          # production server (phone / network access)
 
 # ── Data / numerics ───────────────────────────────────────
 pandas>=2.0.0

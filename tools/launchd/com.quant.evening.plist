@@ -6,40 +6,47 @@
     <key>Label</key>
     <string>com.quant.evening</string>
 
-    <!-- Full ingest + all strategy screens + daily report.
-         The script itself skips weekends, so this fires daily and
-         exits immediately on Saturday / Sunday. -->
+    <!-- Weekday evenings at 18:30 local time: full ingest (SEC filings,
+         insiders, profiles, ...), every strategy screen, and a database
+         backup. No email — it prepares the next morning's brief. On an NYSE
+         holiday it exits at once.
+
+         __ROOT__ and __PATH__ are filled in by `tools/setup_schedule.sh
+         install`; do not copy this file into LaunchAgents by hand. -->
 
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>tools/daily_routine.sh</string>
-        <string>full</string>
+        <string>__ROOT__/tools/daily_routine.sh</string>
+        <string>evening</string>
     </array>
 
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>18</integer>
-        <key>Minute</key>
-        <integer>30</integer>
-    </dict>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer>
+              <key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer>
+              <key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer>
+              <key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer>
+              <key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer>
+              <key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
 
-    <!-- Set WorkingDirectory to the repo root on your machine, e.g.:
-         <string>/Users/you/trading</string>
-         The script resolves all other paths relative to this. -->
     <key>WorkingDirectory</key>
-    <string>/Users/CHANGEME/trading</string>
+    <string>__ROOT__</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Library/Frameworks/Python.framework/Versions/3.12/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__PATH__</string>
     </dict>
 
     <key>StandardOutPath</key>
-    <string>logs/launchd_evening.log</string>
+    <string>__ROOT__/logs/launchd_evening.log</string>
     <key>StandardErrorPath</key>
-    <string>logs/launchd_evening.log</string>
+    <string>__ROOT__/logs/launchd_evening.log</string>
 </dict>
 </plist>

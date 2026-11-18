@@ -395,6 +395,18 @@ _MANIFEST = (
     '}}'
 )
 
+# A signed-out page (session expired, password changed, signed out in
+# another tab) would otherwise sit there with every callback failing
+# silently. Dash's callbacks go through fetch(): on a 401 from one of them,
+# go to the login form and come back here afterwards.
+_SESSION_JS = (
+    "(function(){var f=window.fetch;if(!f)return;var gone=false;"
+    "window.fetch=function(){return f.apply(this,arguments).then(function(r){"
+    "if(r.status===401&&!gone&&String(r.url).indexOf('/_dash-')!==-1){gone=true;"
+    "location.replace('/login?next='+encodeURIComponent(location.pathname+location.search));}"
+    "return r;});};})();"
+)
+
 INDEX_STRING = f'''<!DOCTYPE html>
 <html>
   <head>
@@ -408,6 +420,7 @@ INDEX_STRING = f'''<!DOCTYPE html>
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <link rel="manifest" href="data:application/manifest+json,{_MANIFEST}">
     <style>{INDEX_CSS}</style>
+    <script>{_SESSION_JS}</script>
   </head>
   <body>
     {{%app_entry%}}

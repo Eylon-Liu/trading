@@ -36,6 +36,7 @@ import pandas as pd
 
 import config
 from core import db
+from core import market_calendar as MC
 
 log = logging.getLogger(__name__)
 
@@ -64,10 +65,6 @@ class Source:
     @property
     def log(self) -> str:
         return self.log_source or self.name
-
-    @property
-    def per_ticker(self) -> bool:
-        return self.key_mode in ('ticker', 'ticker_prefix')
 
 
 # Ages are chosen from how fast the underlying data actually changes. Daily
@@ -108,6 +105,12 @@ SOURCES: dict[str, Source] = {
                          key_mode='global'),
     'attention':  Source('attention', 'Wikipedia pageviews', 24, False,
                          key_mode='global'),
+    'macro':      Source('macro', 'FRED macro series', 12, False,
+                         key_mode='global',
+                         note='Rates, credit spreads, VIX; no key needed.'),
+    'earnings':   Source('earnings', 'Earnings calendar', 12, False,
+                         key_mode='global',
+                         note='Upcoming report dates for the universe.'),
 }
 
 ESSENTIAL = [k for k, s in SOURCES.items() if s.essential]
@@ -231,30 +234,19 @@ def stale_keys(source: str, keys: list[str], now: datetime | None = None,
     return [k for k in keys if k not in fresh]
 
 
-# US equities close at 20:00 UTC (21:00 during DST); allow an hour for the
-# daily bar to be published.
-_CLOSE_UTC_HOUR = 21
-
-
 def last_session(now: datetime | None = None) -> date:
     """
     The most recent trading session whose daily bar should exist by now.
 
     Today only counts once the close has been published — otherwise every
-    check before 21:00 UTC declares the whole universe stale and refetches
-    prices on every single run.
+    pre-close check declares the whole universe stale and refetches prices on
+    every run. The close is judged in New York time, so it is right on both
+    sides of daylight saving, and holidays and 1 p.m. closes come from the
+    exchange calendar rather than being treated as missing data.
 
-    Weekends only; holidays are not modelled, so on a market holiday this
-    reports one stale day and prices are fetched once unnecessarily. A holiday
-    calendar to save that is not worth the maintenance.
+    A naive `now` is taken to be UTC, matching how timestamps are stored.
     """
-    now = now or datetime.utcnow()
-    d = now.date()
-    if now.hour < _CLOSE_UTC_HOUR:
-        d -= timedelta(days=1)
-    while d.weekday() >= 5:                 # Saturday or Sunday
-        d -= timedelta(days=1)
-    return d
+    return MC.last_completed_session(now)
 
 
 def price_gap(tickers: list[str]) -> list[str]:
@@ -378,8 +370,28 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
         return SourceResult(name, 'fetched', rows=rows, stale_keys=1,
                             total_keys=1)
 
+    if name == 'macro':
+        due = stale_keys(name, ['fred'], force=force)
+        if not due:
+            return SourceResult(name, 'fresh', total_keys=1)
+        from data import macro
+        emit(f'refreshing {src.label}')
+        rows = macro.update_macro()
+        return SourceResult(name, 'fetched', rows=rows, stale_keys=1,
+                            total_keys=1)
+
     if not tickers:
         return SourceResult(name, 'skipped', detail='empty universe')
+
+    if name == 'earnings':
+        due = stale_keys(name, ['calendar'], force=force)
+        if not due:
+            return SourceResult(name, 'fresh', total_keys=1)
+        from data import earnings
+        emit(f'refreshing {src.label}')
+        rows = earnings.update_earnings(tickers)
+        return SourceResult(name, 'fetched', rows=rows, stale_keys=1,
+                            total_keys=1)
 
     # ── per-ticker sources ───────────────────────────────────────
     if name == 'prices':
@@ -418,5 +430,17 @@ def _sync_one(name: str, tickers: list[str], *, index: str | None,
 
     emit(f'{src.label}: {len(due)} of {len(tickers)} tickers stale')
     rows = fn(due)
+    detail = ''
+    if name == 'news':
+        notes = []
+        if news.LAST_RUN.get('failed'):
+            notes.append(f'{news.LAST_RUN["failed"]} of {news.LAST_RUN["tickers"]} '
+                         f'tickers: no source answered')
+        if news.LAST_RUN.get('skipped'):
+            notes.append(f'{news.LAST_RUN["skipped"]} left for the next refresh '
+                         f'(time budget)')
+        detail = '; '.join(notes)
+        if detail:
+            emit(f'⚠️ news: {detail}')
     return SourceResult(name, 'fetched', rows=rows or 0, stale_keys=len(due),
-                        total_keys=len(tickers))
+                        total_keys=len(tickers), detail=detail)

@@ -342,30 +342,35 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'Presence only — the code says results were filed, not whether they '
         'beat or missed. The price reaction carries that information.'),
 
-    'EARNINGS_SURPRISE': FactorDoc(
-        'EARNINGS_SURPRISE', 'Standardized Unexpected Earnings (SUE)', 'Growth',
-        'ΔNI_q        = NI(latest quarter) − NI(same quarter a year earlier)\n'
-        'SUE          = ΔNI_q / sd(ΔNI over the prior up-to-7 quarters)\n'
-        'needs ≥ 8 quarters of history; dated by the quarter\'s filing',
-        'SEC XBRL quarterly net income (Q4 derived from the annual figure)',
-        'higher',
-        'The surprise in a quarter, measured against a seasonal random walk and '
-        'scaled by how volatile the company\'s earnings changes usually are. '
-        'Large positive SUE is the classic post-earnings-announcement-drift '
-        'signal (Bernard & Thomas 1989), and it needs no analyst estimates, so '
-        'it is point-in-time at any historical date.',
-        'Dated by the 10-Q/10-K, which can trail the press release by weeks, so '
-        'part of the drift is gone before the number is in the store. Pair it '
-        'with DAYS_SINCE_RESULTS to stay inside the drift window.'),
+    'EARNINGS_REACTION': FactorDoc(
+        'EARNINGS_REACTION', 'Earnings Announcement Return', 'Price',
+        'EARNINGS_REACTION = (P[t+1] / P[t-1] - 1) - (SPY[t+1] / SPY[t-1] - 1)\n'
+        '                    t = latest 8-K item 2.02 filing in the last 63 days',
+        'Adjusted closes; SEC submissions item codes', 'higher',
+        'How the market judged the latest results, net of the market that '
+        'day. Post-earnings-announcement drift: prices keep moving in the '
+        'direction of the initial reaction for weeks, because investors '
+        'under-react to earnings news.',
+        'Missing for names with no results filing in the last 63 days — the '
+        'drift has largely run its course by then, and those names are left '
+        'out of the drift screen rather than scored on stale news.'),
 
-    'DAYS_SINCE_RESULTS': FactorDoc(
-        'DAYS_SINCE_RESULTS', 'Days Since Latest Quarter Filed', 'Growth',
-        'DAYS_SINCE_RESULTS = as_of − filed date of the latest quarter',
-        'SEC XBRL filing dates', 'lower',
-        'How fresh the latest reported quarter is. Used as a filter rather than '
-        'a ranking factor: post-earnings drift lives in the weeks after the '
-        'results, not three months later.',
-        'Measured from the filing, not the earnings call.'),
+    'LLM_EARNINGS_VIEW': FactorDoc(
+        'LLM_EARNINGS_VIEW', 'AI Earnings Review', 'Alt Data',
+        'LLM_EARNINGS_VIEW = score × conviction weight\n'
+        '   score      : model verdict on the latest results, -2 .. +2\n'
+        '   conviction : low 0.5 · medium 0.8 · high 1.0\n'
+        '   latest review written in the last 120 days',
+        'Earnings press release (SEC 8-K Ex. 99) + computed fundamentals, '
+        'market reaction, consensus EPS, headlines; read by the configured LLM',
+        'higher',
+        'A language model reads the actual release — guidance, segment trends, '
+        'margin commentary — which no ratio captures, and judges whether the '
+        'quarter makes the stock worth owning for 6-18 months.',
+        'Forward-only. Reviews are dated the day they are written and never '
+        'back-dated, because a model asked today about an old quarter already '
+        'knows what happened next. No backtest can validate it; the live '
+        'track record does. Opinions vary by model and can be wrong.'),
 
     'EVENT_MANAGEMENT': FactorDoc(
         'EVENT_MANAGEMENT', '8-K Management Changes', 'Alt Data',
@@ -691,22 +696,12 @@ EXITS — whichever comes first
 
     stop hit          intraday low ≤ stop
     target hit        intraday high ≥ target
-    time stop         60 trading days elapsed with neither hit
-    trend break       close below the 200-day MA (a review prompt on the
-                      live screen; the backtest exits on the three above)
+    time stop         ~60 trading days elapsed with neither hit
+    trend break       close below the 200-day moving average
 
   When a single day trades through both stop and target, daily bars cannot
   reveal the order, so the backtest assumes the stop. That is the pessimistic
   reading, chosen so results are not flattered by an ambiguity.
-
-BACKTEST FILLS
-
-    the plan is built from data as of the scan date; nothing fills that day
-    market entry      close of the next session
-    pullback entry    a limit working for 5 sessions; fills only if a
-                      session's low reaches it, otherwise no trade
-    book              a held name is not bought again, and new positions
-                      only take uninvested weight — exposure never > 100%
 
 PORTFOLIO RISK
 

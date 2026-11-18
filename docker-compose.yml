@@ -1,0 +1,44 @@
+# Always-on deployment: the web UI and the daily routine, sharing one database.
+#
+#   1. cp .env.example .env  and fill it in (SEC_USER_AGENT, SMTP, QUANT_EMAIL)
+#   2. docker compose build
+#   3. docker compose run --rm web python cli.py set-password --print
+#      → paste the two printed lines into .env
+#   4. docker compose up -d
+#
+# The web port is published on 127.0.0.1 only. Reach it from your phone through
+# Tailscale or a Cloudflare Tunnel (docs/remote-access.md) — do not open 8050
+# to the internet.
+services:
+  web:
+    build: .
+    env_file: .env
+    environment:
+      QUANT_HOST: 0.0.0.0          # inside the container; the publish below limits it
+      QUANT_BEHIND_PROXY: "1"     # only the host's proxy can reach it (127.0.0.1 publish)
+      TZ: ${QUANT_TZ:-America/New_York}
+    ports:
+      - "127.0.0.1:8050:8050"
+    volumes: &data
+      - quant-db:/app/db
+      - quant-cache:/app/cache
+      - quant-reports:/app/reports/out
+      - quant-logs:/app/logs
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    command: ["python", "cli.py", "scheduler"]
+    env_file: .env
+    environment:
+      TZ: ${QUANT_TZ:-America/New_York}
+    healthcheck:
+      disable: true                # the image's check is the web server's
+    volumes: *data
+    restart: unless-stopped
+
+volumes:
+  quant-db:
+  quant-cache:
+  quant-reports:
+  quant-logs:
