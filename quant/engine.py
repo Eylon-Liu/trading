@@ -20,7 +20,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -209,10 +209,17 @@ def _apply_size_filters(raw: pd.DataFrame, spec: UniverseSpec) -> pd.DataFrame:
     return raw[keep]
 
 
+FILTER_KEYS = frozenset({'min_above_ma200', 'rsi_max', 'rsi_min', 'min_market_cap'})
+
+
 def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
     """Names that satisfy the strategy's hard gates."""
     keep = pd.Series(True, index=raw.index)
     f = strategy.filters
+    unknown = set(f) - FILTER_KEYS
+    if unknown:
+        log.warning('%s: filters %s are not understood and do not apply',
+                    strategy.key, sorted(unknown))
 
     if f.get('min_above_ma200') and 'ABOVE_MA200' in raw:
         keep &= raw['ABOVE_MA200'].fillna(0) >= 1
@@ -532,7 +539,7 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
 
     plans = pd.DataFrame()
     # An avoid list gets no long entry, stop or target.
-    if strategy.needs_trade_plan and not strategy.invert:
+    if strategy.needs_trade_plan:
         shortlist = diversified_head(scores, top_n)
         plans = TP.build_plans(
             raw_eligible.loc[raw_eligible.index.intersection(shortlist.index)],

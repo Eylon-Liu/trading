@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from functools import lru_cache
 
 import numpy as np
@@ -157,9 +158,19 @@ NEGATION_WINDOW = 3
 _TOKEN_RE = re.compile(r"[a-z']+")
 
 
-@lru_cache(maxsize=1)
+_VADER_LOCK = threading.Lock()
+
+
 def _vader():
     """VADER analyzer if the lexicon is present; None otherwise."""
+    # News threads score concurrently; without the lock each one raced past
+    # the empty cache and retried the lexicon download.
+    with _VADER_LOCK:
+        return _load_vader()
+
+
+@lru_cache(maxsize=1)
+def _load_vader():
     try:
         from nltk.sentiment.vader import SentimentIntensityAnalyzer
         return SentimentIntensityAnalyzer()

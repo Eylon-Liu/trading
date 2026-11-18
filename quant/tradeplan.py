@@ -28,7 +28,6 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
-import config
 from data import yahoo
 
 log = logging.getLogger(__name__)
@@ -205,83 +204,6 @@ def build_plans(factors: pd.DataFrame, as_of: date | str,
     if not plans:
         return pd.DataFrame()
     return pd.DataFrame(plans).set_index('ticker')
-
-
-# ─────────────────────────────────────────────
-# EXIT MONITORING
-# ─────────────────────────────────────────────
-
-EXIT_REASONS = {
-    'stop': '🔴 Stop hit',
-    'target': '🟢 Target reached',
-    'time': '🟠 Time stop — thesis has not played out',
-    'trend': '🟠 Trend broken (below 200-day MA)',
-    'signal': '🟡 Signal decayed — no longer ranks',
-}
-
-
-def check_exits(plans: pd.DataFrame, as_of: date | str,
-                still_ranked: set[str] | None = None) -> pd.DataFrame:
-    """
-    Re-evaluate open plans against subsequent price action.
-
-    Drives the "what changed" section of the daily report: a mid-term plan is
-    only useful if something checks whether its levels have been hit.
-    """
-    if plans.empty:
-        return pd.DataFrame()
-
-    as_of = pd.to_datetime(as_of).date()
-    tickers = list(plans.index)
-
-    start = min(pd.to_datetime(plans['as_of']).min().date(),
-                as_of - timedelta(days=5))
-    highs, lows, closes = yahoo.adjusted_ohlc(tickers, start=start, end=as_of)
-
-    rows = []
-    for t in tickers:
-        plan = plans.loc[t]
-        opened = pd.to_datetime(plan['as_of']).date()
-        if t not in closes.columns:
-            continue
-
-        window = slice(pd.Timestamp(opened), pd.Timestamp(as_of))
-        hi = highs[t].loc[window].dropna() if t in highs.columns else pd.Series(dtype=float)
-        lo = lows[t].loc[window].dropna() if t in lows.columns else pd.Series(dtype=float)
-        cl = closes[t].loc[window].dropna()
-        if cl.empty:
-            continue
-
-        status, reason, hit_date = 'open', None, None
-
-        # Stop is checked first: on a day that traded through both levels we
-        # cannot tell the order from daily bars, so assume the worse fill.
-        if not lo.empty and (lo <= plan['stop']).any():
-            status, reason = 'closed', 'stop'
-            hit_date = lo[lo <= plan['stop']].index[0].date()
-        elif not hi.empty and (hi >= plan['target']).any():
-            status, reason = 'closed', 'target'
-            hit_date = hi[hi >= plan['target']].index[0].date()
-        elif as_of >= pd.to_datetime(plan['time_stop_date']).date():
-            status, reason = 'closed', 'time'
-            hit_date = pd.to_datetime(plan['time_stop_date']).date()
-        elif still_ranked is not None and t not in still_ranked:
-            status, reason = 'review', 'signal'
-
-        last = float(cl.iloc[-1])
-        entry = float(plan['entry'])
-        rows.append({
-            'ticker': t, 'status': status,
-            'reason': EXIT_REASONS.get(reason) if reason else None,
-            'opened': opened, 'hit_date': hit_date,
-            'entry': entry, 'last': round(last, 2),
-            'pnl_pct': round((last / entry - 1.0) * 100.0, 2),
-            'r_realized': round((last - entry) / (entry - float(plan['stop'])), 2)
-                          if entry > float(plan['stop']) else np.nan,
-            'stop': plan['stop'], 'target': plan['target'],
-        })
-
-    return pd.DataFrame(rows).set_index('ticker') if rows else pd.DataFrame()
 
 
 def portfolio_risk(plans: pd.DataFrame) -> dict:

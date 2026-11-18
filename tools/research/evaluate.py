@@ -2,9 +2,9 @@
 
     python tools/research/evaluate.py      (after build_panel.py)
 """
-import warnings, logging, pickle, json
+import warnings, logging
 warnings.filterwarnings('ignore'); logging.disable(logging.CRITICAL)
-import numpy as np, pandas as pd
+import pandas as pd
 import lib
 from quant import strategies as ST, consensus as CONS, engine as EN
 pd.set_option('display.width', 230)

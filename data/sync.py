@@ -66,10 +66,6 @@ class Source:
     def log(self) -> str:
         return self.log_source or self.name
 
-    @property
-    def per_ticker(self) -> bool:
-        return self.key_mode in ('ticker', 'ticker_prefix')
-
 
 # Ages are chosen from how fast the underlying data actually changes. Daily
 # bars settle once a day; a company files when it files; the Federal Register

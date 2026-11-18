@@ -252,9 +252,12 @@ def test_old_reports_and_logs_are_pruned(fresh_db, tmp_path, monkeypatch):
     new_log.write_text('x')
     big = tmp_path / 'logs' / 'daily.log'
     big.write_bytes(b'line\n' * 1_400_000)                   # 7 MB of cron appends
-    assert M.prune_logs(30) == 2
+    launchd = tmp_path / 'logs' / 'launchd_evening.log'      # appended daily, never ages
+    launchd.write_bytes(b'line\n' * 1_400_000)
+    assert M.prune_logs(30) == 3
     assert not old_log.exists() and new_log.exists()
     assert 0.9e6 < big.stat().st_size <= 1e6 and big.read_bytes().startswith(b'line\n')
+    assert launchd.stat().st_size <= 1e6
 
 
 def test_housekeeping_runs_every_step_and_survives_one_failing(fresh_db, tmp_path, monkeypatch):

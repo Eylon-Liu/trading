@@ -210,10 +210,6 @@ def _fetch_chart(ticker: str, period: str = '10y',
         return pd.DataFrame()
 
 
-def _existing_range(ticker: str) -> tuple[date | None, date | None]:
-    return _existing_ranges([ticker]).get(ticker, (None, None))
-
-
 def _existing_ranges(tickers: list[str]) -> dict[str, tuple[date, date]]:
     """Oldest and newest stored bar per ticker, in one query."""
     if not tickers:

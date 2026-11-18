@@ -36,12 +36,6 @@ FLOW_CONCEPTS = {
     'operating_cash_flow', 'capex', 'interest_expense', 'rnd',
     'dividends_paid', 'buybacks', 'eps_diluted',
 }
-# Stocks are instantaneous balances.
-STOCK_CONCEPTS = {
-    'assets', 'current_assets', 'liabilities', 'current_liabilities',
-    'equity', 'cash', 'long_term_debt', 'short_term_debt', 'total_debt',
-    'inventory', 'shares_diluted', 'shares_basic',
-}
 
 # Day-count windows for classifying a fact's span.
 QUARTER_DAYS = (60, 115)
@@ -654,6 +648,59 @@ def adjust_shares_for_splits(facts: pd.DataFrame,
     return facts
 
 
+def recent_splitters(splits: pd.DataFrame | None, as_of) -> set[str]:
+    """
+    Tickers that split in the 400 days up to and including `as_of`.
+
+    The share crosscheck (reported vs EPS-implied) breaks for these: the
+    quarterly EPS decomposition crosses a split boundary, making the TTM EPS —
+    and therefore the implied count — unreliable. BKNG's 25:1 (Apr 2026)
+    produced a 2.65x ratio and lost its market cap; DELL's 1.8x (2018) landed
+    at 1.39x, just outside the band.
+
+    Bounded at `as_of`: a split that had not happened yet must not change how a
+    historical date is scored, and the companies that later split are the ones
+    whose price later rose.
+    """
+    if splits is None or splits.empty:
+        return set()
+    dates = pd.to_datetime(splits['date'])
+    end = pd.Timestamp(as_of)
+    recent = splits[(dates >= end - pd.Timedelta(days=SPLIT_WINDOW_DAYS))
+                    & (dates <= end)]
+    return set(recent['ticker'].unique())
+
+
+SPLIT_WINDOW_DAYS = 400
+
+
+def _valid_until(facts: pd.DataFrame, memo: dict, ticker: str,
+                 as_of: pd.Timestamp, splits: pd.DataFrame | None) -> pd.Timestamp:
+    """
+    The first date on which this ticker's row could differ *without* a new
+    filing.
+
+    Two inputs depend on the as-of date rather than on the filings alone:
+    whether a share count is still fresh (MAX_SHARE_COUNT_AGE_DAYS after it
+    was filed) and whether a split sits inside the crosscheck window
+    (SPLIT_WINDOW_DAYS). A backtest may carry a row to a later date only while
+    both answers are unchanged; past this date it must be rebuilt.
+    """
+    flips: list[pd.Timestamp] = []
+    for concept in SHARE_CONCEPTS:
+        filed = _latest_filed_date(facts, concept, memo)
+        if filed is not None:
+            expiry = pd.Timestamp(filed) + pd.Timedelta(days=MAX_SHARE_COUNT_AGE_DAYS + 1)
+            if expiry > as_of:
+                flips.append(expiry)
+    if splits is not None and not splits.empty:
+        for d in pd.to_datetime(splits.loc[splits['ticker'] == ticker, 'date']):
+            for flip in (d, d + pd.Timedelta(days=SPLIT_WINDOW_DAYS + 1)):
+                if flip > as_of:
+                    flips.append(flip)
+    return min(flips) if flips else pd.Timestamp.max
+
+
 def build_fundamentals(tickers: list[str], as_of: date | str,
                        facts_all: pd.DataFrame | None = None,
                        splits: pd.DataFrame | None = None,
@@ -699,23 +746,22 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         if dropped:
             log.debug('excluded %d non-financial-statement facts (proxy/8-K/etc.)', dropped)
 
-    # The share crosscheck (reported vs EPS-implied) breaks for tickers that
-    # split within the TTM window: the quarterly EPS decomposition crosses a
-    # split boundary, making the TTM EPS — and therefore the implied count —
-    # unreliable. BKNG's 25:1 (Apr 2026) produced a 2.65x ratio and lost its
-    # market cap; DELL's 1.8x (2018) landed at 1.39x, just outside the band.
-    _recent_split_tickers: set[str] = set()
-    if splits is not None and not splits.empty:
-        cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=400)
-        recent = splits[pd.to_datetime(splits['date']) >= cutoff]
-        _recent_split_tickers = set(recent['ticker'].unique())
+    _recent_split_tickers = recent_splitters(splits, as_of)
 
-    # Incremental mode: only recompute tickers with new filings.
+    # Incremental mode: only recompute tickers with new filings, or whose
+    # as-of-dependent inputs have expired (see _valid_until). Carrying a row
+    # past its expiry would let a backtest keep a share count the live screen
+    # had already discarded as stale.
+    as_of_ts = pd.Timestamp(as_of)
     carry = pd.DataFrame()
     if _prev_result is not None and _changed_tickers is not None:
         available = set(facts_all['ticker'].unique())
+        prev_valid = (_prev_result['valid_until'] if 'valid_until' in _prev_result
+                      else pd.Series(pd.Timestamp.min, index=_prev_result.index))
+        expired = set(prev_valid.index[prev_valid <= as_of_ts])
         recompute = {t for t in available
-                     if t in _changed_tickers or t not in _prev_result.index}
+                     if t in _changed_tickers or t in expired
+                     or t not in _prev_result.index}
         carry_idx = [t for t in available
                      if t not in recompute and t in _prev_result.index]
         if carry_idx:
@@ -856,6 +902,7 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
                           value_n_periods_ago(f, 'shares_diluted', 3, memo)),
                 3),
             'piotroski_f': pf_score,
+            'valid_until': _valid_until(f, memo, ticker, as_of_ts, splits),
             'last_filed': max(all_filed) if all_filed else pd.NaT,
             'last_period_end': max(all_pe) if all_pe else pd.NaT,
         })
@@ -937,12 +984,6 @@ def _safe_div(a, b):
     if not np.isfinite(a) or not np.isfinite(b) or b == 0:
         return np.nan
     return a / b
-
-
-def _nan_sum(*vals):
-    finite = [float(v) for v in vals
-              if v is not None and np.isfinite(_as_float(v))]
-    return sum(finite) if finite else np.nan
 
 
 def _as_float(v):

@@ -376,7 +376,8 @@ def prune_logs(older_than_days: int, max_append_mb: float = 5.0) -> int:
     for path in root.rglob('*.log'):
         try:
             st = path.stat()
-            if path.name in ('daily.log', 'web.log', 'scheduler.log'):
+            if (path.name in ('daily.log', 'web.log', 'scheduler.log')
+                    or path.name.startswith('launchd_')):
                 if st.st_size > max_append_mb * 1e6:
                     with open(path, 'rb') as fh:
                         fh.seek(-int(1e6), 2)

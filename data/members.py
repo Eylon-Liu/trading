@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -334,53 +334,6 @@ def nport_holdings(index_symbol: str, max_filings: int = 40) -> pd.DataFrame:
         log.info('%s N-PORT: %d holdings unmatched to a ticker', index_symbol, unmatched)
     if skipped_series:
         log.info('%s N-PORT: %d filings skipped (different series)', index_symbol, skipped_series)
-    return pd.DataFrame(rows)
-
-
-# ─────────────────────────────────────────────
-# SOURCE 3 — WIKIPEDIA CHANGES TABLE
-# ─────────────────────────────────────────────
-
-def membership_changes(index_symbol: str) -> pd.DataFrame:
-    """Add/remove events from the page's 'Selected changes' table."""
-    page = config.INDEX_WIKI_PAGE.get(index_symbol)
-    if not page:
-        return pd.DataFrame()
-
-    html = http.fetch_text(WIKI_REV, params={'title': page}, category='members')
-    if not html:
-        return pd.DataFrame()
-
-    soup = BeautifulSoup(html, 'lxml')
-    table = soup.find('table', {'id': 'changes'})
-    if table is None:
-        for t in soup.find_all('table', {'class': 'wikitable'}):
-            head = t.get_text(' ', strip=True)[:250].lower()
-            if 'added' in head and 'removed' in head:
-                table = t
-                break
-    if table is None:
-        return pd.DataFrame()
-
-    rows = []
-    for tr in table.find_all('tr')[2:]:          # two header rows
-        cells = [c.get_text(' ', strip=True) for c in tr.find_all('td')]
-        if len(cells) < 3:
-            continue
-        try:
-            eff = pd.to_datetime(cells[0], errors='coerce')
-        except Exception:
-            continue
-        if pd.isna(eff):
-            continue
-        added = normalize_ticker(cells[1]) if len(cells) > 1 else None
-        removed = normalize_ticker(cells[3]) if len(cells) > 3 else None
-        if added:
-            rows.append({'index_symbol': index_symbol, 'ticker': added,
-                         'effective': eff.date(), 'action': 'added'})
-        if removed:
-            rows.append({'index_symbol': index_symbol, 'ticker': removed,
-                         'effective': eff.date(), 'action': 'removed'})
     return pd.DataFrame(rows)
 
 

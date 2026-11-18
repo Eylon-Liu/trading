@@ -41,10 +41,6 @@ log = logging.getLogger(__name__)
 
 FINNHUB_PROFILE = 'https://finnhub.io/api/v1/stock/profile2'
 
-# Finnhub allows 60 calls/minute on the free tier; this is one call per ticker
-# and is only made for names SEC could not supply, so a run touches ~39.
-BATCH_PAUSE_EVERY = 55
-
 
 def available() -> bool:
     return bool(config.FINNHUB_API_KEY)

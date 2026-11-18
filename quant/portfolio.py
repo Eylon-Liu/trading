@@ -279,18 +279,6 @@ def summary(h: pd.DataFrame) -> dict:
             'positions': int(len(h)), 'unpriced': int(len(h) - len(priced))}
 
 
-def realized(since: date | None = None) -> pd.DataFrame:
-    """Closed lots with their realised P&L."""
-    c = lots('closed')
-    if c.empty:
-        return c
-    if since:
-        c = c[c['closed'].dt.date >= since]
-    c['pnl'] = (c['exit_price'] - c['cost_basis']) * c['shares']
-    c['pnl_pct'] = c['exit_price'] / c['cost_basis'] - 1
-    return c
-
-
 # ─────────────────────────────────────────────
 # ALERTS
 # ─────────────────────────────────────────────

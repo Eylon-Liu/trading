@@ -502,3 +502,18 @@ def test_report_ids_are_unique_per_build_not_per_file():
     src = inspect.getsource(RB.delete_report)
     assert 'COUNT(*)' in src and 'path' in src, \
         'delete_report must check whether the path is still referenced'
+
+
+def test_a_future_split_does_not_relax_a_historical_crosscheck():
+    """At a past date, a split that had not happened yet is not knowable."""
+    from datetime import date as _d
+
+    import pandas as pd
+
+    from quant import fundamentals as F
+    splits = pd.DataFrame({'ticker': ['PAST', 'FUTURE'],
+                           'date': ['2024-03-01', '2024-09-01'],
+                           'ratio': [2.0, 10.0]})
+    assert F.recent_splitters(splits, _d(2024, 6, 1)) == {'PAST'}
+    assert F.recent_splitters(splits, _d(2024, 12, 1)) == {'PAST', 'FUTURE'}
+    assert F.recent_splitters(None, _d(2024, 6, 1)) == set()

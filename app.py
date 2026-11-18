@@ -58,7 +58,7 @@ app = dash.Dash(
 server = app.server
 app.index_string = TH.INDEX_STRING
 app.layout = serve_layout
-AUTH_ENABLED = AUTH.install(server)
+AUTH.install(server)
 
 
 @server.route('/reports/<path:name>')

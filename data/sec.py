@@ -701,7 +701,7 @@ def insiders_asof(tickers: list[str], as_of: date | str,
 
     return db.read_sql(f"""
         SELECT ticker, filed, txn_date, insider, role, txn_code,
-               shares, price, value
+               shares, price, value, post_txn_shares
         FROM insider_txns
         WHERE ticker IN ({ph}) AND filed BETWEEN :lo AND :hi
         ORDER BY filed DESC

@@ -51,11 +51,14 @@ case "$MODE" in
     *) echo "usage: $0 {morning|evening}" >&2; exit 2 ;;
 esac
 
-echo "=== $(date '+%Y-%m-%d %H:%M:%S')  routine: $MODE  python: $PYTHON ===" \
-    | tee -a "$LOGFILE"
-"$PYTHON" cli.py "${ARGS[@]}" 2>&1 | tee -a "$LOGFILE"
+# Echo to the terminal only when run by hand. Under launchd stdout is the
+# launchd_*.log, and teeing there stored every routine's output twice.
+if [ -t 1 ]; then out() { tee -a "$LOGFILE"; }; else out() { cat >> "$LOGFILE"; }; fi
+
+echo "=== $(date '+%Y-%m-%d %H:%M:%S')  routine: $MODE  python: $PYTHON ===" | out
+"$PYTHON" cli.py "${ARGS[@]}" 2>&1 | out
 rc=${PIPESTATUS[0]}
-echo "=== exit $rc ===" | tee -a "$LOGFILE"
+echo "=== exit $rc ===" | out
 
 # Keep two weeks of logs.
 find "$LOG_DIR" -name 'routine_*.log' -mtime +14 -delete 2>/dev/null || true

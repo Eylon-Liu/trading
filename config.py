@@ -24,7 +24,6 @@ ROOT = Path(__file__).parent.resolve()
 DB_DIR = ROOT / 'db'
 CACHE_DIR = ROOT / 'cache'
 REPORT_DIR = ROOT / 'reports' / 'out'
-DATA_DIR = ROOT / 'data' / 'static'
 
 for _d in (DB_DIR, CACHE_DIR, REPORT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -230,8 +229,6 @@ TRADING_DAYS = {
     '1W': 5, '1M': 21, '3M': 63, '6M': 126,
     '1Y': 252, '2Y': 504, '3Y': 756, '5Y': 1260,
 }
-LOOKBACK_OPTIONS = ['1M', '3M', '6M', '1Y', '3Y', '5Y']
-REBALANCE_OPTIONS = {'M': 'Monthly', 'Q': 'Quarterly', 'SA': 'Semi-Annual', 'A': 'Annual'}
 
 
 # ─────────────────────────────────────────────
@@ -239,7 +236,6 @@ REBALANCE_OPTIONS = {'M': 'Monthly', 'Q': 'Quarterly', 'SA': 'Semi-Annual', 'A':
 # ─────────────────────────────────────────────
 
 BENCHMARK_TICKER = 'SPY'
-RISK_FREE_SERIES = 'DGS3MO'      # FRED 3-month T-bill
 RISK_FREE_RATE = 0.05             # annual fallback when no FRED T-bill data is stored
 # Largest share of a shortlist or backtest portfolio that one sector may
 # take. A ranking is sector-relative, but its very top can still be one
@@ -249,9 +245,6 @@ RISK_FREE_RATE = 0.05             # annual fallback when no FRED T-bill data is 
 MAX_SECTOR_SHARE = 0.30
 TRANSACTION_COST_BPS = 10.0      # one-way, per trade
 SLIPPAGE_BPS = 5.0
-DEFAULT_PORTFOLIO_SIZE = 20
-IC_HORIZONS = [1, 3, 6, 12]      # months, for IC-decay analysis
-QUINTILES = 5
 
 
 # ─────────────────────────────────────────────
@@ -280,16 +273,8 @@ EIGHTK_ITEMS = {
     '8.01': ('disclosure', 'Other events'),
 }
 
-# Form 4 transaction codes. P and S are the open-market ones that carry signal;
-# A/M/G are grants and option mechanics and are mostly noise.
-INSIDER_CODES = {
-    'P': ('buy', 'Open-market purchase'),
-    'S': ('sell', 'Open-market sale'),
-    'A': ('grant', 'Grant or award'),
-    'M': ('exercise', 'Option exercise'),
-    'G': ('gift', 'Gift'),
-    'F': ('tax', 'Shares withheld for tax'),
-}
+# Form 4 codes that carry signal: open-market purchases (P) and sales (S).
+# Grants, exercises, gifts and tax withholding (A/M/G/F) are compensation noise.
 INSIDER_SIGNAL_CODES = {'P', 'S'}
 
 
@@ -378,18 +363,6 @@ LLM_MAX_ARTICLES = int(os.environ.get('LLM_MAX_ARTICLES', '12'))
 # filing. 'auto' runs them whenever an LLM key is configured; 'off' disables.
 QUANT_LLM_REVIEWS = os.environ.get('QUANT_LLM_REVIEWS', 'auto')
 QUANT_LLM_MAX_REVIEWS = int(os.environ.get('QUANT_LLM_MAX_REVIEWS', '25'))
-
-
-def llm_available() -> bool:
-    """True when an implemented LLM backend is configured.
-
-    Both backends live in nlp/providers.py. A key for any other vendor is not
-    a substitute, so it is not accepted here — silently ignoring an unusable
-    key is how you end up debugging a panel that never renders.
-    """
-    if (LLM_PROVIDER or 'auto').strip().lower() == 'off':
-        return False
-    return bool(ANTHROPIC_API_KEY or GEMINI_API_KEY)
 
 
 # ─────────────────────────────────────────────

@@ -35,47 +35,22 @@ log = logging.getLogger(__name__)
 
 TD = config.TRADING_DAYS
 
+# Calendar days of bars read for price factors. The longest lookback is
+# MOM_12_1 / VOL_1Y at one year of sessions (253 bars); 500 calendar days is
+# ~345 sessions, which survives holidays and short halts. Live screens and
+# backtests slice the same window so their RSI/ATR smoothing starts at the
+# same point and the two paths produce the same number.
+PRICE_LOOKBACK_DAYS = 500
+
+# A provider snapshot older than this does not describe the company on the
+# as-of date (market cap moves daily), so it is ignored and the cap is
+# reconstructed from filed shares x the close instead.
+PROFILE_MAX_AGE_DAYS = 7
+
 
 # ─────────────────────────────────────────────
 # PRICE-BASED INDICATORS
 # ─────────────────────────────────────────────
-
-def wilder_rsi(prices: pd.Series, period: int = 14) -> float:
-    """
-    Wilder's RSI — exponential smoothing with alpha = 1/period.
-
-    A simple rolling mean (what the original used) reacts differently and does
-    not match any published RSI value.
-    """
-    s = prices.dropna()
-    if len(s) < period + 1:
-        return np.nan
-    delta = s.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
-    last_loss = loss.iloc[-1]
-    if last_loss == 0:
-        return 100.0
-    rs = gain.iloc[-1] / last_loss
-    val = 100.0 - (100.0 / (1.0 + rs))
-    return float(val) if np.isfinite(val) else np.nan
-
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series,
-        period: int = 14) -> float:
-    """Average True Range (Wilder) — the volatility unit for stops and sizing."""
-    df = pd.DataFrame({'h': high, 'l': low, 'c': close}).dropna()
-    if len(df) < period + 1:
-        return np.nan
-    prev_close = df['c'].shift(1)
-    tr = pd.concat([
-        df['h'] - df['l'],
-        (df['h'] - prev_close).abs(),
-        (df['l'] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    val = tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
-    return float(val) if np.isfinite(val) else np.nan
-
 
 def _ret(px: pd.DataFrame, lookback: int, skip: int = 0) -> pd.Series:
     """Total return over `lookback` sessions, ending `skip` sessions ago."""
@@ -94,8 +69,8 @@ def _vectorized_rsi(px: pd.DataFrame, period: int = 14) -> pd.Series:
     loss = (-delta).clip(lower=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - 100.0 / (1.0 + rs)
+    # A zero average loss gives rs = inf and RSI = 100; a flat series gives NaN.
+    rsi = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
     result = rsi.iloc[-1]
     result[px.count() < period + 1] = np.nan
     return result.replace([np.inf, -np.inf], np.nan)
@@ -164,18 +139,17 @@ def price_factors(tickers: list[str], as_of: date | str,
     as_of = pd.to_datetime(as_of).date()
     benchmark = benchmark or config.BENCHMARK_TICKER
 
+    start = as_of - timedelta(days=PRICE_LOOKBACK_DAYS)
     if _bt_ohlc is not None:
         adj_c, adj_h, adj_l, _raw_c = _bt_ohlc
-        cutoff = pd.Timestamp(as_of)
-        px = adj_c.loc[:cutoff].copy()
-        high = adj_h.loc[:cutoff].copy()
-        low = adj_l.loc[:cutoff].copy()
+        window = slice(pd.Timestamp(start), pd.Timestamp(as_of))
+        avail = adj_c.columns.intersection(sorted(set(tickers) | {benchmark}))
+        # Label slicing plus column selection already returns new frames.
+        px = adj_c.loc[window, avail]
+        high = adj_h.loc[window, adj_h.columns.intersection(avail)]
+        low = adj_l.loc[window, adj_l.columns.intersection(avail)]
         adj_close = px
-        needed = sorted(set(tickers) | {benchmark})
-        avail = px.columns.intersection(needed)
-        px, high, low, adj_close = px[avail], high[avail], low[avail], adj_close[avail]
     else:
-        start = as_of - timedelta(days=int(TD['3Y'] * 1.6))
         universe = sorted(set(tickers) | {benchmark})
         px, high, low, adj_close = yahoo.price_and_ohlc(universe, start=start,
                                                          end=as_of)
@@ -296,6 +270,9 @@ def fundamental_factors(tickers: list[str], as_of: date | str,
         return pd.DataFrame()
 
     prof = yahoo.profile_asof(tickers, as_of)
+    if not prof.empty and 'snapshot_date' in prof:
+        age = (pd.Timestamp(as_of) - pd.to_datetime(prof['snapshot_date'])).dt.days
+        prof = prof[age <= PROFILE_MAX_AGE_DAYS]
 
     mcap = pd.Series(np.nan, index=fund.index, dtype=float)
     mcap_source = pd.Series('none', index=fund.index)
@@ -497,8 +474,9 @@ def alt_factors(tickers: list[str], as_of: date | str,
 
             signal['buy_val'] = np.where(signal['shares'] > 0,
                                          signal['value'].fillna(0), 0.0)
-            signal['sell_val'] = np.where(signal['shares'] < 0,
+            signal['sell_raw'] = np.where(signal['shares'] < 0,
                                           signal['value'].fillna(0), 0.0)
+            signal['sell_val'] = signal['sell_raw']
 
             # Weight sells by % of holdings: a director selling 3% of their
             # position is routine diversification; a CEO selling 40% is a
@@ -507,13 +485,16 @@ def alt_factors(tickers: list[str], as_of: date | str,
             if 'post_txn_shares' in signal.columns:
                 signal['sell_conviction'] = signal.apply(
                     _sell_conviction_weight, axis=1)
-                signal['sell_val'] = signal['sell_val'] * signal['sell_conviction']
+                signal['sell_val'] = signal['sell_raw'] * signal['sell_conviction']
 
             agg = signal.groupby('ticker').agg(
                 buy=('buy_val', 'sum'), sell=('sell_val', 'sum'),
+                sell_raw=('sell_raw', 'sum'),
                 n_buyers=('insider', lambda s: s[signal.loc[s.index, 'shares'] > 0].nunique()),
             )
-            total = agg['buy'] + agg['sell']
+            # Unweighted denominator: with the weighted one, any sell-only name
+            # came out at exactly -1 whatever its conviction weight.
+            total = agg['buy'] + agg['sell_raw']
             out['INSIDER_NET_BUY'] = ((agg['buy'] - agg['sell'])
                                       / total.replace(0, np.nan)).reindex(out.index)
             # Several distinct insiders buying at once is the stronger form.
@@ -594,13 +575,18 @@ def attention_zscore(views: pd.DataFrame, recent_days: int = 14,
 
 def _read_attention(tickers: list[str], as_of: date,
                     lookback_days: int = 400) -> pd.DataFrame:
-    """I/O only: pageview rows in the window ending at `as_of`."""
+    """
+    I/O only: pageview rows in the window ending the day *before* `as_of`.
+
+    A day's pageview count is published after that day ends, so the as-of
+    day's own figure was not yet knowable at its close.
+    """
     if not tickers:
         return pd.DataFrame()
     ph = ','.join(f':t{i}' for i in range(len(tickers)))
     params: dict = {f't{i}': t for i, t in enumerate(tickers)}
     params.update({'lo': str(as_of - timedelta(days=lookback_days)),
-                   'hi': str(as_of)})
+                   'hi': str(as_of - timedelta(days=1))})
     return db.read_sql(
         f'SELECT ticker, date, wiki_views FROM attention '
         f'WHERE ticker IN ({ph}) AND date BETWEEN :lo AND :hi',

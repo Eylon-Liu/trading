@@ -43,6 +43,7 @@ from quant import engine as EN
 from quant import factorcache
 from quant import strategies as ST
 from quant import tradeplan as TP
+from quant.factors import PRICE_LOOKBACK_DAYS
 from quant.fundamentals import adjust_shares_for_splits
 
 log = logging.getLogger(__name__)
@@ -160,7 +161,7 @@ def _preload(spec: UniverseSpec, start: date, end: date,
     splits = yahoo.split_factors(names) if names else pd.DataFrame()
     if not facts.empty:
         facts = adjust_shares_for_splits(facts, splits)
-    lookback = int(config.TRADING_DAYS['3Y'] * 1.6)
+    lookback = PRICE_LOOKBACK_DAYS
     # The benchmark rides along: BETA, IDIO_VOL and EARNINGS_REACTION are all
     # measured against it. Loading only the universe left those factors empty
     # in every backtest — silently, for the mid-term path, which never ran
@@ -433,140 +434,6 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
         holdings=pd.DataFrame(holdings_log), trades=pd.DataFrame(trades),
         metrics=metrics, rebalance_dates=[d.date() for d in dates],
         ic_series=ic_series)
-
-
-# ─────────────────────────────────────────────
-# BUY AND HOLD  (concentrated, no rebalance)
-# ─────────────────────────────────────────────
-
-def run_buy_and_hold(spec: UniverseSpec, strategy_key, start: date | str,
-                     end: date | str | None = None, n_holdings: int = 3,
-                     cost_bps: float | None = None,
-                     initial_cash: float = 10_000.0,
-                     strict: bool = True) -> BacktestResult:
-    """
-    Score once, buy the top `n_holdings` with equal cash, never touch them again.
-
-    This asks a different question from `run_backtest`. A quarterly rebalance
-    measures the *ranking rule* — it keeps re-picking, so a bad name is only
-    ever held for one period. Buying three names and holding for a decade
-    measures the *picks*: whether the businesses this screen put at the top
-    were actually worth owning. That is the question a long-horizon screen
-    claims to answer, and a rebalance quietly hides the answer by continually
-    correcting itself.
-
-    Weights are equal in *dollars at entry* and then left to drift, which is
-    what a real buy-and-hold portfolio does — a winner becoming an outsized
-    share of the portfolio is a result, not an error to be corrected.
-
-    Scored at `start`; bought at the close of the next session. Costs are
-    charged once, on entry. A pick with no price on the entry day is dropped
-    and its cash shared among the rest — it used to be bought with NaN shares
-    and its slice of the starting cash silently disappeared.
-    """
-    start = pd.to_datetime(start).date()
-    end = pd.to_datetime(end or date.today()).date()
-    cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
-    entry_cost = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
-
-    _require_honest_window(spec, strategy_key, start, strict)
-
-    result = EN.run(spec, strategy_key, as_of=start, top_n=n_holdings,
-                    persist=False)
-    if result.scores.empty:
-        raise ValueError(f'{strategy_key} produced no picks at {start}')
-    if result.degraded:
-        raise DegradedBacktest(
-            f'{ST.get(strategy_key).key} cannot be honestly backtested at '
-            f'{start}: ' + '; '.join(result.warnings))
-
-    picks = result.scores.head(n_holdings)
-    px = yahoo.price_history(list(picks.index), start=start + timedelta(days=1),
-                             end=end, field='adj_close')
-    if px.empty:
-        raise ValueError(f'no price history for {list(picks.index)}')
-    px = px.ffill()
-    entry_row = px.iloc[0]
-    px = px.loc[:, entry_row.notna() & (entry_row > 0)]
-    if px.empty:
-        raise ValueError('no usable price history for the picks')
-
-    # Equal cash per name, so the share count differs and the weights drift.
-    cash_each = initial_cash / len(px.columns)
-    shares = (cash_each * (1.0 - entry_cost)) / px.iloc[0]
-    values = px.mul(shares, axis=1)
-    eq = values.sum(axis=1)
-    eq.name = 'strategy'
-
-    bench = _benchmark_curve(eq.index[0].date(), end, eq.index)
-    if not bench.empty:
-        bench = bench / bench.iloc[0] * initial_cash
-
-    metrics = compute_metrics(eq, bench, rf=_risk_free(start, end))
-    metrics.update({
-        'initial_cash': initial_cash,
-        'final_cash': float(eq.iloc[-1]),
-        'final_cash_benchmark': float(bench.iloc[-1]) if not bench.empty else np.nan,
-        'n_holdings': int(len(px.columns)),
-        'turnover': 0.0,
-        'n_rebalances': 0,
-    })
-
-    entry, exit_ = px.iloc[0], px.iloc[-1]
-    holdings = pd.DataFrame({
-        'ticker': px.columns,
-        'entry_price': entry.values,
-        'exit_price': exit_.values,
-        'shares': shares.values,
-        'cash_in': cash_each * (1.0 - entry_cost),
-        'cash_out': values.iloc[-1].values,
-        'total_return': (exit_ / entry - 1.0).values,
-    }).sort_values('total_return', ascending=False).reset_index(drop=True)
-
-    return BacktestResult(
-        equity=eq, benchmark=bench, holdings=holdings,
-        trades=pd.DataFrame(), metrics=metrics,
-        rebalance_dates=[start])
-
-
-def compare_buy_and_hold(spec: UniverseSpec, strategy_keys: list,
-                         start: date | str, end: date | str | None = None,
-                         n_holdings: int = 3,
-                         initial_cash: float = 10_000.0) -> pd.DataFrame:
-    """
-    Terminal cash per strategy from one concentrated buy-and-hold, side by side.
-
-    The headline column is `final_cash`: what the same starting cash became.
-    `picks` is carried through because with three names the answer is driven by
-    which three, and an average hides that.
-    """
-    rows = []
-    for key in strategy_keys:
-        name = key if isinstance(key, str) else getattr(key, 'key', str(key))
-        try:
-            r = run_buy_and_hold(spec, key, start, end, n_holdings=n_holdings,
-                                 initial_cash=initial_cash)
-        except DegradedBacktest as exc:
-            log.warning('%s not backtestable at %s: %s', name, start, exc)
-            rows.append({'strategy': name, 'error': 'INSUFFICIENT DATA',
-                         'detail': str(exc)[:160]})
-            continue
-        except Exception as exc:                   # noqa: BLE001
-            log.warning('buy-and-hold failed for %s: %s', name, exc)
-            rows.append({'strategy': name, 'error': str(exc)[:80]})
-            continue
-        m = r.metrics
-        rows.append({
-            'strategy': name,
-            'final_cash': m.get('final_cash'),
-            'benchmark_cash': m.get('final_cash_benchmark'),
-            'total_return': m.get('total_return'),
-            'cagr': m.get('cagr'),
-            'sharpe': m.get('sharpe'),
-            'max_drawdown': m.get('max_drawdown'),
-            'picks': ', '.join(r.holdings['ticker']),
-        })
-    return pd.DataFrame(rows)
 
 
 # ─────────────────────────────────────────────

@@ -82,15 +82,6 @@ def score(g, strategy):
     return scores.dropna(subset=['composite']).sort_values('composite', ascending=False)
 
 
-def picks_by_date(df, strategy, n=20):
-    """{date: [tickers]} — the top n names of the strategy at each date."""
-    out = {}
-    for d, g in df.groupby('date'):
-        sc = score(g, strategy)
-        out[d] = list(sc.index[:n])
-    return out
-
-
 def portfolio_stats(df, picks, horizons=(3, 6), weight=None):
     """
     Forward return of holding each date's picks for h months, vs SPY and vs

@@ -243,13 +243,6 @@ PRESETS: dict[str, UniverseSpec] = {
 }
 
 
-def resolve_preset(name: str, as_of: date | str | None = None) -> list[str]:
-    spec = PRESETS.get(name.lower())
-    if spec is None:
-        raise KeyError(f'unknown preset {name!r}; have {sorted(PRESETS)}')
-    return spec.resolve(as_of)
-
-
 def parse_spec(expr: str) -> UniverseSpec:
     """
     Build a spec from a compact CLI expression.
@@ -324,16 +317,3 @@ def _parse_number(val: str) -> float | None:
         return float(v) * mult
     except ValueError:
         return None
-
-
-def sector_breakdown(tickers: list[str]) -> pd.DataFrame:
-    """Sector counts for a resolved universe."""
-    if not tickers:
-        return pd.DataFrame(columns=['sector', 'count'])
-    ph = ','.join(f':t{i}' for i in range(len(tickers)))
-    params = {f't{i}': t for i, t in enumerate(tickers)}
-    df = db.read_sql(
-        f'SELECT COALESCE(sector, \'Unknown\') AS sector, COUNT(*) AS count '
-        f'FROM securities WHERE ticker IN ({ph}) GROUP BY sector '
-        f'ORDER BY count DESC', params)
-    return df

@@ -44,7 +44,9 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # builds, so a stale one could be served to either path.
 # 13: backtest-built frames included names outside the universe of their
 # date (future index members, with fundamentals only).
-CODE_VERSION = 13
+# 14: share crosscheck no longer relaxed by splits after as_of; INSIDER_NET_BUY
+# conviction weighting now separates sell-only names.
+CODE_VERSION = 14
 
 # Entries are self-invalidating via the data version, so this only bounds
 # unbounded growth from many one-off as-of dates.

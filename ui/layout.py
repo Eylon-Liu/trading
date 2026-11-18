@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dash_bootstrap_components as dbc
-from dash import dcc, html
+from dash import html
 
 from ui import components as C
 from ui import theme as TH

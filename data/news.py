@@ -399,30 +399,6 @@ def news_asof(tickers: list[str], as_of: date | str,
     """, params, parse_dates=['published'])
 
 
-def sentiment_scores(tickers: list[str], as_of: date | str,
-                     lookback_days: int = 14) -> pd.DataFrame:
-    """Per-ticker aggregate sentiment and coverage volume."""
-    df = news_asof(tickers, as_of, lookback_days)
-    if df.empty:
-        return pd.DataFrame()
-
-    agg = df.groupby('ticker').agg(
-        news_sentiment=('sentiment', 'mean'),
-        news_count=('sentiment', 'size'),
-        news_sentiment_std=('sentiment', 'std'),
-    )
-    # Weight recent coverage more heavily than three-week-old coverage.
-    weighted = {}
-    ref = pd.to_datetime(as_of)
-    for t, grp in df.groupby('ticker'):
-        age_days = (ref - grp['published']).dt.total_seconds() / 86400.0
-        w = 0.5 ** (age_days / 7.0)            # one-week half-life
-        if w.sum() > 0:
-            weighted[t] = float((grp['sentiment'] * w).sum() / w.sum())
-    agg['news_sentiment_weighted'] = pd.Series(weighted)
-    return agg
-
-
 def direction_summary(ticker: str, as_of: date | str,
                       lookback_days: int = 30) -> dict:
     """

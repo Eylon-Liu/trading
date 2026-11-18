@@ -715,10 +715,6 @@ PORTFOLIO RISK
 # HELPERS
 # ─────────────────────────────────────────────
 
-def doc_for(factor: str) -> FactorDoc | None:
-    return FACTOR_DOCS.get(factor)
-
-
 def by_family() -> dict[str, list[FactorDoc]]:
     out: dict[str, list[FactorDoc]] = {}
     for d in FACTOR_DOCS.values():

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -162,8 +162,9 @@ def test_close_uses_last_close_and_realises(book):
     PF.add_lot('AAA', 10, 100)
     assert PF.close('AAA', closed='2026-11-06') == 1
     assert PF.holdings(date(2026, 11, 6)).empty
-    r = PF.realized()
-    assert r['pnl'].iloc[0] == pytest.approx(200)
+    c = PF.lots('closed')
+    assert (c['exit_price'].iloc[0] - c['cost_basis'].iloc[0]) * c['shares'].iloc[0] \
+        == pytest.approx(200)
 
 
 def test_watchlist_merges_env(book, monkeypatch):

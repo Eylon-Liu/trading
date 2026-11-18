@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import pandas as pd
 import pytest
 
 from data import news as NEWS
@@ -180,3 +179,26 @@ def test_is_about_recognises_names_brands_and_symbols():
     assert NEWS.is_about('T', 'AT&T Inc.', 'AT&T adds subscribers', '')
     assert not NEWS.is_about('PFE', 'Pfizer Inc', 'Arbutus Reports Third Quarter Results', '')
     assert NEWS.is_about('ZZZ', None, 'anything', '')     # no name on file: cannot judge
+
+
+def test_attention_fetches_only_from_the_last_stored_day(fresh_db, monkeypatch):
+    """Re-downloading 400 days for every ticker each night rewrote ~200k rows."""
+    from datetime import date
+
+    from data import altdata as ALT
+
+    fresh_db.upsert(fresh_db.securities, [{'ticker': 'AAPL', 'name': 'Apple Inc.'},
+                                          {'ticker': 'NEW', 'name': 'New Co'}])
+    last = date.today() - timedelta(days=10)
+    fresh_db.upsert(fresh_db.attention, [{'ticker': 'AAPL', 'date': last, 'wiki_views': 1.0}])
+    asked = {}
+
+    def fake_fetch(ticker, article, start, end):
+        asked[ticker] = start
+        return []
+    monkeypatch.setattr(ALT, '_fetch_views', fake_fetch)
+    monkeypatch.setattr(ALT, '_article_for', lambda t, name: f'{t}_article')
+
+    ALT.update_attention(['AAPL', 'NEW'], days_back=400, overlap_days=3)
+    assert asked['AAPL'] == last - timedelta(days=3)
+    assert asked['NEW'] == date.today() - timedelta(days=401)

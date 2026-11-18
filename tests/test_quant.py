@@ -19,15 +19,19 @@ from quant import tradeplan as TP
 # INDICATORS
 # ─────────────────────────────────────────────
 
+def _rsi(prices: pd.Series, period: int = 14) -> float:
+    return float(FA._vectorized_rsi(prices.to_frame('X'), period)['X'])
+
+
 def test_wilder_rsi_all_gains_is_100():
     prices = pd.Series(np.arange(1, 40, dtype=float))
-    assert FA.wilder_rsi(prices) == pytest.approx(100.0)
+    assert _rsi(prices) == pytest.approx(100.0)
 
 
 def test_wilder_rsi_bounded_and_midrange_on_noise():
     rng = np.random.RandomState(7)
     prices = pd.Series(100 + np.cumsum(rng.randn(200)))
-    rsi = FA.wilder_rsi(prices)
+    rsi = _rsi(prices)
     assert 0 <= rsi <= 100
     assert 20 < rsi < 80
 
@@ -40,7 +44,7 @@ def test_wilder_rsi_differs_from_simple_moving_average_version():
     rng = np.random.RandomState(3)
     prices = pd.Series(100 + np.cumsum(rng.randn(120)))
 
-    wilder = FA.wilder_rsi(prices, period=14)
+    wilder = _rsi(prices, period=14)
 
     delta = prices.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
@@ -50,14 +54,17 @@ def test_wilder_rsi_differs_from_simple_moving_average_version():
     assert abs(wilder - simple) > 0.5, 'the two smoothings must not coincide'
 
 
+def test_rsi_needs_enough_bars():
+    assert np.isnan(_rsi(pd.Series(np.arange(1, 10, dtype=float))))
+
+
 def test_atr_is_positive_and_scales_with_range():
     n = 60
     idx = pd.date_range('2024-01-01', periods=n, freq='B')
-    close = pd.Series(np.full(n, 100.0), index=idx)
-    tight = TP  # noqa: F841  (keeps import used if ATR moves)
+    close = pd.DataFrame({'X': np.full(n, 100.0)}, index=idx)
 
-    narrow = FA.atr(close + 0.5, close - 0.5, close)
-    wide = FA.atr(close + 5.0, close - 5.0, close)
+    narrow = FA._vectorized_atr(close + 0.5, close - 0.5, close)['X']
+    wide = FA._vectorized_atr(close + 5.0, close - 5.0, close)['X']
     assert narrow > 0 and wide > narrow * 5
 
 
@@ -706,3 +713,22 @@ def test_sell_conviction_100pct_disposal():
     from quant.factors import _sell_conviction_weight
     row = pd.Series({'shares': -1000, 'post_txn_shares': 0})
     assert _sell_conviction_weight(row) == pytest.approx(1.0)
+
+
+def test_sell_conviction_separates_sell_only_names(fresh_db):
+    """A 2% trim and a 50% disposal used to both score exactly -1."""
+    d = pd.Timestamp('2026-06-01')
+    row = {'filed': d, 'txn_date': d, 'role': 'Officer', 'txn_code': 'S', 'price': 100.0}
+    ins = pd.DataFrame([
+        {**row, 'ticker': 'TRIM', 'insider': 'A', 'shares': -20, 'value': 2_000.0,
+         'post_txn_shares': 980},
+        {**row, 'ticker': 'DUMP', 'insider': 'B', 'shares': -500, 'value': 50_000.0,
+         'post_txn_shares': 500},
+    ])
+    no_events = pd.DataFrame({'ticker': pd.Series(dtype=str),
+                              'filed': pd.Series(dtype='datetime64[ns]'),
+                              'category': pd.Series(dtype=str)})
+    out = FA.alt_factors(['TRIM', 'DUMP'], date(2026, 6, 5),
+                         _bt_insiders=ins, _bt_events=no_events)
+    assert out.loc['DUMP', 'INSIDER_NET_BUY'] == pytest.approx(-1.0)
+    assert out.loc['TRIM', 'INSIDER_NET_BUY'] == pytest.approx(-0.15)

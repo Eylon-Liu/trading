@@ -242,24 +242,6 @@ def drawdown_chart(equity: pd.Series, title: str = '') -> go.Figure:
     return fig
 
 
-def heatmap(matrix: pd.DataFrame, title: str = '') -> go.Figure:
-    if matrix is None or matrix.empty:
-        return go.Figure(TH.empty_figure('Not enough data for a matrix.'))
-    fig = go.Figure(go.Heatmap(
-        z=matrix.values, x=list(matrix.columns), y=list(matrix.index),
-        colorscale=[[0, TH.NEG], [0.5, '#1a1d2e'], [1, TH.ACCENT]],
-        zmid=0, zmin=-1, zmax=1,
-        hovertemplate='%{y} vs %{x}<br>corr %{z:.2f}<extra></extra>',
-        colorbar={'thickness': 10, 'tickfont': {'size': 9}}))
-    n = len(matrix)
-    fig.update_layout(**TH.plot_layout(
-        title, height=max(320, 22 * n + 130),
-        xaxis={'tickangle': -45, 'tickfont': {'size': 9}, 'showgrid': False},
-        yaxis={'tickfont': {'size': 9}, 'showgrid': False},
-        margin={'l': 160, 'r': 30, 't': 44, 'b': 150}))
-    return fig
-
-
 def loading(children, component_id: str):
     return dcc.Loading(children, id=component_id, type='circle',
                        color=TH.ACCENT)

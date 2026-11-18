@@ -94,7 +94,8 @@ class Strategy:
 
     @property
     def needs_trade_plan(self) -> bool:
-        return HORIZONS[self.horizon]['needs_trade_plan']
+        # An avoid list ranks what not to own; a long entry plan would buy it.
+        return HORIZONS[self.horizon]['needs_trade_plan'] and not self.invert
 
 
 # ─────────────────────────────────────────────
