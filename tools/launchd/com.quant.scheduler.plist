@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quant.scheduler</string>
+
+    <!-- A five-minute tick, not a clock time. launchd only knows this Mac's
+         local zone, while the routine's times are New York times
+         (QUANT_TZ, QUANT_MORNING_TIME, QUANT_EVENING_TIME). Each tick runs the
+         scheduler once (daily_routine.sh tick), which decides in QUANT_TZ, DST included,
+         whether the morning email or the evening preparation is due, runs it
+         once per day, and catches up a run missed while the Mac slept.
+         launchd never starts a tick while the previous one is still running.
+
+         __ROOT__ and __PATH__ are filled in by `tools/setup_schedule.sh
+         install`; do not copy this file into LaunchAgents by hand. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__ROOT__/tools/daily_routine.sh</string>
+        <string>tick</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>__ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__ROOT__/logs/launchd_scheduler.log</string>
+    <key>StandardErrorPath</key>
+    <string>__ROOT__/logs/launchd_scheduler.log</string>
+</dict>
+</plist>

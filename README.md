@@ -322,16 +322,21 @@ python3 cli.py daily                             # do it
 macOS (launchd — fills in this checkout's paths for you):
 
 ```bash
-bash tools/setup_schedule.sh install   # 07:00 daily email; 18:30 Mon–Fri prep + backup
+bash tools/setup_schedule.sh install   # 08:45 ET daily email; 18:30 ET Mon–Fri prep + backup
 bash tools/setup_schedule.sh test      # dry run
 ```
 
-Linux, or cron anywhere — `bash tools/setup_schedule.sh cron` prints these
+Times are New York time (`QUANT_TZ`, `QUANT_MORNING_TIME`, `QUANT_EVENING_TIME`),
+whatever zone the machine is in. 08:45 ET is after most pre-market earnings
+releases and before the 09:30 open, and the morning run pulls that morning's
+8-Ks. launchd and cron only know local time, so they run a five-minute tick and
+`cli.py scheduler --once` decides what is due; that also gets DST right.
+
+Linux, or cron anywhere — `bash tools/setup_schedule.sh cron` prints this
 with your paths filled in:
 
 ```cron
-0 7 * * *     cd /path/to/trading && python3 cli.py daily >> logs/daily.log 2>&1
-30 18 * * 1-5 cd /path/to/trading && python3 cli.py daily --mode full --no-email --backup >> logs/daily.log 2>&1
+*/5 * * * *   cd /path/to/trading && python3 cli.py scheduler --once >> logs/launchd_scheduler.log 2>&1
 0 8 1 * *     cd /path/to/trading && python3 cli.py report --kind monthly --email you@example.com
 ```
 

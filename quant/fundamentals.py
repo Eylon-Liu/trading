@@ -531,6 +531,44 @@ def value_n_periods_ago(facts: pd.DataFrame, concept: str, years: int,
     return float(prior.iloc[-1]['val']) if not prior.empty else np.nan
 
 
+# Quarters of year-over-year changes used to scale the latest surprise.
+SUE_WINDOW = 8
+SUE_MIN_CHANGES = 4
+
+
+def earnings_surprise(facts: pd.DataFrame, memo: dict | None = None
+                      ) -> tuple[float, pd.Timestamp | None]:
+    """
+    Standardized unexpected earnings (SUE) for the latest quarter, and the
+    date that quarter's figures were filed.
+
+    Expectation is a seasonal random walk (the same quarter a year earlier),
+    so the surprise is the year-over-year change, scaled by the volatility of
+    the previous such changes (Foster, Olsen & Shevlin 1984; Bernard & Thomas
+    1989). It needs no analyst estimates, so it is point-in-time from filed
+    XBRL at any date.
+
+    Net income rather than EPS: a Q4 EPS derived by differencing cumulative
+    figures straddles share-count changes and is noisier than the income.
+
+    The date is the 10-Q/10-K filing, which can trail the press release by
+    weeks; using it can only make the signal later, never earlier.
+    """
+    q = quarterly_flows(facts, 'net_income', memo)
+    if q.empty or len(q) < 4 + SUE_MIN_CHANGES:
+        return np.nan, None
+    vals = q['val'].to_numpy(dtype=float)
+    changes = vals[4:] - vals[:-4]
+    recent = changes[-SUE_WINDOW:]
+    recent = recent[np.isfinite(recent)]
+    if len(recent) < SUE_MIN_CHANGES or not np.isfinite(changes[-1]):
+        return np.nan, None
+    sd = float(np.std(recent[:-1], ddof=1))
+    if not np.isfinite(sd) or sd <= 0:
+        return np.nan, None
+    return float(changes[-1] / sd), pd.Timestamp(q['filed'].iloc[-1])
+
+
 # Book equity below this share of assets makes any equity-denominated ratio
 # meaningless rather than merely large.
 MIN_EQUITY_TO_ASSETS = 0.01
@@ -851,6 +889,8 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         ]
         pf_score = float(sum(1 for t in pf_tests if t is True or t is np.True_))
 
+        sue, last_q_filed = earnings_surprise(f, memo)
+
         tag_audit = memo.get(_TAG_AUDIT_KEY, {})
         rev_tag = tag_audit.get('revenue', '')
         ni_tag = tag_audit.get('net_income', '')
@@ -902,6 +942,8 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
                           value_n_periods_ago(f, 'shares_diluted', 3, memo)),
                 3),
             'piotroski_f': pf_score,
+            'earnings_surprise': sue,
+            'last_quarter_filed': last_q_filed if last_q_filed is not None else pd.NaT,
             'valid_until': _valid_until(f, memo, ticker, as_of_ts, splits),
             'last_filed': max(all_filed) if all_filed else pd.NaT,
             'last_period_end': max(all_pe) if all_pe else pd.NaT,

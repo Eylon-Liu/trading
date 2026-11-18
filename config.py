@@ -418,7 +418,9 @@ RETENTION = {
 
 # Built-in scheduler (`python cli.py scheduler`, used by the Docker setup).
 QUANT_TZ = (os.environ.get('QUANT_TZ') or 'America/New_York').strip()
-QUANT_MORNING_TIME = (os.environ.get('QUANT_MORNING_TIME') or '07:00').strip()
+# 08:45 New York: after most pre-market earnings releases (≈06:00–08:00 ET)
+# and before the 09:30 open, which is when mid-term market orders fill.
+QUANT_MORNING_TIME = (os.environ.get('QUANT_MORNING_TIME') or '08:45').strip()
 QUANT_EVENING_TIME = (os.environ.get('QUANT_EVENING_TIME') or '18:30').strip()
 
 # Names you hold or are watching. They lead the daily brief and the weekend

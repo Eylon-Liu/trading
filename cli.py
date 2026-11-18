@@ -452,12 +452,7 @@ def _daily(args) -> int:
               f'nothing to do (pass --resend to send again).')
         return 0
 
-    if kind == 'news':
-        sources = ['news', 'policy', 'earnings']
-    elif args.mode == 'full':
-        sources = None                          # every source
-    else:
-        sources = ['prices', 'news', 'policy', 'macro', 'earnings']
+    sources = _daily_sources(kind, args.mode)
 
     if args.dry_run:
         print(f'  dry run: would ingest {sources or "all sources"}, '
@@ -1031,6 +1026,21 @@ def cmd_set_password(args) -> int:
     return 0
 
 
+def _daily_sources(kind: str, mode: str) -> list[str] | None:
+    """
+    What `daily` ingests before building. None means every source.
+
+    `filings` is in the morning set because most pre-market earnings releases
+    (8-K item 2.02) land between 06:00 and 08:00 ET — after the evening run —
+    and the brief should know which names reported this morning.
+    """
+    if kind == 'news':
+        return ['news', 'policy', 'earnings', 'filings']
+    if mode == 'full':
+        return None
+    return ['prices', 'news', 'policy', 'macro', 'earnings', 'filings']
+
+
 # Morning runs every day (the calendar picks brief vs. digest); the evening
 # preparation run only on weekdays.
 SCHEDULE = (
@@ -1046,8 +1056,8 @@ def scheduled_runs(now, tz_name: str | None = None, last_done: dict | None = Non
     Pure: the runs due at `now` (a list of names) and the next fire time.
 
     A run whose time passed less than CATCH_UP_HOURS ago and that has not
-    run that day is due — so a server restarted at 07:20 still sends the
-    7:00 email. `last_done` maps run name -> ISO date it last ran.
+    run that day is due — so a machine woken at 09:10 still sends the
+    08:45 email. `last_done` maps run name -> ISO date it last ran.
     """
     from datetime import datetime as _dt, time as _time, timedelta as _td
     from zoneinfo import ZoneInfo
@@ -1090,8 +1100,9 @@ def cmd_scheduler(args) -> int:
     except (OSError, ValueError):
         state = {}
     commands = {name: run_args for name, _a, _d, run_args in SCHEDULE}
-    print(f'▸ scheduler: morning {config.QUANT_MORNING_TIME} daily, evening '
-          f'{config.QUANT_EVENING_TIME} Mon–Fri ({config.QUANT_TZ})', flush=True)
+    if not args.once:                  # a launchd tick every 5 min stays quiet
+        print(f'▸ scheduler: morning {config.QUANT_MORNING_TIME} daily, evening '
+              f'{config.QUANT_EVENING_TIME} Mon–Fri ({config.QUANT_TZ})', flush=True)
     while True:
         now = _dt.now(_tz.utc)
         due, nxt = scheduled_runs(now, last_done=state)

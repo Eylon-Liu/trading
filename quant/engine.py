@@ -209,7 +209,8 @@ def _apply_size_filters(raw: pd.DataFrame, spec: UniverseSpec) -> pd.DataFrame:
     return raw[keep]
 
 
-FILTER_KEYS = frozenset({'min_above_ma200', 'rsi_max', 'rsi_min', 'min_market_cap'})
+FILTER_KEYS = frozenset({'min_above_ma200', 'rsi_max', 'rsi_min', 'min_market_cap',
+                         'require_earnings_reaction', 'min_insider_buyers'})
 
 
 def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
@@ -230,8 +231,22 @@ def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
     if f.get('min_market_cap') and 'MARKET_CAP' in raw:
         mcap = pd.to_numeric(raw['MARKET_CAP'], errors='coerce')
         keep &= mcap.isna() | (mcap >= f['min_market_cap'])
+    if f.get('require_earnings_reaction'):
+        # Inside the drift window means a results 8-K in the last 63 days,
+        # which is exactly when EARNINGS_REACTION exists.
+        keep &= _col(raw, 'EARNINGS_REACTION').notna()
+    if f.get('min_insider_buyers'):
+        # Distinct open-market buyers in the window; no insider data is zero.
+        keep &= _col(raw, 'INSIDER_CLUSTER').fillna(0) >= f['min_insider_buyers']
 
     return raw.index[keep]
+
+
+def _col(raw: pd.DataFrame, name: str) -> pd.Series:
+    """A numeric column, or all-NaN when the factor is absent."""
+    if name not in raw:
+        return pd.Series(np.nan, index=raw.index, dtype=float)
+    return pd.to_numeric(raw[name], errors='coerce')
 
 
 # ─────────────────────────────────────────────

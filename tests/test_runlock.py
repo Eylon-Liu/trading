@@ -32,7 +32,7 @@ def test_free_lock_has_no_holder(lockdir):
 
 
 def test_another_process_sees_the_holder_and_waits(lockdir):
-    # A real second process, like the 7:00 job versus a Control-tab button.
+    # A real second process, like the morning job versus a Control-tab button.
     code = textwrap.dedent(f'''
         import sys, time
         sys.path.insert(0, {str(config.ROOT)!r})

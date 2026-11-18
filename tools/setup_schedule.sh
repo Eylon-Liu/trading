@@ -11,10 +11,15 @@
 #   bash tools/setup_schedule.sh install-web    # macOS: keep the web UI running (phone access)
 #   bash tools/setup_schedule.sh uninstall-web
 #
-# Schedule:
-#   07:00 every day       one email — full brief on trading days, a news-only
+# Schedule (New York time — QUANT_TZ, QUANT_MORNING_TIME, QUANT_EVENING_TIME):
+#   08:45 every day       one email — full brief on trading days, a news-only
 #                         digest on weekends and NYSE holidays
 #   18:30 Mon–Fri         full ingest + screens + DB backup, no email
+#
+# launchd and cron only know this machine's local zone, so neither is given a
+# clock time. One job ticks every five minutes and `cli.py scheduler --once`
+# decides in QUANT_TZ what is due — correct on a Mac in any time zone and
+# across both DST changes, which a fixed local hour is not.
 #
 # Set QUANT_EMAIL (and optionally QUANT_WATCHLIST, QUANT_INDEX) in .env first.
 
@@ -23,7 +28,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LAUNCH_DIR="$HOME/Library/LaunchAgents"
 PLIST_DIR="$ROOT/tools/launchd"
-LABELS=("com.quant.morning" "com.quant.evening")
+LABELS=("com.quant.scheduler")
+# Earlier installs registered two fixed-hour jobs in local time; remove them.
+LEGACY_LABELS=("com.quant.morning" "com.quant.evening")
+
+remove_legacy() {
+    for label in "${LEGACY_LABELS[@]}"; do
+        dst="$LAUNCH_DIR/$label.plist"
+        if [ -f "$dst" ]; then
+            launchctl unload "$dst" 2>/dev/null || true
+            rm "$dst"
+            echo "🗑  removed the old fixed-hour job $label"
+        fi
+    done
+}
+
+schedule_line() {
+    (cd "$ROOT" && "$(python_bin)" -c 'import config; print(f"{config.QUANT_MORNING_TIME} daily email, {config.QUANT_EVENING_TIME} Mon–Fri prep ({config.QUANT_TZ})")')
+}
 
 python_bin() {
     if [ -n "${QUANT_PYTHON:-}" ]; then echo "$QUANT_PYTHON"
@@ -50,6 +72,7 @@ install)
     # directory first so the same python3 that has the dependencies is used.
     JOB_PATH="$(dirname "$PY"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     mkdir -p "$LAUNCH_DIR" "$ROOT/logs"
+    remove_legacy
     for label in "${LABELS[@]}"; do
         src="$PLIST_DIR/$label.plist"
         dst="$LAUNCH_DIR/$label.plist"
@@ -63,9 +86,10 @@ install)
         echo "✅  $label loaded"
     done
     echo ""
-    echo "Schedule:"
-    echo "  🌅 07:00 daily  — full brief on trading days, news-only digest when closed"
-    echo "  🌆 18:30 Mon–Fri — full ingest + screens + backup (no email)"
+    echo "Schedule: $(schedule_line)"
+    echo "  🌅 morning — full brief on trading days, news-only digest when closed"
+    echo "  🌆 evening — full ingest + screens + backup (no email)"
+    echo "  ⏱  checked every 5 minutes; times are in QUANT_TZ, not this Mac's zone"
     echo "  🐍 python: $PY"
     check_email
     echo ""
@@ -74,6 +98,7 @@ install)
     ;;
 
 uninstall)
+    remove_legacy
     for label in "${LABELS[@]}"; do
         dst="$LAUNCH_DIR/$label.plist"
         if [ -f "$dst" ]; then
@@ -87,7 +112,7 @@ uninstall)
     ;;
 
 status)
-    echo "Quant routine schedule:"
+    echo "Quant routine schedule: $(schedule_line)"
     for label in "${LABELS[@]}"; do
         if launchctl list "$label" &>/dev/null; then
             echo "  ✅ $label — active"
@@ -103,11 +128,10 @@ status)
 cron)
     PY="$(python_bin)"
     cat <<EOF
-# Add with: crontab -e     (times are this machine's local time)
-# 07:00 every day — full brief on trading days, news-only digest when closed
-0 7 * * *     cd "$ROOT" && "$PY" cli.py daily --mode quick >> "$ROOT/logs/daily.log" 2>&1
-# 18:30 Mon–Fri — full ingest + screens + backup, no email
-30 18 * * 1-5 cd "$ROOT" && "$PY" cli.py daily --mode full --no-email --backup >> "$ROOT/logs/daily.log" 2>&1
+# Add with: crontab -e
+# Every 5 minutes; the scheduler runs the morning email and evening prep when
+# they are due in QUANT_TZ ($(schedule_line)), whatever this machine's zone.
+*/5 * * * *   cd "$ROOT" && "$PY" cli.py scheduler --once >> "$ROOT/logs/launchd_scheduler.log" 2>&1
 EOF
     mkdir -p "$ROOT/logs"
     check_email

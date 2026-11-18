@@ -43,7 +43,7 @@ class Action:
 ACTIONS: dict[str, Action] = {a.key: a for a in (
     Action('brief', '📧 Send today\'s email', ('daily',),
            'Refresh news and prices, run the screens and email the brief — '
-           'the same as the 7:00 job. Skipped if today\'s already went out.',
+           'the same as the morning job. Skipped if today\'s already went out.',
            '5–20 min'),
     Action('resend', '🔁 Re-send today\'s email', ('daily', '--resend', '--skip-ingest'),
            'Rebuild today\'s brief from stored data and send it again.', '1–3 min'),

@@ -373,18 +373,32 @@ MID_TERM = {
         # return itself, which EARNINGS_REACTION now measures; names without
         # a report in the last 63 days fall below the coverage floor and are
         # not scored, which is the point.
+        #
+        # EARNINGS_SURPRISE (SUE) adds the size of the surprise itself: the
+        # reaction is how the market judged the results, SUE how far they
+        # actually moved, and each predicts drift on its own. It is a
+        # supporting weight because it arrives with the 10-Q, often weeks
+        # after the release. Eligibility is now an explicit filter — a
+        # results 8-K in the last 63 days — rather than a side effect of the
+        # coverage floor, which a second earnings factor would have broken.
         weights={
-            'EARNINGS_REACTION': 2.0, 'EARNINGS_GROWTH_1Y': 0.8,
-            'MOM_6_1': 0.6, 'PCT_VS_MA50': 0.4,
+            'EARNINGS_REACTION': 2.0, 'EARNINGS_SURPRISE': 1.0,
+            'EARNINGS_GROWTH_1Y': 0.6, 'MOM_6_1': 0.6, 'PCT_VS_MA50': 0.4,
         },
-        filters={'min_above_ma200': 1},
+        filters={'min_above_ma200': 1, 'require_earnings_reaction': 1},
         setup='momentum',
     ),
     'insider_cluster': Strategy(
         key='insider_cluster', name='Insider Cluster Buying', horizon='mid',
-        description='Multiple insiders buying on the open market, from Form 4 filings.',
+        description='Two or more insiders buying on the open market in the last '
+                    'six months, from Form 4 filings.',
         thesis='Insiders buying together is a costly signal; exit on the stop or '
                'when the cluster stops.',
+        # The cluster is a gate, not a weight. INSIDER_CLUSTER (distinct
+        # buyers) correlates 0.98 with INSIDER_NET_BUY, so weighting both
+        # counts one signal twice; requiring two buyers is what makes this a
+        # cluster, and net buying then ranks those that qualify.
+        filters={'min_insider_buyers': 2},
         weights={
             'INSIDER_NET_BUY': 2.0,
             'EARNINGS_YIELD': 1.0, 'PCT_VS_MA200': 0.8, 'FCF_YIELD': 0.8,

@@ -355,6 +355,24 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'drift has largely run its course by then, and those names are left '
         'out of the drift screen rather than scored on stale news.'),
 
+    'EARNINGS_SURPRISE': FactorDoc(
+        'EARNINGS_SURPRISE', 'Standardized Unexpected Earnings (SUE)', 'Growth',
+        'ΔNI  = NI(latest quarter) − NI(same quarter a year earlier)\n'
+        'SUE  = ΔNI / sd(ΔNI over the previous up-to-7 quarters)\n'
+        'needs ≥ 8 quarters; missing once the quarter is > 100 days old',
+        'SEC XBRL quarterly net income (Q4 derived from the annual figure)',
+        'higher',
+        'The size of the earnings surprise, measured against a seasonal random '
+        'walk and scaled by how volatile the company\'s earnings changes '
+        'usually are. Complements EARNINGS_REACTION: the reaction is how the '
+        'market judged the results, SUE is how far the results themselves '
+        'moved, and each predicts drift independently of the other (Chan, '
+        'Jegadeesh & Lakonishok 1996). No analyst estimates are needed, so it '
+        'is point-in-time at any historical date.',
+        'Dated by the 10-Q/10-K, which can trail the press release by weeks, '
+        'so it often arrives after the reaction. It is a supporting factor in '
+        'the drift screen; the reaction decides who is eligible.'),
+
     'LLM_EARNINGS_VIEW': FactorDoc(
         'LLM_EARNINGS_VIEW', 'AI Earnings Review', 'Alt Data',
         'LLM_EARNINGS_VIEW = score × conviction weight\n'

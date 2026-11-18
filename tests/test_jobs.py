@@ -107,10 +107,11 @@ def test_a_restart_shortly_after_still_sends_the_email(monkeypatch):
 def test_evening_prep_is_weekdays_only(monkeypatch):
     import cli
     import config
+    monkeypatch.setattr(config, 'QUANT_MORNING_TIME', '08:45')
     monkeypatch.setattr(config, 'QUANT_EVENING_TIME', '18:30')
     due, nxt = cli.scheduled_runs(_utc('2026-11-14T23:40:00'), 'America/New_York')
     assert 'evening' not in due                        # Saturday 18:40 ET
-    assert nxt.weekday() == 6 and nxt.hour == 7        # next: Sunday morning
+    assert nxt.weekday() == 6 and (nxt.hour, nxt.minute) == (8, 45)   # Sunday morning
 
 
 def test_times_follow_the_configured_zone_across_dst(monkeypatch):

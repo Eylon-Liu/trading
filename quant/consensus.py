@@ -93,7 +93,6 @@ def score(raw: pd.DataFrame, strategy, as_of: date | str | None = None
     Returns (scores, tidy per-family detail, warnings) in the same shape the
     factor-weighted path returns, so the engine treats both alike.
     """
-    from quant import strategies as ST
 
     warnings: list[str] = []
     fam_pct: dict[str, pd.Series] = {}

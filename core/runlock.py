@@ -1,7 +1,7 @@
 """
 One routine at a time, across processes.
 
-The 7:00 job (launchd, cron or `cli.py scheduler`), a button on the Control
+The morning job (launchd, cron or `cli.py scheduler`), a button on the Control
 tab and a command typed in a terminal are separate processes. Without a
 shared lock two of them could ingest into the same database at once, and —
 worse — both pass the "already emailed today?" check before either has

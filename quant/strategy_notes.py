@@ -228,8 +228,9 @@ NOTES: dict[str, StrategyNote] = {
     'earnings_drift': StrategyNote(
         differentiator='Event-driven rather than price-driven: it ranks on '
                        'how the market reacted to the latest results (the '
-                       'three-day return around the 8-K, net of the market), '
-                       'not on a chart pattern.',
+                       'three-day return around the 8-K, net of the market) '
+                       'and on the size of the surprise itself (SUE), not on '
+                       'a chart pattern.',
         benefit='Post-earnings announcement drift is among the most persistent '
                 'documented anomalies, and the 8-K item code dates the event '
                 'deterministically rather than by parsing text. Names with no '

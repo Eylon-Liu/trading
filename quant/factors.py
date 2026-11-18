@@ -47,6 +47,11 @@ PRICE_LOOKBACK_DAYS = 500
 # reconstructed from filed shares x the close instead.
 PROFILE_MAX_AGE_DAYS = 7
 
+# A quarter's earnings surprise describes the business until the next quarter
+# is filed (~91 days, plus filing jitter). Older than this, it is last quarter's
+# news and not what the market is reacting to now.
+SUE_MAX_AGE_DAYS = 100
+
 
 # ─────────────────────────────────────────────
 # PRICE-BASED INDICATORS
@@ -367,6 +372,13 @@ def fundamental_factors(tickers: list[str], as_of: date | str,
             if 'trailing_pe' in prof else np.nan
 
     out['PIOTROSKI_F'] = fund['piotroski_f']
+
+    # ── earnings surprise (post-earnings drift) ───────────────────
+    # SUE is a property of the filings; whether it is still fresh depends on
+    # the as-of date, so the age gate lives here and not in the fundamentals
+    # row, which the backtest reuses across dates.
+    age = (pd.Timestamp(as_of) - pd.to_datetime(fund['last_quarter_filed'])).dt.days
+    out['EARNINGS_SURPRISE'] = fund['earnings_surprise'].where(age <= SUE_MAX_AGE_DAYS)
     out['DATA_AS_OF'] = fund['last_filed']
     return out
 
@@ -767,6 +779,7 @@ FACTOR_DIRECTION: dict[str, bool] = {
     'CURRENT_RATIO': True, 'PIOTROSKI_F': True, 'FCF_CONVERSION': True,
     'EVENT_RESULTS': True,          # a recent results filing opens the drift window
     'EARNINGS_REACTION': True,      # drift continues in the reaction's direction
+    'EARNINGS_SURPRISE': True,      # SUE: y/y quarterly change / its own volatility
     'LLM_EARNINGS_VIEW': True,      # model's buy/avoid judgement, -2..+2
     'ACCRUALS': False, 'DEBT_TO_EQUITY': False, 'NET_DEBT_TO_EQUITY': False,
     'REVENUE_GROWTH_1Y': True, 'REVENUE_CAGR_3Y': True,

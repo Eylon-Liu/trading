@@ -60,7 +60,8 @@ Never forward port 8050 on your router. You don't need to.
 
 6. **Keep the Mac awake while plugged in**: System Settings → Battery →
    Options → *Prevent automatic sleeping on power adapter when the display is
-   off*. A sleeping Mac answers nobody, and misses the 7:00 email too.
+   off*. A sleeping Mac answers nobody, and misses the morning email too (it is caught up on
+   waking, if within three hours).
 
 That's all. No `.env` edits, no router settings, no certificates to manage.
 To stop sharing: `tailscale serve --https=443 off`.
@@ -69,7 +70,7 @@ The **🎛️ Control** tab is the phone's home screen: market status, last emai
 data freshness and whether a scheduled run is in progress, plus buttons to
 send today's email, run a full refresh, run AI reviews or back up the
 database. Each button asks for confirmation and shows a live log. A button
-pressed while the 7:00 job is running waits for it, then does its own check,
+pressed while the morning job is running waits for it, then does its own check,
 so the email is never sent twice.
 
 ---
@@ -85,7 +86,7 @@ free option. The alternatives, measured against this app:
 | Small VPS (Hetzner, DigitalOcean…) | ~$5–8/month | pick **≥ 4 GB RAM**: the daily screens peak at ~2.5 GB on the S&P 500 |
 | Oracle Cloud *Always Free* ARM VM | free | enough RAM, but new instances are often "out of capacity" and the free allowance was cut in 2026 |
 | Free 1 GB VMs (Google e2-micro, Oracle AMD micro) | free | too little memory for the screens |
-| Free web hosts (Render, Hugging Face…) + hosted DB | free | they sleep when idle, so no 7:00 email; the database is ~0.8 GB, over most free DB tiers; and every screen would pull ~3M rows over the internet |
+| Free web hosts (Render, Hugging Face…) + hosted DB | free | they sleep when idle, so no morning email; the database is ~0.8 GB, over most free DB tiers; and every screen would pull ~3M rows over the internet |
 
 So: Mac + Tailscale if the Mac stays home and plugged in. If you'd rather not
 depend on the Mac, a small paid VPS with the Docker setup below.
@@ -117,7 +118,7 @@ any phone without installing Tailscale:
 ## Alternative: an always-on server (no Mac required)
 
 On a Linux VPS with at least 4 GB of RAM, the included Docker setup runs the
-web UI and the 7:00 / 18:30 routine (`cli.py scheduler`) side by side on one
+web UI and the 08:45 / 18:30 ET routine (`cli.py scheduler`) side by side on one
 database:
 
 ```bash
@@ -148,7 +149,7 @@ docker compose restart
 Then remove the Mac's launchd jobs (`bash tools/setup_schedule.sh uninstall`)
 so two machines are not both sending the morning email.
 
-The scheduler's times come from `QUANT_TZ`, `QUANT_MORNING_TIME` (07:00,
+The scheduler's times come from `QUANT_TZ`, `QUANT_MORNING_TIME` (08:45,
 daily) and `QUANT_EVENING_TIME` (18:30, weekdays). A server restarted up to
 three hours after a scheduled time still runs it. The email itself is never
 sent twice in a day.
