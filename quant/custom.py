@@ -22,7 +22,6 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import replace
 from datetime import datetime
 
 import pandas as pd
@@ -208,10 +207,6 @@ def options(horizon: str | None = None) -> list[dict]:
             {'label': (f'★ {s.name}' if k.startswith(CUSTOM_PREFIX) else s.name),
              'value': k})
     return built_in + custom
-
-
-def is_custom(key: str) -> bool:
-    return key.startswith(CUSTOM_PREFIX)
 
 
 def summary() -> pd.DataFrame:

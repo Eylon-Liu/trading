@@ -303,7 +303,7 @@ def cmd_backtest(args) -> int:
     spec = parse_spec(args.universe) if args.universe else UniverseSpec(preset='SPY')
     strat = ST.get(args.strategy)
 
-    if strat.horizon == 'mid':
+    if strat.horizon == 'mid' and not strat.invert:
         print(f'▸ mid-horizon backtest (stop/target aware): {strat.name}')
         res = BT.run_trade_backtest(spec, args.strategy, args.start, args.end,
                                     n_positions=args.top)

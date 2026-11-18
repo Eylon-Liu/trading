@@ -666,12 +666,22 @@ EXITS — whichever comes first
 
     stop hit          intraday low ≤ stop
     target hit        intraday high ≥ target
-    time stop         ~60 trading days elapsed with neither hit
-    trend break       close below the 200-day moving average
+    time stop         60 trading days elapsed with neither hit
+    trend break       close below the 200-day MA (a review prompt on the
+                      live screen; the backtest exits on the three above)
 
   When a single day trades through both stop and target, daily bars cannot
   reveal the order, so the backtest assumes the stop. That is the pessimistic
   reading, chosen so results are not flattered by an ambiguity.
+
+BACKTEST FILLS
+
+    the plan is built from data as of the scan date; nothing fills that day
+    market entry      close of the next session
+    pullback entry    a limit working for 5 sessions; fills only if a
+                      session's low reaches it, otherwise no trade
+    book              a held name is not bought again, and new positions
+                      only take uninvested weight — exposure never > 100%
 
 PORTFOLIO RISK
 
@@ -684,10 +694,6 @@ PORTFOLIO RISK
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-
-def doc_for(factor: str) -> FactorDoc | None:
-    return FACTOR_DOCS.get(factor)
-
 
 def by_family() -> dict[str, list[FactorDoc]]:
     out: dict[str, list[FactorDoc]] = {}

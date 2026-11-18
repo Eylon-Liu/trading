@@ -10,7 +10,8 @@ Correctness rests on the key, which folds in:
 
   * the ticker set and the as-of date, because both change the answer;
   * a *data version* — the newest `filed` in sec_facts, the newest price bar,
-    and row counts. Ingesting anything moves the version, so a stale entry can
+    the newest pageview day, and row counts (insiders and 8-K events
+    included, since both feed factors). Ingesting anything moves the version, so a stale entry can
     never be served. This is what makes caching safe for a point-in-time tool:
     the cache is keyed by what was knowable, not by wall-clock time.
 
@@ -39,7 +40,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # Bump when factor computation logic changes (new factors, formula fixes,
 # direction changes). The data_version fingerprint only moves when new data
 # is ingested; without this, a code change serves stale cached results.
-CODE_VERSION = 10
+CODE_VERSION = 11
 
 # Entries are self-invalidating via the data version, so this only bounds
 # unbounded growth from many one-off as-of dates.
@@ -63,6 +64,8 @@ def data_version() -> str:
                    (SELECT MAX(date) FROM prices)              AS mp,
                    (SELECT MAX(rowid) FROM prices)             AS rp,
                    (SELECT COUNT(*) FROM insider_txns)         AS ni,
+                   (SELECT COUNT(*) FROM corporate_events)     AS ne,
+                   (SELECT MAX(date) FROM attention)           AS ma,
                    (SELECT COUNT(*) FROM securities)           AS ns,
                    (SELECT COUNT(*) FROM profile_snapshots)    AS nps,
                    (SELECT MAX(snapshot_date) FROM profile_snapshots) AS mps,
@@ -72,7 +75,7 @@ def data_version() -> str:
             return 'unknown'
         r = row.iloc[0]
         return (f"{r['nf']}:{r['mf']}:{r['np']}:{r['mp']}"
-                f":{r['ni']}:{r['ns']}:{r['nps']}:{r['mps']}"
+                f":{r['ni']}:{r['ne']}:{r['ma']}:{r['ns']}:{r['nps']}:{r['mps']}"
                 f":{r['rf']}:{r['rp']}:{r['rs']}")
     except Exception as exc:                       # noqa: BLE001
         # Without a version we cannot prove freshness, so make the key unique
@@ -143,18 +146,6 @@ def _prune() -> None:
             p.unlink()
         except OSError:
             pass
-
-
-def clear() -> int:
-    """Remove every entry. Returns how many were deleted."""
-    n = 0
-    for p in CACHE_DIR.glob('*.pkl'):
-        try:
-            p.unlink()
-            n += 1
-        except OSError:
-            pass
-    return n
 
 
 def stats() -> dict:

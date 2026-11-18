@@ -13,7 +13,6 @@ straight from EDGAR and live in data/sec.py, since they are filings.
 from __future__ import annotations
 
 import logging
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
@@ -102,20 +101,3 @@ def update_attention(tickers: list[str], days_back: int = 730) -> int:
     log.info('attention: %d daily observations', written)
     return written
 
-
-def attention_asof(tickers: list[str], as_of: date | str,
-                   lookback_days: int = 90) -> pd.DataFrame:
-    """Pageview series up to `as_of`."""
-    if not tickers:
-        return pd.DataFrame()
-    end = pd.to_datetime(as_of).date()
-    start = end - timedelta(days=lookback_days)
-
-    ph = ','.join(f':t{i}' for i in range(len(tickers)))
-    params: dict = {f't{i}': t for i, t in enumerate(tickers)}
-    params.update({'lo': str(start), 'hi': str(end)})
-
-    return db.read_sql(
-        f'SELECT ticker, date, wiki_views FROM attention '
-        f'WHERE ticker IN ({ph}) AND date BETWEEN :lo AND :hi ORDER BY date',
-        params, parse_dates=['date'])

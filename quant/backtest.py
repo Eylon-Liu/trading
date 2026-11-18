@@ -13,7 +13,9 @@ Two execution models, matching the two horizons:
 The look-ahead discipline is structural rather than advisory: at each
 rebalance date the engine calls the same scoring path the live screen uses,
 gated to that date. Nothing filed later is visible, so a backtest cannot use
-information the strategy could not have had.
+information the strategy could not have had. Orders are filled from the
+session *after* the scoring date, never at the close the score was computed
+from.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from data import sec, yahoo
 from data.universe import UniverseSpec
 from quant import availability as AV
 from quant import engine as EN
+from quant import factors as FA
 from quant import factorcache
 from quant import strategies as ST
 from quant import tradeplan as TP
@@ -89,7 +92,6 @@ class BacktestResult:
     holdings: pd.DataFrame
     trades: pd.DataFrame
     metrics: dict
-    rebalance_dates: list
     ic_series: pd.Series = field(default_factory=pd.Series)
 
     def summary(self) -> str:
@@ -98,6 +100,114 @@ class BacktestResult:
                 f"Sharpe {m.get('sharpe', 0):.2f}  "
                 f"MaxDD {m.get('max_drawdown', 0)*100:.1f}%  "
                 f"Turnover {m.get('turnover', 0)*100:.0f}%/yr")
+
+
+# ─────────────────────────────────────────────
+# SHARED PRE-LOAD AND POINT-IN-TIME SCORING
+# ─────────────────────────────────────────────
+
+@dataclass
+class _Preload:
+    """Everything a walk-forward needs, read once for the whole window."""
+    facts: pd.DataFrame
+    splits: pd.DataFrame
+    data_version: str
+    ohlc: tuple                      # (adj_close, adj_high, adj_low, raw_close)
+    insiders: pd.DataFrame
+    events: pd.DataFrame
+    prev_fund: pd.DataFrame | None = None
+    prev_date: date | None = None
+
+
+def _preload(spec: UniverseSpec, dates: pd.DatetimeIndex, start: date,
+             end: date) -> _Preload:
+    """
+    One read per source covering every rebalance in the window.
+
+    Rows dated after a given rebalance are present in these frames, so every
+    consumer slices them to the as-of date — `facts` by `filed` in
+    `_score_at`, prices/insiders/events inside quant.factors. Nothing past
+    `end` is loaded at all.
+    """
+    tickers: set[str] = set()
+    for ts in dates:
+        tickers.update(spec.resolve(ts.date()))
+    tickers_sorted = sorted(tickers)
+    last = dates[-1].date()
+
+    splits = (yahoo.split_factors(tickers_sorted) if tickers_sorted
+              else pd.DataFrame(columns=['ticker', 'date', 'ratio']))
+    facts = sec.facts_asof(tickers_sorted, last) if tickers_sorted else pd.DataFrame()
+    if not facts.empty:
+        facts = adjust_shares_for_splits(facts, splits)
+
+    # The benchmark rides along so BETA / IDIO_VOL can be computed: it is
+    # rarely a member of the universe being tested.
+    px_tickers = sorted(tickers | {config.BENCHMARK_TICKER})
+    ohlc = yahoo.bulk_ohlc(px_tickers,
+                           start=start - timedelta(days=FA.PRICE_LOOKBACK_DAYS),
+                           end=end)
+    insiders = sec.insiders_asof(
+        tickers_sorted, last,
+        lookback_days=(last - start).days + 180) if tickers_sorted else pd.DataFrame()
+    events = sec.events_asof(
+        tickers_sorted, last,
+        lookback_days=(last - start).days + 90) if tickers_sorted else pd.DataFrame()
+    log.info('pre-loaded %d tickers, %d price bars, %d facts',
+             len(tickers_sorted), len(ohlc[0]), len(facts))
+    return _Preload(facts, splits, factorcache.data_version(), ohlc,
+                    insiders, events)
+
+
+def _score_at(pre: _Preload, spec: UniverseSpec, strategy_key, d0: date,
+              top_n: int, plan_params: TP.PlanParams | None = None
+              ) -> EN.RunResult:
+    """Run the live scoring path gated to `d0`, reusing unchanged fundamentals."""
+    facts = pre.facts
+    if facts.empty:
+        facts_d0, changed = None, None
+    else:
+        filed = facts['filed']
+        facts_d0 = facts[filed <= pd.Timestamp(d0)]
+        changed = (None if pre.prev_date is None else set(
+            facts.loc[(filed > pd.Timestamp(pre.prev_date))
+                      & (filed <= pd.Timestamp(d0)), 'ticker'].unique()))
+
+    result = EN.run(spec, strategy_key, as_of=d0, top_n=top_n, persist=False,
+                    plan_params=plan_params,
+                    _bt_facts=facts_d0,
+                    _bt_data_version=pre.data_version,
+                    _bt_prev_fund=pre.prev_fund,
+                    _bt_changed_tickers=changed,
+                    _bt_splits=pre.splits,
+                    _bt_splits_applied=True,
+                    _bt_ohlc=pre.ohlc,
+                    _bt_insiders=pre.insiders,
+                    _bt_events=pre.events)
+    pre.prev_fund, pre.prev_date = result._fund_raw, d0
+    return result
+
+
+def _check_degraded(result: EN.RunResult, strategy: ST.Strategy, d0: date,
+                    strict: bool) -> None:
+    if strict and result.degraded:
+        raise DegradedBacktest(
+            f'{strategy.key} cannot be honestly backtested at {d0}: '
+            + '; '.join(result.warnings)
+            + '  (pass strict=False to measure the degraded variant anyway)')
+
+
+def _next_session(sessions: pd.DatetimeIndex, d: date) -> pd.Timestamp | None:
+    """
+    First trading session strictly after `d`.
+
+    Scores use everything dated `d`, including filings that land after that
+    day's close, so the earliest honest fill is the following session.
+    Trading at the very close the signal was computed from would quietly
+    assume a filing published at 6pm was known at 4pm.
+    """
+    pos = sessions.searchsorted(pd.Timestamp(d), side='right')
+    return sessions[pos] if pos < len(sessions) else None
 
 
 # ─────────────────────────────────────────────
@@ -138,6 +248,14 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     """
     Walk forward, re-scoring at each rebalance with only the data of that date.
 
+    Scores are computed as of each rebalance date and the portfolio is traded
+    at the close of the *next* session, held to the close of the session after
+    the following rebalance date.
+
+    For an inverted (avoid-list) strategy the portfolio holds the names it
+    flags, so underperforming the benchmark is the strategy working; the IC is
+    reported on the un-inverted score so that positive still means "works".
+
     `strict` (the default) refuses to return a number when the data cannot
     support the strategy at a rebalance date — see `DegradedBacktest`. Pass
     strict=False only to inspect *how* a strategy degrades; the equity curve
@@ -160,132 +278,93 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     log.info('backtest %s | %s -> %s | %d rebalances | top %d',
              strategy.name, start, end, len(dates), n_holdings)
 
-    # ── pre-fetch: load everything once for the entire backtest window ──
-    all_tickers: set[str] = set()
-    for ts in dates:
-        all_tickers.update(spec.resolve(ts.date()))
-    all_tickers_sorted = sorted(all_tickers)
-    facts_full = sec.facts_asof(all_tickers_sorted, dates[-1].date())
-    dv = factorcache.data_version()
-    splits = yahoo.split_factors(all_tickers_sorted) if all_tickers_sorted else pd.DataFrame()
-    facts_full = adjust_shares_for_splits(facts_full, splits)
+    pre = _preload(spec, dates, start, end)
+    adj_close = pre.ohlc[0]
+    if adj_close.empty:
+        raise ValueError('no stored prices for this universe and window')
+    sessions = adj_close.index
+    last_session = sessions[-1]
 
-    # Prices: one SQL read for the entire window (lookback + forward).
-    price_lookback = int(config.TRADING_DAYS['3Y'] * 1.6)
-    price_start = start - timedelta(days=price_lookback)
-    bt_ohlc = yahoo.bulk_ohlc(all_tickers_sorted, start=price_start, end=end)
-    adj_close_all = bt_ohlc[0].ffill() if not bt_ohlc[0].empty else pd.DataFrame()
-    log.info('pre-loaded prices: %d tickers, %d bars',
-             len(adj_close_all.columns) if not adj_close_all.empty else 0,
-             len(adj_close_all))
+    def fill_at(d: date) -> pd.Timestamp:
+        return _next_session(sessions, d) or last_session
 
-    # Insiders and events: one read each covering the full lookback.
-    ins_start = start - timedelta(days=180)
-    bt_insiders = sec.insiders_asof(all_tickers_sorted, dates[-1].date(),
-                                     lookback_days=(dates[-1].date() - ins_start).days)
-    evt_start = start - timedelta(days=90)
-    bt_events = sec.events_asof(all_tickers_sorted, dates[-1].date(),
-                                 lookback_days=(dates[-1].date() - evt_start).days)
-
-    prev_fund: pd.DataFrame | None = None
-    prev_d0: date | None = None
-
+    ic_sign = -1.0 if strategy.invert else 1.0
     prev_w = pd.Series(dtype=float)
     equity, turnover_log, holdings_log, trades, ics = [1.0], [], [], [], []
-    equity_dates = [dates[0].date()]
-    degraded_dates: list = []
+    equity_dates = [fill_at(dates[0].date())]
 
     for i in range(len(dates) - 1):
         d0, d1 = dates[i].date(), dates[i + 1].date()
+        t0, t1 = fill_at(d0), fill_at(d1)
 
-        facts_d0 = facts_full[facts_full['filed'] <= pd.Timestamp(d0)]
-        if prev_d0 is not None:
-            new_filings = facts_full[
-                (facts_full['filed'] > pd.Timestamp(prev_d0))
-                & (facts_full['filed'] <= pd.Timestamp(d0))]
-            changed = set(new_filings['ticker'].unique())
-        else:
-            changed = None
+        if t1 <= t0:
+            break                       # no session left to trade in
 
-        result = EN.run(spec, strategy_key, as_of=d0,
-                        top_n=n_holdings, persist=False,
-                        _bt_facts=facts_d0,
-                        _bt_data_version=dv,
-                        _bt_prev_fund=prev_fund,
-                        _bt_changed_tickers=changed,
-                        _bt_splits=splits,
-                        _bt_splits_applied=True,
-                        _bt_ohlc=bt_ohlc,
-                        _bt_insiders=bt_insiders,
-                        _bt_events=bt_events)
-        prev_fund = result._fund_raw
-        prev_d0 = d0
-        if strict and result.degraded:
-            raise DegradedBacktest(
-                f'{strategy.key} cannot be honestly backtested at {d0}: '
-                + '; '.join(result.warnings)
-                + '  (pass strict=False to measure the degraded variant anyway)')
-        degraded_dates.extend([d0] * bool(result.degraded))
-        if result.scores.empty:
-            equity.append(equity[-1]); equity_dates.append(d1)
-            continue
+        result = _score_at(pre, spec, strategy_key, d0, n_holdings)
+        _check_degraded(result, strategy, d0, strict)
 
-        vols = result.scores.get('VOL_1Y')
-        w = _weights(result.scores, n_holdings, weighting, vols)
+        w = (_weights(result.scores, n_holdings, weighting,
+                      result.scores.get('VOL_1Y'))
+             if not result.scores.empty else pd.Series(dtype=float))
+        px = adj_close.loc[t0:t1]
         if w.empty:
-            equity.append(equity[-1]); equity_dates.append(d1)
+            # Nothing held for the period: carry the curve flat, and liquidate
+            # what was held before, which costs a trade.
+            exit_cost = float(prev_w.abs().sum()) * round_trip
+            equity.append(equity[-1] * (1.0 - exit_cost))
+            equity_dates.append(t1)
+            if exit_cost:
+                turnover_log.append(float(prev_w.abs().sum()))
+            prev_w = pd.Series(dtype=float)
             continue
 
-        # Forward return from pre-loaded prices (no SQL per rebalance).
-        if not adj_close_all.empty:
-            avail = adj_close_all.columns.intersection(w.index)
-            px = adj_close_all.loc[pd.Timestamp(d0):pd.Timestamp(d1), avail]
-        else:
-            px = pd.DataFrame()
-        if px.empty or len(px) < 2:
-            equity.append(equity[-1]); equity_dates.append(d1)
-            continue
-        period_ret = (px.iloc[-1] / px.iloc[0] - 1.0).reindex(w.index).fillna(0.0)
-
+        # Forward-filled only inside the holding window, so a name that stops
+        # trading keeps its last price rather than borrowing a future one.
+        held = px.reindex(columns=w.index).ffill()
+        period_ret = (held.iloc[-1] / held.iloc[0] - 1.0).fillna(0.0)
         gross = float((w * period_ret).sum())
 
         traded = float((w.subtract(prev_w, fill_value=0.0)).abs().sum())
-        cost = traded * round_trip
-        equity.append(equity[-1] * (1.0 + gross - cost))
-        equity_dates.append(d1)
+        equity.append(equity[-1] * (1.0 + gross - traded * round_trip))
+        equity_dates.append(t1)
         turnover_log.append(traded)
 
-        # Rank IC from pre-loaded prices (no SQL per rebalance).
-        if len(result.scores) >= 8 and not adj_close_all.empty:
-            ic_tickers = adj_close_all.columns.intersection(result.scores.index)
-            all_px = adj_close_all.loc[pd.Timestamp(d0):pd.Timestamp(d1), ic_tickers]
-            if not all_px.empty and len(all_px) >= 2:
-                fwd = all_px.iloc[-1] / all_px.iloc[0] - 1.0
-                pair = pd.concat([result.scores['composite'], fwd], axis=1).dropna()
-                pair.columns = ['score', 'fwd']
-                if len(pair) >= 8:
-                    ics.append({'date': d1,
-                                'ic': pair['score'].corr(pair['fwd'], method='spearman')})
+        # Rank IC over the same window the portfolio was exposed to.
+        if len(result.scores) >= 8:
+            cols = px.columns.intersection(result.scores.index)
+            all_px = px[cols].ffill()
+            fwd = all_px.iloc[-1] / all_px.iloc[0] - 1.0
+            pair = pd.concat([result.scores['composite'] * ic_sign, fwd],
+                             axis=1).dropna()
+            if len(pair) >= 8:
+                ics.append({'date': d1, 'ic': pair.iloc[:, 0].corr(
+                    pair.iloc[:, 1], method='spearman')})
 
         for t, weight in w.items():
             holdings_log.append({'date': d0, 'ticker': t, 'weight': weight,
                                  'period_return': period_ret.get(t, 0.0)})
-        for t in set(w.index) - set(prev_w.index):
+        for t in w.index.difference(prev_w.index):
             trades.append({'date': d0, 'ticker': t, 'action': 'buy',
                            'weight': w[t]})
-        for t in set(prev_w.index) - set(w.index):
+        for t in prev_w.index.difference(w.index):
             trades.append({'date': d0, 'ticker': t, 'action': 'sell',
                            'weight': prev_w[t]})
-        prev_w = w
+        # Weights drift with returns over the period; the next rebalance trades
+        # from the drifted book, not from the targets set at this one.
+        drifted = w * (1.0 + period_ret)
+        prev_w = drifted / drifted.sum() if drifted.sum() > 0 else w
 
-    eq = pd.Series(equity, index=pd.to_datetime(equity_dates), name='strategy')
-    bench = _benchmark_curve(dates[0].date(), dates[-1].date(), eq.index)
+    eq = pd.Series(equity, index=pd.DatetimeIndex(equity_dates), name='strategy')
+    eq = eq[~eq.index.duplicated(keep='last')]
+    bench = _benchmark_curve(eq.index[0].date(), eq.index[-1].date(), eq.index)
 
     metrics = compute_metrics(eq, bench)
     metrics['turnover'] = float(np.mean(turnover_log)) * _periods_per_year(rebalance) \
         if turnover_log else 0.0
     metrics['n_rebalances'] = len(dates) - 1
     metrics['avg_holdings'] = n_holdings
+    if strategy.invert:
+        metrics['inverted'] = True
 
     ic_series = pd.Series(dtype=float)
     if ics:
@@ -300,161 +379,108 @@ def run_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     return BacktestResult(
         equity=eq, benchmark=bench,
         holdings=pd.DataFrame(holdings_log), trades=pd.DataFrame(trades),
-        metrics=metrics, rebalance_dates=[d.date() for d in dates],
-        ic_series=ic_series)
-
-
-# ─────────────────────────────────────────────
-# BUY AND HOLD  (concentrated, no rebalance)
-# ─────────────────────────────────────────────
-
-def run_buy_and_hold(spec: UniverseSpec, strategy_key, start: date | str,
-                     end: date | str | None = None, n_holdings: int = 3,
-                     cost_bps: float | None = None,
-                     initial_cash: float = 10_000.0,
-                     strict: bool = True) -> BacktestResult:
-    """
-    Score once, buy the top `n_holdings` with equal cash, never touch them again.
-
-    This asks a different question from `run_backtest`. A quarterly rebalance
-    measures the *ranking rule* — it keeps re-picking, so a bad name is only
-    ever held for one period. Buying three names and holding for a decade
-    measures the *picks*: whether the businesses this screen put at the top
-    were actually worth owning. That is the question a long-horizon screen
-    claims to answer, and a rebalance quietly hides the answer by continually
-    correcting itself.
-
-    Weights are equal in *dollars at entry* and then left to drift, which is
-    what a real buy-and-hold portfolio does — a winner becoming an outsized
-    share of the portfolio is a result, not an error to be corrected.
-
-    Costs are charged once, on entry.
-    """
-    start = pd.to_datetime(start).date()
-    end = pd.to_datetime(end or date.today()).date()
-    cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
-    entry_cost = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
-
-    _require_honest_window(spec, strategy_key, start, strict)
-
-    result = EN.run(spec, strategy_key, as_of=start, top_n=n_holdings,
-                    persist=False)
-    if result.scores.empty:
-        raise ValueError(f'{strategy_key} produced no picks at {start}')
-    if result.degraded:
-        raise DegradedBacktest(
-            f'{ST.get(strategy_key).key} cannot be honestly backtested at '
-            f'{start}: ' + '; '.join(result.warnings))
-
-    picks = result.scores.head(n_holdings)
-    px = yahoo.price_history(list(picks.index), start=start, end=end,
-                             field='adj_close')
-    if px.empty:
-        raise ValueError(f'no price history for {list(picks.index)}')
-    px = px.ffill().dropna(axis=1, how='all')
-    if px.empty:
-        raise ValueError('no usable price history for the picks')
-
-    # Equal cash per name, so the share count differs and the weights drift.
-    cash_each = initial_cash / len(px.columns)
-    shares = (cash_each * (1.0 - entry_cost)) / px.iloc[0]
-    values = px.mul(shares, axis=1)
-    eq = values.sum(axis=1)
-    eq.name = 'strategy'
-
-    bench = _benchmark_curve(start, end, eq.index)
-    if not bench.empty:
-        bench = bench / bench.iloc[0] * initial_cash
-
-    metrics = compute_metrics(eq, bench)
-    metrics.update({
-        'initial_cash': initial_cash,
-        'final_cash': float(eq.iloc[-1]),
-        'final_cash_benchmark': float(bench.iloc[-1]) if not bench.empty else np.nan,
-        'n_holdings': int(len(px.columns)),
-        'turnover': 0.0,
-        'n_rebalances': 0,
-    })
-
-    entry, exit_ = px.iloc[0], px.iloc[-1]
-    holdings = pd.DataFrame({
-        'ticker': px.columns,
-        'entry_price': entry.values,
-        'exit_price': exit_.values,
-        'shares': shares.values,
-        'cash_in': cash_each * (1.0 - entry_cost),
-        'cash_out': values.iloc[-1].values,
-        'total_return': (exit_ / entry - 1.0).values,
-    }).sort_values('total_return', ascending=False).reset_index(drop=True)
-
-    return BacktestResult(
-        equity=eq, benchmark=bench, holdings=holdings,
-        trades=pd.DataFrame(), metrics=metrics,
-        rebalance_dates=[start])
-
-
-def compare_buy_and_hold(spec: UniverseSpec, strategy_keys: list,
-                         start: date | str, end: date | str | None = None,
-                         n_holdings: int = 3,
-                         initial_cash: float = 10_000.0) -> pd.DataFrame:
-    """
-    Terminal cash per strategy from one concentrated buy-and-hold, side by side.
-
-    The headline column is `final_cash`: what the same starting cash became.
-    `picks` is carried through because with three names the answer is driven by
-    which three, and an average hides that.
-    """
-    rows = []
-    for key in strategy_keys:
-        name = key if isinstance(key, str) else getattr(key, 'key', str(key))
-        try:
-            r = run_buy_and_hold(spec, key, start, end, n_holdings=n_holdings,
-                                 initial_cash=initial_cash)
-        except DegradedBacktest as exc:
-            log.warning('%s not backtestable at %s: %s', name, start, exc)
-            rows.append({'strategy': name, 'error': 'INSUFFICIENT DATA',
-                         'detail': str(exc)[:160]})
-            continue
-        except Exception as exc:                   # noqa: BLE001
-            log.warning('buy-and-hold failed for %s: %s', name, exc)
-            rows.append({'strategy': name, 'error': str(exc)[:80]})
-            continue
-        m = r.metrics
-        rows.append({
-            'strategy': name,
-            'final_cash': m.get('final_cash'),
-            'benchmark_cash': m.get('final_cash_benchmark'),
-            'total_return': m.get('total_return'),
-            'cagr': m.get('cagr'),
-            'sharpe': m.get('sharpe'),
-            'max_drawdown': m.get('max_drawdown'),
-            'picks': ', '.join(r.holdings['ticker']),
-        })
-    return pd.DataFrame(rows)
+        metrics=metrics, ic_series=ic_series)
 
 
 # ─────────────────────────────────────────────
 # MID-HORIZON BACKTEST  (stop / target aware)
 # ─────────────────────────────────────────────
 
-def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
+# Sessions a pullback limit order stays working before it is cancelled.
+ENTRY_WINDOW_SESSIONS = 5
+
+
+def _simulate_trade(plan: pd.Series, hi: pd.Series, lo: pd.Series,
+                    cl: pd.Series, time_stop_days: int) -> dict | None:
+    """
+    Walk one plan through the sessions after its scan date.
+
+    `hi`/`lo`/`cl` start at the first session after the scan and are on the
+    same adjusted basis as the plan's levels. Returns None when the order is
+    never filled or the setup is already broken at the fill.
+
+      market    filled at the first session's close.
+      pullback  a limit at `entry`, working for ENTRY_WINDOW_SESSIONS; it
+                fills only on a session whose low reaches it, at the lower of
+                the limit and that session's high (a gap down fills below).
+                Assuming every limit fills — and at the limit — books the
+                discount on exactly the trades where price never came back.
+
+    After the fill, a session that touches the stop exits at the stop, or at
+    the session's high when it gapped through; one that touches the target
+    exits at the target. When both are touched on the same day the stop is
+    assumed, since daily bars cannot reveal the order. Otherwise the position
+    is closed at the close `time_stop_days` sessions after the fill.
+    """
+    entry, stop, target = (float(plan['entry']), float(plan['stop']),
+                           float(plan['target']))
+    if cl.empty:
+        return None
+
+    limit = plan.get('entry_type') == 'pullback'
+    if limit:
+        window = lo.iloc[:ENTRY_WINDOW_SESSIONS]
+        touched = window.index[window <= entry]
+        if len(touched) == 0:
+            return None
+        fill_day = touched[0]
+        day_hi = float(hi.get(fill_day, np.nan))
+        fill = min(entry, day_hi) if np.isfinite(day_hi) else entry
+    else:
+        fill_day = cl.index[0]
+        fill = float(cl.iloc[0])
+
+    if not (stop < fill < target):
+        return None                                    # setup broken before entry
+
+    fill_pos = cl.index.get_loc(fill_day)
+    planned_exit = fill_pos + time_stop_days
+    last_pos = min(planned_exit, len(cl) - 1)
+    exit_price, exit_day = float(cl.iloc[last_pos]), cl.index[last_pos]
+    reason = 'time' if planned_exit <= len(cl) - 1 else 'end'   # window ran out
+
+    # A market fill happens at the close, so the walk starts next session. A
+    # limit fills intraday: its own session can still stop out, but a high on
+    # that day may have printed before the dip, so it cannot count as target.
+    first_walk = fill_pos if limit else fill_pos + 1
+    for day in cl.index[first_walk:last_pos + 1]:
+        day_lo, day_hi = lo.get(day, np.nan), hi.get(day, np.nan)
+        if np.isfinite(day_lo) and day_lo <= stop:
+            gapped = np.isfinite(day_hi) and day_hi < stop
+            exit_price, reason, exit_day = (day_hi if gapped else stop), 'stop', day
+            break
+        if day != fill_day and np.isfinite(day_hi) and day_hi >= target:
+            exit_price, reason, exit_day = target, 'target', day
+            break
+
+    return {'fill_date': fill_day.date(), 'fill': fill, 'exit_date': exit_day.date(),
+            'exit': exit_price, 'reason': reason}
+
+
+def run_trade_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                        start: date | str, end: date | str | None = None,
                        n_positions: int = 10,
                        params: TP.PlanParams | None = None,
-                       cost_bps: float | None = None) -> BacktestResult:
+                       cost_bps: float | None = None,
+                       strict: bool = True) -> BacktestResult:
     """
     Backtest a mid-term strategy honouring its own exit rules.
 
-    At each monthly scan the engine builds plans, then walks daily bars to see
-    whether the stop, the target, or the time stop was reached first. When a
-    single day trades through both stop and target, daily bars cannot reveal
-    the order, so the stop is assumed — the pessimistic read, chosen so the
-    results are not flattered by an ambiguity.
+    At each month-end scan the engine builds plans from data of that date,
+    then walks the following sessions to see whether the entry filled and
+    which of stop, target or time stop came first (see `_simulate_trade`).
+
+    The book is one portfolio: a name already held is not bought again, and a
+    new position only takes the weight still uninvested, so overlapping scans
+    can never add up to more than 100% exposure.
     """
     strategy = ST.get(strategy_key)
     if strategy.horizon != 'mid':
-        raise ValueError(f'{strategy_key} is a long-horizon strategy; '
+        raise ValueError(f'{strategy.key} is a long-horizon strategy; '
                          f'use run_backtest instead')
+    if strategy.invert:
+        raise ValueError(f'{strategy.key} is an avoid list, not a trade; '
+                         f'use run_backtest to test whether its names lag')
 
     start = pd.to_datetime(start).date()
     end = pd.to_datetime(end or date.today()).date()
@@ -462,120 +488,77 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     cost_bps = config.TRANSACTION_COST_BPS if cost_bps is None else cost_bps
     round_trip = (cost_bps + config.SLIPPAGE_BPS) / 10_000.0
 
+    _require_honest_window(spec, strategy_key, start, strict)
+
     scan_dates = pd.date_range(start, end, freq='ME')
+    if len(scan_dates) == 0:
+        raise ValueError('backtest window too short for a monthly scan')
+
+    pre = _preload(spec, scan_dates, start, end)
+    adj_c, adj_h, adj_l, _raw = pre.ohlc
+    if adj_c.empty:
+        raise ValueError('no stored prices for this universe and window')
+
     trades: list[dict] = []
-
-    # ── pre-fetch: load everything once for the entire window ──
-    all_tickers_mid: set[str] = set()
-    for ts in scan_dates:
-        all_tickers_mid.update(spec.resolve(ts.date()))
-    all_tickers_mid_sorted = sorted(all_tickers_mid)
-    facts_full_mid = sec.facts_asof(all_tickers_mid_sorted, scan_dates[-1].date()) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-    dv_mid = factorcache.data_version()
-    splits_mid = yahoo.split_factors(all_tickers_mid_sorted) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-    if not facts_full_mid.empty:
-        facts_full_mid = adjust_shares_for_splits(facts_full_mid, splits_mid)
-
-    price_lookback_mid = int(config.TRADING_DAYS['3Y'] * 1.6)
-    bt_ohlc_mid = yahoo.bulk_ohlc(all_tickers_mid_sorted,
-                                   start=start - timedelta(days=price_lookback_mid),
-                                   end=end + timedelta(days=int(params.time_stop_days * 1.5)))
-    ins_start_mid = start - timedelta(days=180)
-    bt_insiders_mid = sec.insiders_asof(
-        all_tickers_mid_sorted, scan_dates[-1].date(),
-        lookback_days=(scan_dates[-1].date() - ins_start_mid).days) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-    bt_events_mid = sec.events_asof(
-        all_tickers_mid_sorted, scan_dates[-1].date(),
-        lookback_days=(scan_dates[-1].date() - (start - timedelta(days=90))).days) \
-        if all_tickers_mid_sorted else pd.DataFrame()
-
-    prev_fund_mid: pd.DataFrame | None = None
-    prev_d0_mid: date | None = None
+    open_book: list[dict] = []          # {'ticker', 'exit_date', 'weight'}
+    unfilled = 0
 
     for ts in scan_dates:
         d0 = ts.date()
-        facts_d0_mid = facts_full_mid[facts_full_mid['filed'] <= pd.Timestamp(d0)] \
-            if not facts_full_mid.empty else pd.DataFrame()
-        if prev_d0_mid is not None and not facts_full_mid.empty:
-            new_mid = facts_full_mid[
-                (facts_full_mid['filed'] > pd.Timestamp(prev_d0_mid))
-                & (facts_full_mid['filed'] <= pd.Timestamp(d0))]
-            changed_mid = set(new_mid['ticker'].unique())
-        else:
-            changed_mid = None
-
-        result = EN.run(spec, strategy_key, as_of=d0, top_n=n_positions,
-                        persist=False, plan_params=params,
-                        _bt_facts=facts_d0_mid if not facts_d0_mid.empty else None,
-                        _bt_data_version=dv_mid,
-                        _bt_prev_fund=prev_fund_mid,
-                        _bt_changed_tickers=changed_mid,
-                        _bt_splits=splits_mid,
-                        _bt_splits_applied=True,
-                        _bt_ohlc=bt_ohlc_mid,
-                        _bt_insiders=bt_insiders_mid,
-                        _bt_events=bt_events_mid)
-        prev_fund_mid = result._fund_raw
-        prev_d0_mid = d0
+        result = _score_at(pre, spec, strategy_key, d0, n_positions,
+                           plan_params=params)
+        _check_degraded(result, strategy, d0, strict)
         if result.plans.empty:
             continue
 
-        horizon_end = min(end, d0 + timedelta(days=int(params.time_stop_days * 1.5)))
-        tickers = list(result.plans.index)
-        # Adjusted OHLC: raw highs/lows sit on a different basis to the
-        # adjusted price the plan levels were derived from.
-        highs, lows, closes = yahoo.adjusted_ohlc(tickers, start=d0, end=horizon_end)
-        if closes.empty:
-            continue
+        # Positions whose exit is on or before the scan are closed by now.
+        open_book = [p for p in open_book if p['exit_date'] > d0]
+        held = {p['ticker'] for p in open_book}
+        capacity = 1.0 - sum(p['weight'] for p in open_book)
 
-        for t in tickers:
-            if t not in closes.columns:
+        after = adj_c.index[adj_c.index > pd.Timestamp(d0)]
+        if len(after) == 0:
+            continue
+        # Rank order, not the order the plans happened to be built in.
+        for t in [x for x in result.scores.index if x in result.plans.index]:
+            if capacity <= 1e-9:
+                break
+            if t in held or t not in adj_c.columns:
                 continue
             plan = result.plans.loc[t]
-            entry, stop, target = (float(plan['entry']), float(plan['stop']),
-                                   float(plan['target']))
-
-            hi = highs[t].dropna() if t in highs.columns else pd.Series(dtype=float)
-            lo = lows[t].dropna() if t in lows.columns else pd.Series(dtype=float)
-            cl = closes[t].dropna()
-            if cl.empty:
+            cl = adj_c.loc[after, t].dropna()
+            hi = adj_h[t].reindex(cl.index) if t in adj_h else pd.Series(np.nan, index=cl.index)
+            lo = adj_l[t].reindex(cl.index) if t in adj_l else pd.Series(np.nan, index=cl.index)
+            sim = _simulate_trade(plan, hi, lo, cl, params.time_stop_days)
+            if sim is None:
+                unfilled += 1
                 continue
 
-            exit_price, exit_reason, exit_date = None, 'time', cl.index[-1].date()
-            for day in cl.index:
-                day_low = lo.get(day, np.nan)
-                day_high = hi.get(day, np.nan)
-                if np.isfinite(day_low) and day_low <= stop:
-                    exit_price, exit_reason, exit_date = stop, 'stop', day.date()
-                    break
-                if np.isfinite(day_high) and day_high >= target:
-                    exit_price, exit_reason, exit_date = target, 'target', day.date()
-                    break
-            if exit_price is None:
-                exit_price = float(cl.iloc[-1])
+            weight = min(float(plan['weight_pct']) / 100.0, capacity)
+            capacity -= weight
+            open_book.append({'ticker': t, 'exit_date': sim['exit_date'],
+                              'weight': weight})
 
-            gross = exit_price / entry - 1.0
-            net = gross - 2 * round_trip
-            risk = (entry - stop) / entry
+            gross = sim['exit'] / sim['fill'] - 1.0
+            risk = (sim['fill'] - float(plan['stop'])) / sim['fill']
             trades.append({
-                'entry_date': d0, 'exit_date': exit_date, 'ticker': t,
-                'entry': entry, 'exit': round(exit_price, 2),
-                'reason': exit_reason, 'weight': float(plan['weight_pct']) / 100.0,
-                'gross_return': gross, 'net_return': net,
+                'entry_date': sim['fill_date'], 'exit_date': sim['exit_date'],
+                'ticker': t, 'entry': round(sim['fill'], 2),
+                'exit': round(sim['exit'], 2), 'reason': sim['reason'],
+                'weight': weight, 'gross_return': gross,
+                'net_return': gross - 2 * round_trip,
                 'r_multiple': (gross / risk) if risk > 0 else np.nan,
-                'days_held': (exit_date - d0).days,
+                'days_held': (sim['exit_date'] - sim['fill_date']).days,
             })
 
     trades_df = pd.DataFrame(trades)
     if trades_df.empty:
         return BacktestResult(pd.Series(dtype=float), pd.Series(dtype=float),
                               pd.DataFrame(), pd.DataFrame(),
-                              {'note': 'no trades generated'}, [])
+                              {'note': 'no trades generated',
+                               'unfilled_orders': unfilled})
 
-    # Equity curve: sum weighted P&L by exit date.
+    # Equity: weighted P&L booked on each exit date.
     trades_df = trades_df.sort_values('exit_date')
     daily = (trades_df.assign(contrib=trades_df['net_return'] * trades_df['weight'])
                       .groupby('exit_date')['contrib'].sum())
@@ -588,6 +571,7 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     wins = trades_df['net_return'] > 0
     metrics.update({
         'n_trades': int(len(trades_df)),
+        'unfilled_orders': unfilled,
         'win_rate': float(wins.mean()),
         'avg_win': float(trades_df.loc[wins, 'net_return'].mean()) if wins.any() else 0.0,
         'avg_loss': float(trades_df.loc[~wins, 'net_return'].mean()) if (~wins).any() else 0.0,
@@ -598,11 +582,10 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str,
     if metrics['avg_loss'] != 0:
         metrics['profit_factor'] = abs(
             (metrics['avg_win'] * wins.sum()) /
-            (metrics['avg_loss'] * (~wins).sum())) if (~wins).any() else np.inf
+            (metrics['avg_loss'] * (~wins).sum()))
 
     return BacktestResult(equity=eq, benchmark=bench, holdings=pd.DataFrame(),
-                          trades=trades_df, metrics=metrics,
-                          rebalance_dates=[d.date() for d in scan_dates])
+                          trades=trades_df, metrics=metrics)
 
 
 # ─────────────────────────────────────────────

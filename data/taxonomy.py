@@ -81,16 +81,6 @@ SEC_DEI_TAG_MAP: dict[str, list[str]] = {
 }
 
 
-def all_tags() -> set[str]:
-    """Every XBRL tag referenced by the maps, for validation."""
-    tags: set[str] = set()
-    for lst in SEC_TAG_MAP.values():
-        tags.update(lst)
-    for lst in SEC_DEI_TAG_MAP.values():
-        tags.update(lst)
-    return tags
-
-
 def concepts() -> list[str]:
     """All logical concept names, sorted."""
     return sorted(set(SEC_TAG_MAP) | set(SEC_DEI_TAG_MAP))

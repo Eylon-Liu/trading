@@ -31,7 +31,7 @@ The app treats these as separate questions rather than one ranked list, because 
 | Output | Rank, signal, and the reasoning behind it | Entry, stop, target, time stop, position size |
 | Exit | A broken thesis — no price level | Stop hit, target hit, time stop, or trend break |
 | Rebalance | Quarterly | Monthly, with intra-period stops |
-| Strategies | Quality Value, Deep Value, Piotroski, Compounder, Dividend Quality, Low Volatility, GARP, Multi-Factor | Momentum + Trend, 52-Week Breakout, Pullback, Post-Earnings Drift, Insider Cluster, Mean Reversion |
+| Strategies | Buffett Quality, Quality Momentum, Style Factors, Insider Conviction, Total Shareholder Yield | Momentum + Trend, 52-Week Breakout, Pullback, Post-Earnings Drift, Insider Cluster, Quality Mean Reversion, Low-Vol Relative Strength, Deteriorating Quality (avoid list) |
 
 Position sizes are **percentages of portfolio** implied by a risk budget and the stop distance — a wider stop earns a smaller position. The app knows nothing about your account and never asks.
 
@@ -186,10 +186,10 @@ python3 cli.py ingest --index SPY --full --members-from 2015-01-01
 
 python3 cli.py strategies                               # list, by horizon
 python3 cli.py screen --universe "SPY,sector=Health Care,mcap>5B" \
-                      --strategy quality_value
+                      --strategy buffett
 python3 cli.py screen --strategy momentum_trend --top 10   # mid-term + plans
 
-python3 cli.py backtest --strategy quality_value --start 2020-01-01
+python3 cli.py backtest --strategy buffett --start 2020-01-01
 python3 cli.py report --kind daily --email you@example.com
 python3 cli.py status                                   # coverage and freshness
 ```
@@ -207,9 +207,9 @@ SPY,sector=Health Care,adv>25M,top=50      cap by size rank, never at random
 ```cron
 0 18 * * 1-5  cd /path/to/trading && python3 cli.py ingest --index SPY --full
 0  7 * * 1-5  cd /path/to/trading && python3 cli.py report --kind daily \
-                  --strategy quality_value --email you@example.com
+                  --strategy buffett --email you@example.com
 0  8 1 * *    cd /path/to/trading && python3 cli.py report --kind monthly \
-                  --strategy quality_value --email you@example.com
+                  --strategy buffett --email you@example.com
 ```
 
 ---
@@ -234,11 +234,11 @@ app.py               Dash entry point
 core/                db.py (SQLAlchemy schema), http.py (throttle + cache)
 data/                members, yahoo, sec, classify, news, policy, altdata, universe
 quant/               fundamentals, factors, transforms, strategies,
-                     tradeplan, signals/engine, risk, backtest, research
+                     tradeplan, engine, backtest, compare, availability
 nlp/                 sentiment (Loughran-McDonald), extract, summarize
 reports/             builder (HTML), email
 ui/                  theme, components, layout, pages/
-tests/               278 tests, including the look-ahead assertions
+tests/               look-ahead and execution-timing assertions included
 ```
 
 Storage is SQLite by default (~250–300 MB for 500 tickers × 10 years). Because the data layer is SQLAlchemy, moving to a hosted database is a `DATABASE_URL` change — Turso is the easiest since it *is* SQLite.
@@ -261,7 +261,7 @@ The suite covers the transforms against hand-computed values, Wilder RSI against
 - **News cannot be backfilled** (above). It accumulates forward.
 - **SIC → GICS is approximate.** Alphabet lands in Information Technology rather than Communication Services, for instance.
 - **`yfinance.info` is unreliable.** Market cap and forward P/E fall back to SEC-derived estimates when it is throttled; the app is built not to depend on it.
-- **Backtests ignore borrow costs, taxes, and market impact**, and assume you can transact at the closing price.
+- **Backtests ignore borrow costs, taxes, and market impact.** Scores are computed as of each rebalance date and filled at the *next* session's close; pullback limits fill only if a later session trades down to them. Daily bars carry no open, so a gap through a stop fills at that day's high — real gaps fill at the open, which can be worse.
 
 ---
 

@@ -29,6 +29,7 @@ from lxml import etree
 
 import config
 from core import db, http
+from data.taxonomy import SEC_DEI_TAG_MAP, SEC_TAG_MAP
 
 log = logging.getLogger(__name__)
 
@@ -39,12 +40,12 @@ ARCHIVE = 'https://www.sec.gov/Archives/edgar/data/{cik}/{acc}'
 # Reverse lookup: XBRL tag -> our concept name, per namespace.
 _TAG_TO_CONCEPT = {
     tag: concept
-    for concept, tags in config.SEC_TAG_MAP.items()
+    for concept, tags in SEC_TAG_MAP.items()
     for tag in tags
 }
 _DEI_TAG_TO_CONCEPT = {
     tag: concept
-    for concept, tags in config.SEC_DEI_TAG_MAP.items()
+    for concept, tags in SEC_DEI_TAG_MAP.items()
     for tag in tags
 }
 NAMESPACES = (('us-gaap', _TAG_TO_CONCEPT), ('dei', _DEI_TAG_TO_CONCEPT))
@@ -660,7 +661,7 @@ def insiders_asof(tickers: list[str], as_of: date | str,
 
     return db.read_sql(f"""
         SELECT ticker, filed, txn_date, insider, role, txn_code,
-               shares, price, value
+               shares, price, value, post_txn_shares
         FROM insider_txns
         WHERE ticker IN ({ph}) AND filed BETWEEN :lo AND :hi
         ORDER BY filed DESC

@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-PYTHON="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+PYTHON="${PYTHON:-$(command -v python3)}"
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 

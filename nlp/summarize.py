@@ -13,7 +13,6 @@ configured.
 from __future__ import annotations
 
 import re
-from collections import Counter
 
 import numpy as np
 
@@ -104,28 +103,3 @@ def summarize(text: str, max_sentences: int = 3, max_chars: int = 400) -> str:
         out = out[:max_chars].rsplit(' ', 1)[0] + '…'
     return out
 
-
-def keywords(text: str, top_n: int = 8) -> list[str]:
-    """Most frequent meaningful terms."""
-    words = _words(text or '')
-    if not words:
-        return []
-    return [w for w, _c in Counter(words).most_common(top_n)]
-
-
-def digest(items: list[dict], max_items: int = 5) -> str:
-    """
-    One-paragraph rollup across several articles.
-
-    Used for the per-ticker news card and the daily report.
-    """
-    if not items:
-        return 'No recent coverage.'
-    lines = []
-    for it in items[:max_items]:
-        title = (it.get('title') or '').strip()
-        if not title:
-            continue
-        label = it.get('sentiment_label', '')
-        lines.append(f'{label} {title}'.strip())
-    return ' | '.join(lines) if lines else 'No recent coverage.'

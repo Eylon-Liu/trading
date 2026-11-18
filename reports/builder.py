@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -27,9 +27,9 @@ from data import news as NEWS
 from data import policy as POL
 from data import yahoo
 from data.universe import UniverseSpec
+from quant import compare as CMP
 from quant import custom as CU
 from quant import engine as ENG
-from quant import research as RS
 from quant import strategies as ST
 
 log = logging.getLogger(__name__)
@@ -333,7 +333,7 @@ def _gather_cross_strategy(as_of: date, compare_days: int = 1,
                                    as_of - timedelta(days=compare_days))
             if prev_run is None or prev_run['run_id'] == info['run_id']:
                 continue
-            comp = RS.compare_runs(prev_run['run_id'], info['run_id'])
+            comp = CMP.compare_runs(prev_run['run_id'], info['run_id'])
             if comp.empty:
                 continue
             changed = comp[comp['signal_changed']

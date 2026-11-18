@@ -117,13 +117,6 @@ def test_prune_enforces_the_entry_cap(cache_dir, frame, monkeypatch):
     assert len(list(cache_dir.glob('*.pkl'))) <= 5
 
 
-def test_clear_empties_the_cache(cache_dir, frame):
-    for i in range(3):
-        factorcache.save(f'c{i}', frame)
-    assert factorcache.clear() == 3
-    assert factorcache.stats()['entries'] == 0
-
-
 def test_stats_reports_entries_and_size(cache_dir, frame):
     factorcache.save('s1', frame)
     st = factorcache.stats()

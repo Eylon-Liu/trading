@@ -17,14 +17,12 @@ import logging
 from datetime import date
 
 import dash_bootstrap_components as dbc
-import pandas as pd
 from dash import Input, Output, State, callback, dcc, html, no_update
 
 from data.universe import PRESETS, UniverseSpec
 from nlp import llm as LLM
 from quant import compare as CMP
 from quant import custom as CU
-from quant import strategies as ST
 from ui import components as C
 from ui import theme as TH
 

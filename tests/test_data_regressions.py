@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import config
+from data.taxonomy import SEC_TAG_MAP
 from quant import factors as FA
 from quant import fundamentals as F
 
@@ -131,9 +131,9 @@ def test_the_debt_tag_whitelist_covers_the_concepts_the_code_reads():
     ingested, so it is silently always NaN.
     """
     for concept in ('total_debt', 'long_term_debt', 'short_term_debt'):
-        assert concept in config.SEC_TAG_MAP, \
+        assert concept in SEC_TAG_MAP, \
             f'{concept} is read but has no tags to ingest it from'
-        assert config.SEC_TAG_MAP[concept], f'{concept} maps to no tags'
+        assert SEC_TAG_MAP[concept], f'{concept} maps to no tags'
 
 
 def test_combined_debt_tags_are_not_duplicated_across_concepts():
@@ -142,7 +142,7 @@ def test_combined_debt_tags_are_not_duplicated_across_concepts():
     """
     seen: dict[str, str] = {}
     for concept in ('total_debt', 'long_term_debt', 'short_term_debt'):
-        for tag in config.SEC_TAG_MAP[concept]:
+        for tag in SEC_TAG_MAP[concept]:
             assert tag not in seen, \
                 f'{tag} is mapped to both {seen[tag]} and {concept}'
             seen[tag] = concept
@@ -307,7 +307,6 @@ def test_a_ten_x_error_is_far_outside_the_agreement_tolerance():
     The Lam Research case, stated as a bound: the split fault produced a 0.1x
     ratio, which no sane tolerance can absorb.
     """
-    from quant import validate as V
     assert abs(0.1 - 1.0) > 0.15, 'tolerance must not be wide enough to hide it'
 
 

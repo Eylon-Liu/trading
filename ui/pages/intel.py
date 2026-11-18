@@ -481,7 +481,6 @@ def _confirmation_scorecard(ticker: str, summary: dict, events: pd.DataFrame,
     supports, concerns, checks = [], [], []
 
     # News direction
-    notes = summary.get('direction_notes') or []
     analyst = summary.get('analyst_actions') or {}
     guidance = summary.get('guidance') or {}
 

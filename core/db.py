@@ -162,18 +162,6 @@ insider_txns = Table(
     Index('ix_insider_pit', 'ticker', 'filed'),
 )
 
-risk_factor_diffs = Table(
-    'risk_factor_diffs', metadata,
-    Column('ticker', String, primary_key=True),
-    Column('fy', Integer, primary_key=True),
-    Column('filed', Date, index=True),
-    Column('prev_filed', Date),
-    Column('pct_changed', Float),
-    Column('word_count', Integer),
-    Column('added_topics', Text),
-    Column('removed_topics', Text),
-)
-
 # Snapshot of provider-computed metrics that SEC does not carry (analyst
 # forward PE, beta). Accumulates a forward point-in-time record from the day
 # the app first runs — it can never be backfilled.
@@ -244,14 +232,6 @@ policy = Table(
     Column('affected_sectors', String),
     Column('affected_tickers', String),
 )
-
-macro = Table(
-    'macro', metadata,
-    Column('series_id', String, primary_key=True),
-    Column('date', Date, primary_key=True),
-    Column('value', Float),
-)
-
 
 # ─────────────────────────────────────────────
 # RUNS & SCORES

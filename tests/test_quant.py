@@ -19,15 +19,20 @@ from quant import tradeplan as TP
 # INDICATORS
 # ─────────────────────────────────────────────
 
+def _rsi(prices: pd.Series, period: int = 14) -> float:
+    return float(FA.rsi(prices.to_frame('x'), period=period)['x'])
+
+
 def test_wilder_rsi_all_gains_is_100():
+    """No down days is RSI 100 by definition — it used to come back NaN."""
     prices = pd.Series(np.arange(1, 40, dtype=float))
-    assert FA.wilder_rsi(prices) == pytest.approx(100.0)
+    assert _rsi(prices) == pytest.approx(100.0)
 
 
 def test_wilder_rsi_bounded_and_midrange_on_noise():
     rng = np.random.RandomState(7)
     prices = pd.Series(100 + np.cumsum(rng.randn(200)))
-    rsi = FA.wilder_rsi(prices)
+    rsi = _rsi(prices)
     assert 0 <= rsi <= 100
     assert 20 < rsi < 80
 
@@ -40,7 +45,7 @@ def test_wilder_rsi_differs_from_simple_moving_average_version():
     rng = np.random.RandomState(3)
     prices = pd.Series(100 + np.cumsum(rng.randn(120)))
 
-    wilder = FA.wilder_rsi(prices, period=14)
+    wilder = _rsi(prices, period=14)
 
     delta = prices.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
@@ -50,14 +55,17 @@ def test_wilder_rsi_differs_from_simple_moving_average_version():
     assert abs(wilder - simple) > 0.5, 'the two smoothings must not coincide'
 
 
+def test_rsi_needs_a_full_period_of_history():
+    assert np.isnan(_rsi(pd.Series([1.0, 2.0, 3.0])))
+
+
 def test_atr_is_positive_and_scales_with_range():
     n = 60
     idx = pd.date_range('2024-01-01', periods=n, freq='B')
-    close = pd.Series(np.full(n, 100.0), index=idx)
-    tight = TP  # noqa: F841  (keeps import used if ATR moves)
+    close = pd.DataFrame({'x': np.full(n, 100.0)}, index=idx)
 
-    narrow = FA.atr(close + 0.5, close - 0.5, close)
-    wide = FA.atr(close + 5.0, close - 5.0, close)
+    narrow = float(FA.atr(close + 0.5, close - 0.5, close)['x'])
+    wide = float(FA.atr(close + 5.0, close - 5.0, close)['x'])
     assert narrow > 0 and wide > narrow * 5
 
 

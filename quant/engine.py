@@ -25,7 +25,6 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
-import config
 from core import db
 from data import sync as SY
 from data.universe import UniverseSpec
@@ -43,7 +42,6 @@ class RunResult:
     as_of: date
     strategy: ST.Strategy
     scores: pd.DataFrame          # ranked, one row per name
-    factor_detail: pd.DataFrame   # per factor/ticker scoring intermediates
     plans: pd.DataFrame           # mid-term only; empty for long-term
     universe: list[str]
     sync: SY.SyncReport | None = None     # what the pull phase did
@@ -207,7 +205,7 @@ def _long_term_signal(row: pd.Series) -> tuple[str, float, str]:
 
     if np.isfinite(comp):
         if comp > 1.0:
-            score += 3; reasons.append('Top-decile composite')
+            score += 3; reasons.append('Very strong composite')
         elif comp > 0.5:
             score += 2; reasons.append('Strong composite')
         elif comp > 0:
@@ -293,14 +291,41 @@ def _mid_term_signal(row: pd.Series) -> tuple[str, float, str]:
     return label, score, '; '.join(reasons)
 
 
+# ─────────────────────────────────────────────
+# SIGNALS — AVOID LISTS (inverted strategies)
+# ─────────────────────────────────────────────
+
+def _avoid_signal(row: pd.Series) -> tuple[str, float, str]:
+    """
+    Grade a name on an inverted (worst-first) strategy.
+
+    The composite has already been negated, so a high value means a bad
+    business. Grading it with the buy-side ladders would print "Enter — full
+    size" on the name the strategy ranks worst.
+    """
+    comp = row.get('composite', np.nan)
+    if not np.isfinite(comp):
+        return '⚪ No flag', 0.0, ''
+    if comp > 1.0:
+        return '🔴 Avoid — review if held', comp, 'Severe deterioration'
+    if comp > 0.5:
+        return '🟠 Reduce / watch closely', comp, 'Clear deterioration'
+    if comp > 0:
+        return '🟡 Watch', comp, 'Mild deterioration'
+    return '⚪ No flag', comp, 'No meaningful deterioration'
+
+
 def generate_signals(scores: pd.DataFrame, raw: pd.DataFrame,
-                     horizon: str) -> pd.DataFrame:
+                     horizon: str, invert: bool = False) -> pd.DataFrame:
     """Attach horizon-appropriate signal, score and reasoning."""
     if scores.empty:
         return scores
 
     merged = scores.join(raw.drop(columns=['sector'], errors='ignore'), how='left')
-    fn = _mid_term_signal if horizon == 'mid' else _long_term_signal
+    if invert:
+        fn = _avoid_signal
+    else:
+        fn = _mid_term_signal if horizon == 'mid' else _long_term_signal
 
     results = [fn(row) for _i, row in merged.iterrows()]
     scores = scores.copy()
@@ -359,7 +384,7 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     if not universe:
         log.warning('universe resolved to zero names for %s', spec.describe())
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), [],
+                         pd.DataFrame(), pd.DataFrame(), [],
                          sync_report)
 
     if sync and not is_historical:
@@ -390,7 +415,7 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
                        _bt_events=_bt_events)
     if raw.empty:
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                         pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report)
 
     # Size filters are applied here, not during universe resolution. At
@@ -402,14 +427,14 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     if raw.empty:
         log.warning('size filters removed every name for %s', spec.describe())
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                         pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report)
 
     eligible = apply_filters(raw, strategy)
     if len(eligible) == 0:
         log.warning('all %d names filtered out by %s gates', len(raw), strategy.key)
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                         pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report)
     log.info('filters: %d/%d names eligible', len(eligible), len(raw))
 
@@ -417,10 +442,11 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     scores, detail, warnings = score_universe(raw_eligible, strategy, as_of)
     if scores.empty:
         return RunResult(str(uuid.uuid4()), as_of, strategy,
-                         pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), universe,
+                         pd.DataFrame(), pd.DataFrame(), universe,
                          sync_report, warnings)
 
-    scores = generate_signals(scores, raw_eligible, strategy.horizon)
+    scores = generate_signals(scores, raw_eligible, strategy.horizon,
+                              invert=strategy.invert)
     scores = scores.dropna(subset=['composite'])
     scores['rank'] = range(1, len(scores) + 1)
 
@@ -446,7 +472,7 @@ def run(spec: UniverseSpec, strategy_key: str | ST.Strategy,
     if persist:
         _persist(run_id, as_of, spec, strategy, universe, scores, detail)
 
-    return RunResult(run_id, as_of, strategy, scores, detail, plans, universe,
+    return RunResult(run_id, as_of, strategy, scores, plans, universe,
                      sync_report, warnings,
                      _fund_raw=fund_stash.get('result'))
 

@@ -36,13 +36,6 @@ FLOW_CONCEPTS = {
     'operating_cash_flow', 'capex', 'interest_expense', 'rnd',
     'dividends_paid', 'buybacks', 'eps_diluted',
 }
-# Stocks are instantaneous balances.
-STOCK_CONCEPTS = {
-    'assets', 'current_assets', 'liabilities', 'current_liabilities',
-    'equity', 'cash', 'long_term_debt', 'short_term_debt', 'total_debt',
-    'inventory', 'shares_diluted', 'shares_basic',
-}
-
 # Day-count windows for classifying a fact's span.
 QUARTER_DAYS = (60, 115)
 ANNUAL_DAYS = (330, 400)
@@ -706,8 +699,12 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
     # market cap; DELL's 1.8x (2018) landed at 1.39x, just outside the band.
     _recent_split_tickers: set[str] = set()
     if splits is not None and not splits.empty:
-        cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=400)
-        recent = splits[pd.to_datetime(splits['date']) >= cutoff]
+        # Bounded on both sides: a split after `as_of` had not happened yet,
+        # and letting it switch off the crosscheck is a decision made with
+        # knowledge of the future.
+        split_dates = pd.to_datetime(splits['date'])
+        recent = splits[(split_dates >= pd.Timestamp(as_of) - pd.Timedelta(days=400))
+                        & (split_dates <= pd.Timestamp(as_of))]
         _recent_split_tickers = set(recent['ticker'].unique())
 
     # Incremental mode: only recompute tickers with new filings.
@@ -871,60 +868,6 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
 # PIOTROSKI F-SCORE
 # ─────────────────────────────────────────────
 
-def piotroski_f(tickers: list[str], as_of: date | str,
-                facts_all: pd.DataFrame | None = None) -> pd.Series:
-    """
-    Piotroski F-Score (0-9): nine binary fundamental health tests.
-
-    Computed entirely from filed data, so it is honest at any historical date.
-
-    Accepts a pre-fetched `facts_all` for the same reason build_fundamentals
-    does: the two are always called together, and the fetch is not cheap.
-    """
-    if facts_all is None:
-        facts_all = sec.facts_asof(tickers, as_of)
-    if facts_all.empty:
-        return pd.Series(dtype=float)
-
-    scores = {}
-    for ticker, facts in facts_all.groupby('ticker'):
-        memo: dict = {}
-        ni = ttm(facts, 'net_income', memo=memo)
-        ocf = ttm(facts, 'operating_cash_flow', memo=memo)
-        assets = latest_stock(facts, 'assets', memo)
-        assets_prev = value_n_periods_ago(facts, 'assets', 1, memo)
-        rev = ttm(facts, 'revenue', memo=memo)
-        rev_prev = value_n_periods_ago(facts, 'revenue', 1, memo)
-        gp = ttm(facts, 'gross_profit', memo=memo)
-        gp_prev = value_n_periods_ago(facts, 'gross_profit', 1, memo)
-        ni_prev = value_n_periods_ago(facts, 'net_income', 1, memo)
-        ltd = latest_stock(facts, 'long_term_debt', memo)
-        ltd_prev = value_n_periods_ago(facts, 'long_term_debt', 1, memo)
-        ca, cl = latest_stock(facts, 'current_assets', memo), latest_stock(facts, 'current_liabilities', memo)
-        ca_p = value_n_periods_ago(facts, 'current_assets', 1, memo)
-        cl_p = value_n_periods_ago(facts, 'current_liabilities', 1, memo)
-        sh = latest_stock(facts, 'shares_diluted', memo)
-        sh_prev = value_n_periods_ago(facts, 'shares_diluted', 1, memo)
-
-        roa = _safe_div(ni, assets)
-        roa_prev = _safe_div(ni_prev, assets_prev)
-
-        tests = [
-            roa > 0,                                              # profitable
-            ocf > 0,                                              # cash generative
-            roa > roa_prev,                                       # improving returns
-            (ocf > ni) if np.isfinite(ocf) and np.isfinite(ni) else False,   # quality of earnings
-            _safe_div(ltd, assets) < _safe_div(ltd_prev, assets_prev),       # deleveraging
-            _safe_div(ca, cl) > _safe_div(ca_p, cl_p),            # liquidity up
-            (sh <= sh_prev * 1.02) if np.isfinite(sh) and np.isfinite(sh_prev) else False,
-            _safe_div(gp, rev) > _safe_div(gp_prev, rev_prev),    # margin up
-            _safe_div(rev, assets) > _safe_div(rev_prev, assets_prev),       # turnover up
-        ]
-        scores[ticker] = float(sum(1 for t in tests if t is True or t is np.True_))
-
-    return pd.Series(scores, name='piotroski_f')
-
-
 # ─────────────────────────────────────────────
 # ARITHMETIC HELPERS  (NaN-safe)
 # ─────────────────────────────────────────────
@@ -937,12 +880,6 @@ def _safe_div(a, b):
     if not np.isfinite(a) or not np.isfinite(b) or b == 0:
         return np.nan
     return a / b
-
-
-def _nan_sum(*vals):
-    finite = [float(v) for v in vals
-              if v is not None and np.isfinite(_as_float(v))]
-    return sum(finite) if finite else np.nan
 
 
 def _as_float(v):

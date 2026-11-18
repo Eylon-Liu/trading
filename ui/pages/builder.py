@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 
 import dash_bootstrap_components as dbc
-import pandas as pd
 from dash import ALL, Input, Output, State, callback, ctx, dcc, html, no_update
 
 from quant import custom as CU

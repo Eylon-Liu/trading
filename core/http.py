@@ -128,10 +128,6 @@ def _headers_for(host: str, extra: dict | None) -> dict:
     return h
 
 
-class RateLimited(Exception):
-    """Raised when a host keeps refusing after the retry budget is spent."""
-
-
 def fetch(
     url: str,
     params: dict | None = None,
@@ -238,21 +234,6 @@ def fetch_text(url: str, params: dict | None = None, category: str = '_default',
     if raw is None:
         return None
     return raw.decode('utf-8', errors='replace')
-
-
-def clear_cache(category: str | None = None) -> int:
-    """Delete cached responses. Returns the number of files removed."""
-    root = config.CACHE_DIR / category if category else config.CACHE_DIR
-    if not root.exists():
-        return 0
-    n = 0
-    for p in root.rglob('*.cache'):
-        try:
-            p.unlink()
-            n += 1
-        except OSError:
-            pass
-    return n
 
 
 def cache_stats() -> dict[str, dict[str, float]]:

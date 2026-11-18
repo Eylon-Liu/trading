@@ -35,6 +35,7 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
+from core import db
 from data.universe import UniverseSpec
 from quant import engine as EN
 from quant import strategies as ST
@@ -45,6 +46,37 @@ log = logging.getLogger(__name__)
 LOOKBACKS = {
     '1W': 7, '1M': 30, '3M': 91, '6M': 182, '1Y': 365,
 }
+
+
+# ─────────────────────────────────────────────
+# STORED RUNS
+# ─────────────────────────────────────────────
+
+def compare_runs(run_id_a: str, run_id_b: str) -> pd.DataFrame:
+    """
+    Rank migration between two stored runs.
+
+    This is what the -1M / -1Y comparison rests on: because every run is
+    persisted, "what changed" is a join rather than a re-computation.
+    """
+
+    a = db.read_sql(
+        'SELECT ticker, composite, rank, signal, sector FROM scores WHERE run_id = :r',
+        {'r': run_id_a}).set_index('ticker')
+    b = db.read_sql(
+        'SELECT ticker, composite, rank, signal FROM scores WHERE run_id = :r',
+        {'r': run_id_b}).set_index('ticker')
+    if a.empty or b.empty:
+        return pd.DataFrame()
+
+    joined = a.join(b, how='outer', lsuffix='_then', rsuffix='_now')
+    joined['rank_change'] = joined['rank_then'] - joined['rank_now']
+    joined['score_change'] = joined['composite_now'] - joined['composite_then']
+    joined['signal_changed'] = joined['signal_then'] != joined['signal_now']
+    joined['status'] = np.where(
+        joined['rank_then'].isna(), 'entered',
+        np.where(joined['rank_now'].isna(), 'dropped', 'held'))
+    return joined.sort_values('rank_change', ascending=False)
 
 
 # ─────────────────────────────────────────────

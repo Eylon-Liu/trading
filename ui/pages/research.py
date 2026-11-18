@@ -104,7 +104,9 @@ def _run_backtest(n_clicks, strategy, preset, start, holdings, rebalance):
                             label=base.label)
         strat = ST.get(strategy)
 
-        if strat.horizon == 'mid':
+        # An avoid list has no trade plans; it is tested by holding what it
+        # flags and checking that those names lag.
+        if strat.horizon == 'mid' and not strat.invert:
             res = BT.run_trade_backtest(spec, strategy, start,
                                         n_positions=holdings)
         else:
@@ -119,6 +121,12 @@ def _run_backtest(n_clicks, strategy, preset, start, holdings, rebalance):
 
     m = res.metrics
     panels = []
+    if m.get('inverted'):
+        panels.append(C.note(
+            'This strategy is an avoid list, so the portfolio below holds the '
+            'names it flags. Lagging the benchmark is the strategy working; '
+            'the rank IC is measured on the un-inverted score, so a positive '
+            'IC still means the flags predicted.', 'warn'))
 
     # The verdict first. Beating the benchmark is the headline a reader looks
     # for, and whether the ranking actually predicted is the one that decides

@@ -22,8 +22,6 @@ ROOT = Path(__file__).parent.resolve()
 DB_DIR = ROOT / 'db'
 CACHE_DIR = ROOT / 'cache'
 REPORT_DIR = ROOT / 'reports' / 'out'
-DATA_DIR = ROOT / 'data' / 'static'
-
 for _d in (DB_DIR, CACHE_DIR, REPORT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -92,7 +90,6 @@ RATE_LIMITS = {
     'wikimedia.org': 5.0,
     'news.google.com': 2.0,
     'www.federalregister.gov': 5.0,
-    'api.stlouisfed.org': 5.0,
     '_default': 3.0,
 }
 
@@ -223,31 +220,21 @@ TRADING_DAYS = {
     '1W': 5, '1M': 21, '3M': 63, '6M': 126,
     '1Y': 252, '2Y': 504, '3Y': 756, '5Y': 1260,
 }
-LOOKBACK_OPTIONS = ['1M', '3M', '6M', '1Y', '3Y', '5Y']
-REBALANCE_OPTIONS = {'M': 'Monthly', 'Q': 'Quarterly', 'SA': 'Semi-Annual', 'A': 'Annual'}
-
-
 # ─────────────────────────────────────────────
 # BACKTEST
 # ─────────────────────────────────────────────
 
 BENCHMARK_TICKER = 'SPY'
-RISK_FREE_SERIES = 'DGS3MO'      # FRED 3-month T-bill
-RISK_FREE_RATE = 0.05             # annualised fallback; update when FRED pipeline lands
+RISK_FREE_RATE = 0.05             # annualised, used for Sharpe / Sortino
 TRANSACTION_COST_BPS = 10.0      # one-way, per trade
 SLIPPAGE_BPS = 5.0
-DEFAULT_PORTFOLIO_SIZE = 20
-IC_HORIZONS = [1, 3, 6, 12]      # months, for IC-decay analysis
-QUINTILES = 5
 
 
 # ─────────────────────────────────────────────
 # SEC / XBRL
 # ─────────────────────────────────────────────
 
-# Tag maps live in data/taxonomy.py for independent testability. Re-exported
-# here so existing imports (config.SEC_TAG_MAP) keep working.
-from data.taxonomy import SEC_DEI_TAG_MAP, SEC_TAG_MAP  # noqa: E402, F401
+# XBRL tag maps live in data/taxonomy.py.
 
 # 8-K item codes worth treating as structured corporate events. These need no
 # NLP at all — the SEC already classified them.
@@ -267,16 +254,6 @@ EIGHTK_ITEMS = {
     '8.01': ('disclosure', 'Other events'),
 }
 
-# Form 4 transaction codes. P and S are the open-market ones that carry signal;
-# A/M/G are grants and option mechanics and are mostly noise.
-INSIDER_CODES = {
-    'P': ('buy', 'Open-market purchase'),
-    'S': ('sell', 'Open-market sale'),
-    'A': ('grant', 'Grant or award'),
-    'M': ('exercise', 'Option exercise'),
-    'G': ('gift', 'Gift'),
-    'F': ('tax', 'Shares withheld for tax'),
-}
 INSIDER_SIGNAL_CODES = {'P', 'S'}
 
 
@@ -359,18 +336,6 @@ LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'auto')
 LLM_MAX_ARTICLES = int(os.environ.get('LLM_MAX_ARTICLES', '12'))
 
 
-def llm_available() -> bool:
-    """True when an implemented LLM backend is configured.
-
-    Both backends live in nlp/providers.py. A key for any other vendor is not
-    a substitute, so it is not accepted here — silently ignoring an unusable
-    key is how you end up debugging a panel that never renders.
-    """
-    if (LLM_PROVIDER or 'auto').strip().lower() == 'off':
-        return False
-    return bool(ANTHROPIC_API_KEY or GEMINI_API_KEY)
-
-
 # ─────────────────────────────────────────────
 # EMAIL / REPORTS
 # ─────────────────────────────────────────────
@@ -384,9 +349,6 @@ SMTP_USER = (os.environ.get('SMTP_USER') or '').strip() or None
 # so they are stripped here rather than leaving the user to discover that a
 # copy-paste straight from Google fails authentication.
 SMTP_PASS = (os.environ.get('SMTP_PASS') or '').replace(' ', '').strip() or None
-FRED_API_KEY = os.environ.get('FRED_API_KEY')
-
-
 # ─────────────────────────────────────────────
 # UI THEME
 # ─────────────────────────────────────────────

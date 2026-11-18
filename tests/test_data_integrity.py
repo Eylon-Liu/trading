@@ -33,7 +33,6 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy import select
 
 import config
 from quant import factors as FA
@@ -359,7 +358,7 @@ def test_every_strategy_factor_is_documented():
     from quant import factor_docs as FD
     for key, strat in ST.ALL_STRATEGIES.items():
         for factor in strat.weights:
-            assert FD.doc_for(factor) is not None, \
+            assert factor in FD.FACTOR_DOCS, \
                 f'{key} weights {factor}, which has no FactorDoc'
 
 

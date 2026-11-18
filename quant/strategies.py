@@ -69,7 +69,10 @@ class Strategy:
 
     @property
     def needs_trade_plan(self) -> bool:
-        return HORIZONS[self.horizon]['needs_trade_plan']
+        # An inverted strategy is an avoid list. A long entry/stop/target on
+        # the names it ranks worst would be a plan to buy exactly what it says
+        # to stay away from.
+        return HORIZONS[self.horizon]['needs_trade_plan'] and not self.invert
 
 
 # ─────────────────────────────────────────────
@@ -106,7 +109,10 @@ STYLE_PROXIES: dict[str, list[tuple[str, str]]] = {
 DEFAULT_STYLE_PROXIES: dict[str, str] = {
     'value': 'EARNINGS_YIELD',
     'growth': 'REVENUE_GROWTH_1Y',
-    'momentum': 'RETURN_1M',
+    # Not RETURN_1M: a one-month return is the short-term *reversal* window,
+    # so as a higher-is-better default it ranks against the momentum premium
+    # this style is meant to capture. It stays selectable for comparison.
+    'momentum': 'MOM_6_1',
 }
 
 STYLE_FACTORS_KEY = 'style_factors'
@@ -189,9 +195,13 @@ LONG_TERM = {
         # rank correlations of 0.88 and 0.87 on live data. Weighting all three
         # put two-thirds of the strategy on one signal counted three times,
         # which is a concentrated momentum bet wearing a diversified label.
-        # One medium-horizon measure, one short, and the quality overlay.
+        #
+        # One momentum measure, skipping the latest month, plus the quality
+        # overlay. RETURN_1M used to carry 0.8 here, but the last month is the
+        # short-term reversal window: rewarding it positively in a quarterly
+        # strategy bought last month's winners just as they tend to give back.
         weights={
-            'RETURN_6M': 1.5, 'RETURN_1M': 0.8,
+            'MOM_12_1': 1.5,
             'ROIC': 0.8, 'ACCRUALS': 0.6, 'NET_DEBT_TO_EQUITY': 0.4,
         },
         filters={'min_market_cap': 2e9},
@@ -418,5 +428,6 @@ def summary_table() -> list[dict]:
         'horizon': HORIZONS[s.horizon]['label'],
         'description': s.description, 'thesis': s.thesis,
         'factors': len(s.weights),
-        'trade_plan': 'yes' if s.needs_trade_plan else 'no (thesis-based exit)',
+        'trade_plan': ('yes' if s.needs_trade_plan else
+                       'no (avoid list)' if s.invert else 'no (thesis-based exit)'),
     } for s in sorted(ALL_STRATEGIES.values(), key=lambda x: (x.horizon, x.key))]

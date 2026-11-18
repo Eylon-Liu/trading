@@ -19,7 +19,6 @@ from quant import strategies as ST
 
 def test_slug_is_prefixed_so_custom_keys_are_recognisable():
     assert CU.slugify('Quality Tilt').startswith(CU.CUSTOM_PREFIX)
-    assert CU.is_custom(CU.slugify('Quality Tilt'))
 
 
 def test_slug_does_not_double_prefix():

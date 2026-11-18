@@ -166,39 +166,6 @@ def policy_asof(as_of: date | str, lookback_days: int = 30,
     return df
 
 
-def policy_exposure(tickers: list[str], as_of: date | str,
-                    lookback_days: int = 30) -> pd.DataFrame:
-    """
-    How much recent policy activity touches each name's sector.
-
-    A count, not a judgement: regulation can be a tailwind or a headwind, and
-    the direction is not something a keyword match can honestly call.
-    """
-    df = policy_asof(as_of, lookback_days)
-    if df.empty or not tickers:
-        return pd.DataFrame()
-
-    ph = ','.join(f':t{i}' for i in range(len(tickers)))
-    secs = db.read_sql(
-        f'SELECT ticker, sector FROM securities WHERE ticker IN ({ph})',
-        {f't{i}': t for i, t in enumerate(tickers)})
-    if secs.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for _i, s in secs.iterrows():
-        hits = df[df['affected_sectors'].fillna('').str.contains(
-            str(s['sector']), regex=False)]
-        rows.append({
-            'ticker': s['ticker'], 'sector': s['sector'],
-            'policy_items_30d': len(hits),
-            'top_themes': ','.join(
-                sorted({t for th in hits['themes'].fillna('')
-                        for t in th.split(',') if t})[:4]),
-        })
-    return pd.DataFrame(rows).set_index('ticker')
-
-
 def sector_heat(as_of: date | str, lookback_days: int = 30) -> pd.DataFrame:
     """Policy document count per sector — drives the Intel tab heat panel."""
     df = policy_asof(as_of, lookback_days)
