@@ -594,8 +594,12 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'INSIDER_NET_BUY = (Σ buy value − Σ sell value) / (Σ buy + Σ sell)\n'
         '                  over Form 4 filings in the last 180 days,\n'
         '                  open-market transactions only (codes P and S).\n'
-        '                  Likely ESPP purchases are filtered out (recurring\n'
-        '                  quarterly buys under $25k by the same insider).\n'
+        '                  Excluded before scoring: Rule 10b5-1 plan trades;\n'
+        '                  footnoted ESPP / DRIP / 401(k) / sell-to-cover rows;\n'
+        '                  sales on an option-exercise day; 10% owners who are\n'
+        '                  not officers or directors; routine traders (same\n'
+        '                  month in each of the prior 3 years); recurring\n'
+        '                  small quarterly buys (unfootnoted ESPP pattern).\n'
         '                  Sells are conviction-weighted by % of holdings\n'
         '                  disposed (via post_txn_shares from Form 4).',
         'SEC Form 4 filings', 'higher',
@@ -613,8 +617,9 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
 
     'INSIDER_CLUSTER': FactorDoc(
         'INSIDER_CLUSTER', 'Insider Cluster Buying', 'Alt Data',
-        'INSIDER_CLUSTER = count of distinct insiders making open-market\n'
-        '                  purchases in the last 180 days',
+        'INSIDER_CLUSTER = count of distinct insiders making discretionary\n'
+        '                  open-market purchases of at least $10k in the\n'
+        '                  last 180 days (same exclusions as INSIDER_NET_BUY)',
         'SEC Form 4 filings', 'higher',
         'Several executives buying independently is a much stronger signal than '
         'one — it is harder to explain away as a personal liquidity decision.',
