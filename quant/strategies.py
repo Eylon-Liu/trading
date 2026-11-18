@@ -291,14 +291,23 @@ MID_TERM = {
     ),
     'earnings_drift': Strategy(
         key='earnings_drift', name='Post-Earnings Drift', horizon='mid',
-        description='Recent results filings plus positive price reaction (PEAD).',
-        thesis='Prices under-react to earnings news; exit at the target or when '
-               'the drift window closes.',
+        description='Large positive earnings surprises, bought while the drift '
+                    'window is still open (PEAD).',
+        thesis='Prices under-react to earnings news, so a big positive '
+               'surprise keeps drifting for weeks after it is public. Ranked on '
+               'standardized unexpected earnings (SUE), restricted to quarters '
+               'filed in the last 45 days; exit at the target or when the '
+               'drift window closes.',
+        # EVENT_RESULTS was the previous anchor: a count of 8-K item 2.02
+        # filings, which nearly every company makes once a quarter — so it was
+        # ~1 for everyone and ranked nothing. SUE measures the *size* of the
+        # surprise, and the filter supplies the timing that count was
+        # standing in for.
         weights={
-            'EVENT_RESULTS': 1.0, 'MOM_6_1': 1.0, 'RETURN_3M': 1.2,
-            'EARNINGS_GROWTH_1Y': 1.0, 'PCT_VS_MA50': 0.8,
+            'EARNINGS_SURPRISE': 2.0, 'MOM_6_1': 0.8,
+            'EARNINGS_GROWTH_1Y': 0.6, 'PCT_VS_MA50': 0.6,
         },
-        filters={'min_above_ma200': 1},
+        filters={'min_above_ma200': 1, 'max_days_since_results': 45},
         setup='momentum',
     ),
     'insider_cluster': Strategy(

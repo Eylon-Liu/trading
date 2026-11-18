@@ -56,6 +56,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     'MARKET_CAP': (1e7, 1e14),            # $10M to $100T
     'EPS_CAGR_3Y': (-1.0, 10.0),          # -100% to 10x/yr compounding
     'EQUITY_CAGR_3Y': (-1.0, 10.0),
+    'EARNINGS_SURPRISE': (-100.0, 100.0),   # in units of its own sd
+    'DAYS_SINCE_RESULTS': (0.0, 5000.0),    # negative means a future filing
     'RETURN_1M': (-1.0, 10.0),            # -100% is a total loss; 10x in a month
     'RETURN_6M': (-1.0, 50.0),
 }

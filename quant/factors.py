@@ -328,6 +328,14 @@ def fundamental_factors(tickers: list[str], as_of: date | str,
             if 'trailing_pe' in prof else np.nan
 
     out['PIOTROSKI_F'] = fund['piotroski_f']
+
+    # ── earnings surprise (post-earnings drift) ───────────────────
+    # SUE itself is a property of the filings. How long ago the quarter
+    # became public depends on the as-of date, so it is computed here rather
+    # than in the fundamentals row, which is reused across dates.
+    out['EARNINGS_SURPRISE'] = fund['earnings_surprise']
+    out['DAYS_SINCE_RESULTS'] = (
+        pd.Timestamp(as_of) - pd.to_datetime(fund['last_quarter_filed'])).dt.days
     out['DATA_AS_OF'] = fund['last_filed']
     return out
 
@@ -703,6 +711,8 @@ FACTOR_DIRECTION: dict[str, bool] = {
     'NET_MARGIN': True, 'OPERATING_MARGIN': True, 'ASSET_TURNOVER': True,
     'CURRENT_RATIO': True, 'PIOTROSKI_F': True, 'FCF_CONVERSION': True,
     'EVENT_RESULTS': True,          # a recent results filing opens the drift window
+    'EARNINGS_SURPRISE': True,      # SUE: y/y quarterly change / its own volatility
+    'DAYS_SINCE_RESULTS': False,    # fresher results, more drift left
     'ACCRUALS': False, 'DEBT_TO_EQUITY': False, 'NET_DEBT_TO_EQUITY': False,
     'REVENUE_GROWTH_1Y': True, 'REVENUE_CAGR_3Y': True,
     'EARNINGS_GROWTH_1Y': True, 'EQUITY_CAGR_3Y': True, 'EPS_CAGR_3Y': True,

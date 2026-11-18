@@ -530,6 +530,47 @@ def value_n_periods_ago(facts: pd.DataFrame, concept: str, years: int,
     return float(prior.iloc[-1]['val']) if not prior.empty else np.nan
 
 
+# Quarters of year-over-year changes used to scale the latest surprise.
+SUE_WINDOW = 8
+SUE_MIN_CHANGES = 4
+
+
+def earnings_surprise(facts: pd.DataFrame, memo: dict | None = None
+                      ) -> tuple[float, pd.Timestamp | None]:
+    """
+    Standardized unexpected earnings (SUE) for the most recent quarter, and
+    the date that quarter became public.
+
+    Expectation is a seasonal random walk — the same quarter a year earlier —
+    so the surprise is the year-over-year change, scaled by how volatile those
+    changes have been over the last two years (Foster, Olsen & Shevlin 1984;
+    Bernard & Thomas 1989). No analyst estimates are needed, so it is
+    computable from filed XBRL at any historical date.
+
+    Net income rather than EPS: quarterly EPS for a Q4 is derived by
+    differencing cumulative figures that straddle share-count changes, which
+    makes it noisier than the income it divides.
+
+    The date returned is the quarter's `filed` date — the 10-Q/10-K, which can
+    trail the earnings release by weeks. That is the first day the number
+    exists in this store, so using it can only make the signal later, never
+    earlier.
+    """
+    q = quarterly_flows(facts, 'net_income', memo)
+    if q.empty or len(q) < 4 + SUE_MIN_CHANGES:
+        return np.nan, None
+    vals = q['val'].to_numpy(dtype=float)
+    changes = vals[4:] - vals[:-4]                 # y/y change per quarter
+    recent = changes[-SUE_WINDOW:]
+    recent = recent[np.isfinite(recent)]
+    if len(recent) < SUE_MIN_CHANGES or not np.isfinite(changes[-1]):
+        return np.nan, None
+    sd = float(np.std(recent[:-1], ddof=1)) if len(recent) > 2 else np.nan
+    if not np.isfinite(sd) or sd <= 0:
+        return np.nan, None
+    return float(changes[-1] / sd), pd.Timestamp(q['filed'].iloc[-1])
+
+
 # Book equity below this share of assets makes any equity-denominated ratio
 # meaningless rather than merely large.
 MIN_EQUITY_TO_ASSETS = 0.01
@@ -647,6 +688,38 @@ def adjust_shares_for_splits(facts: pd.DataFrame,
     return facts
 
 
+def _valid_until(facts: pd.DataFrame, memo: dict, ticker: str,
+                 as_of: pd.Timestamp, splits: pd.DataFrame | None) -> pd.Timestamp:
+    """
+    The first date on which this ticker's row could differ *without* a new
+    filing.
+
+    Two inputs depend on the as-of date rather than on the filings alone:
+    whether a share count is still fresh (MAX_SHARE_COUNT_AGE_DAYS after it
+    was filed) and whether a split sits inside the crosscheck window
+    (SPLIT_WINDOW_DAYS). A row can be carried to a later date only while both
+    answers are unchanged; past this date it must be rebuilt.
+    """
+    flips: list[pd.Timestamp] = []
+    for concept in SHARE_CONCEPTS:
+        filed = _latest_filed_date(facts, concept, memo)
+        if filed is not None:
+            expiry = pd.Timestamp(filed) + pd.Timedelta(days=MAX_SHARE_COUNT_AGE_DAYS + 1)
+            if expiry > as_of:
+                flips.append(expiry)
+    if splits is not None and not splits.empty:
+        dates = pd.to_datetime(splits.loc[splits['ticker'] == ticker, 'date'])
+        for d in dates:
+            for flip in (d, d + pd.Timedelta(days=SPLIT_WINDOW_DAYS + 1)):
+                if flip > as_of:
+                    flips.append(flip)
+    return min(flips) if flips else pd.Timestamp.max
+
+
+# A split this recent switches off the share-count crosscheck.
+SPLIT_WINDOW_DAYS = 400
+
+
 def build_fundamentals(tickers: list[str], as_of: date | str,
                        facts_all: pd.DataFrame | None = None,
                        splits: pd.DataFrame | None = None,
@@ -703,16 +776,26 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         # and letting it switch off the crosscheck is a decision made with
         # knowledge of the future.
         split_dates = pd.to_datetime(splits['date'])
-        recent = splits[(split_dates >= pd.Timestamp(as_of) - pd.Timedelta(days=400))
+        recent = splits[(split_dates >= pd.Timestamp(as_of)
+                         - pd.Timedelta(days=SPLIT_WINDOW_DAYS))
                         & (split_dates <= pd.Timestamp(as_of))]
         _recent_split_tickers = set(recent['ticker'].unique())
 
-    # Incremental mode: only recompute tickers with new filings.
+    # Incremental mode: only recompute tickers with new filings, or whose
+    # as-of-dependent inputs have expired (see _valid_until). Carrying a row
+    # past its expiry would let a backtest keep a share count the live screen
+    # had already discarded as stale.
+    as_of_ts = pd.Timestamp(as_of)
     carry = pd.DataFrame()
     if _prev_result is not None and _changed_tickers is not None:
         available = set(facts_all['ticker'].unique())
+        prev_valid = (_prev_result['valid_until']
+                      if 'valid_until' in _prev_result else
+                      pd.Series(pd.Timestamp.min, index=_prev_result.index))
+        expired = set(prev_valid.index[prev_valid <= as_of_ts])
         recompute = {t for t in available
-                     if t in _changed_tickers or t not in _prev_result.index}
+                     if t in _changed_tickers or t in expired
+                     or t not in _prev_result.index}
         carry_idx = [t for t in available
                      if t not in recompute and t in _prev_result.index]
         if carry_idx:
@@ -802,6 +885,8 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         ]
         pf_score = float(sum(1 for t in pf_tests if t is True or t is np.True_))
 
+        sue, last_q_filed = earnings_surprise(f, memo)
+
         tag_audit = memo.get(_TAG_AUDIT_KEY, {})
         rev_tag = tag_audit.get('revenue', '')
         ni_tag = tag_audit.get('net_income', '')
@@ -853,6 +938,9 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
                           value_n_periods_ago(f, 'shares_diluted', 3, memo)),
                 3),
             'piotroski_f': pf_score,
+            'earnings_surprise': sue,
+            'last_quarter_filed': last_q_filed if last_q_filed is not None else pd.NaT,
+            'valid_until': _valid_until(f, memo, ticker, as_of_ts, splits),
             'last_filed': max(all_filed) if all_filed else pd.NaT,
             'last_period_end': max(all_pe) if all_pe else pd.NaT,
         })

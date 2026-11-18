@@ -342,6 +342,31 @@ FACTOR_DOCS: dict[str, FactorDoc] = {
         'Presence only — the code says results were filed, not whether they '
         'beat or missed. The price reaction carries that information.'),
 
+    'EARNINGS_SURPRISE': FactorDoc(
+        'EARNINGS_SURPRISE', 'Standardized Unexpected Earnings (SUE)', 'Growth',
+        'ΔNI_q        = NI(latest quarter) − NI(same quarter a year earlier)\n'
+        'SUE          = ΔNI_q / sd(ΔNI over the prior up-to-7 quarters)\n'
+        'needs ≥ 8 quarters of history; dated by the quarter\'s filing',
+        'SEC XBRL quarterly net income (Q4 derived from the annual figure)',
+        'higher',
+        'The surprise in a quarter, measured against a seasonal random walk and '
+        'scaled by how volatile the company\'s earnings changes usually are. '
+        'Large positive SUE is the classic post-earnings-announcement-drift '
+        'signal (Bernard & Thomas 1989), and it needs no analyst estimates, so '
+        'it is point-in-time at any historical date.',
+        'Dated by the 10-Q/10-K, which can trail the press release by weeks, so '
+        'part of the drift is gone before the number is in the store. Pair it '
+        'with DAYS_SINCE_RESULTS to stay inside the drift window.'),
+
+    'DAYS_SINCE_RESULTS': FactorDoc(
+        'DAYS_SINCE_RESULTS', 'Days Since Latest Quarter Filed', 'Growth',
+        'DAYS_SINCE_RESULTS = as_of − filed date of the latest quarter',
+        'SEC XBRL filing dates', 'lower',
+        'How fresh the latest reported quarter is. Used as a filter rather than '
+        'a ranking factor: post-earnings drift lives in the weeks after the '
+        'results, not three months later.',
+        'Measured from the filing, not the earnings call.'),
+
     'EVENT_MANAGEMENT': FactorDoc(
         'EVENT_MANAGEMENT', '8-K Management Changes', 'Alt Data',
         'EVENT_MANAGEMENT = count of 8-K filings carrying item 5.02\n'

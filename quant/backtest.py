@@ -542,6 +542,7 @@ def run_trade_backtest(spec: UniverseSpec, strategy_key: str | ST.Strategy,
             gross = sim['exit'] / sim['fill'] - 1.0
             risk = (sim['fill'] - float(plan['stop'])) / sim['fill']
             trades.append({
+                'scan_date': d0,
                 'entry_date': sim['fill_date'], 'exit_date': sim['exit_date'],
                 'ticker': t, 'entry': round(sim['fill'], 2),
                 'exit': round(sim['exit'], 2), 'reason': sim['reason'],

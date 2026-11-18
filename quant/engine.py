@@ -183,8 +183,20 @@ def apply_filters(raw: pd.DataFrame, strategy: ST.Strategy) -> pd.Index:
     if f.get('min_market_cap') and 'MARKET_CAP' in raw:
         mcap = pd.to_numeric(raw['MARKET_CAP'], errors='coerce')
         keep &= mcap.isna() | (mcap >= f['min_market_cap'])
+    if f.get('max_days_since_results'):
+        # Outside the drift window there is nothing to drift; a name with no
+        # dated quarter is not inside it either.
+        days = pd.to_numeric(raw.get('DAYS_SINCE_RESULTS'), errors='coerce') \
+            if 'DAYS_SINCE_RESULTS' in raw else pd.Series(np.nan, index=raw.index)
+        keep &= days.notna() & (days <= f['max_days_since_results'])
 
     return raw.index[keep]
+
+
+# Every filter key apply_filters understands. A strategy naming any other key
+# would have it silently ignored, so tests check strategies against this.
+FILTER_KEYS = frozenset({'min_above_ma200', 'rsi_max', 'rsi_min',
+                         'min_market_cap', 'max_days_since_results'})
 
 
 # ─────────────────────────────────────────────

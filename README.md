@@ -253,6 +253,11 @@ python3 -m pytest -q
 
 The suite covers the transforms against hand-computed values, Wilder RSI against a reference, TTM assembly from a fixture containing the real Apple duplicate-duration case and a restatement, trade-plan sizing arithmetic, backtest metrics against an analytically known curve, and the point-in-time assertions — including that a factor computed as of date `T` references no row dated after `T`.
 
+Two suites guard the backtest's honesty end to end, on a synthetic store built in the test:
+
+- **`tests/test_backtest_integrity.py`** — *future-perturbation invariance*: a second store rewrites everything dated after a cutoff (prices, a later restatement, a post-cutoff split, insider trades, 8-Ks, that day's pageviews) and every built-in strategy must score identically at the cutoff, on both the live and the backtest path. It also checks that the backtest path equals a fresh live screen (including the incremental fundamentals carry across a share count going stale), that fills land strictly after the scan, that the mid-term book never exceeds 100% or double-holds, and that every factor source moves the cache version.
+- **`tests/test_strategy_sanity.py`** — every strategy's filters are understood by the engine, every factor is documented and sourced, avoid lists get no long plans, no long strategy rewards the one-month reversal window, SUE arithmetic, and a dead-code guard that fails on any top-level definition referenced nowhere.
+
 ---
 
 ## Known limitations
