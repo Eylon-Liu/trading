@@ -310,7 +310,6 @@ def _run_validation(n_clicks, universe, survivorship):
         ])
 
     verdict = 'pass' if not errors else 'FAIL'
-    verdict_color = TH.POS if not errors else TH.NEG
 
     return html.Div([
         header,
@@ -367,7 +366,6 @@ def _health_badge(active_tab):
             color, verdict = TH.POS, 'All sources fresh'
             suffix = ''
 
-        last = SY.last_session()
         last_pulled = fresh['last refreshed'].replace('never', pd.NaT)
         last_pulled = pd.to_datetime(last_pulled, errors='coerce')
         newest_pull = last_pulled.max()

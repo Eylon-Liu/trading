@@ -159,6 +159,13 @@ insider_txns = Table(
     Column('price', Float),
     Column('value', Float),
     Column('post_txn_shares', Float),
+    # Why a row may not be a discretionary trade, comma-separated: '10b5-1'
+    # (pre-scheduled plan), 'plan' (ESPP / DRIP / 401(k) / sell-to-cover per
+    # its footnote), 'exercise' (a sale of shares just acquired by exercise).
+    Column('flags', String),
+    # Parser version that wrote the row; older rows are re-parsed from the
+    # cached filing so a parser fix reaches stored history.
+    Column('parse_version', Integer),
     Index('ix_insider_pit', 'ticker', 'filed'),
 )
 
@@ -452,8 +459,40 @@ def init_db() -> None:
     """Create every table and index if absent. Safe to run repeatedly."""
     eng = get_engine()
     metadata.create_all(eng)
+    _ensure_columns(eng)
     _ensure_indexes(eng)
     log.info('schema ready at %s', config.DATABASE_URL)
+
+
+def _ensure_columns(eng: Engine) -> None:
+    """
+    Add nullable columns declared in the schema but missing from the database.
+
+    `create_all` never alters a table that already exists, so a column added
+    to the schema later — insider_txns.flags, for one — would otherwise be
+    absent from every store built before it, and the first write naming it
+    would fail. Only nullable, non-key columns are added; anything else needs
+    a real migration and is reported instead.
+    """
+    from sqlalchemy import inspect
+    insp = inspect(eng)
+    existing_tables = set(insp.get_table_names())
+    with eng.begin() as conn:
+        for table in metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            have = {c['name'] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                if col.primary_key or not col.nullable:
+                    log.warning('column %s.%s is missing and cannot be added '
+                                'automatically', table.name, col.name)
+                    continue
+                coltype = col.type.compile(dialect=conn.dialect)
+                conn.execute(text(f'ALTER TABLE {table.name} '
+                                  f'ADD COLUMN {col.name} {coltype}'))
+                log.info('added column %s.%s', table.name, col.name)
 
 
 def _ensure_indexes(eng: Engine) -> None:

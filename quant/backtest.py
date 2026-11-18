@@ -43,7 +43,7 @@ from quant import engine as EN
 from quant import factorcache
 from quant import strategies as ST
 from quant import tradeplan as TP
-from quant.factors import PRICE_LOOKBACK_DAYS
+from quant.factors import INSIDER_HISTORY_DAYS, PRICE_LOOKBACK_DAYS
 from quant.fundamentals import adjust_shares_for_splits
 
 log = logging.getLogger(__name__)
@@ -168,8 +168,11 @@ def _preload(spec: UniverseSpec, start: date, end: date,
     # the degraded-run check.
     ohlc = yahoo.bulk_ohlc(sorted(set(names) | {config.BENCHMARK_TICKER}),
                            start=start - timedelta(days=lookback), end=end)
+    # Insider history reaches back past the window: each trade is classified
+    # against the insider's prior three years (routine vs. opportunistic).
     insiders = sec.insiders_asof(names, end,
-                                 lookback_days=(end - start).days + 180) \
+                                 lookback_days=(end - start).days
+                                 + INSIDER_HISTORY_DAYS) \
         if names else pd.DataFrame()
     events = sec.events_asof(names, end, lookback_days=(end - start).days + 90) \
         if names else pd.DataFrame()

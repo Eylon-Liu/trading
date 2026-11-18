@@ -24,6 +24,7 @@ from data import policy as POL
 from data import sec as SEC
 from nlp import eightk as EK
 from nlp import llm as LLM
+from quant import factors as FA
 from ui import components as C
 from ui import theme as TH
 
@@ -482,7 +483,6 @@ def _confirmation_scorecard(ticker: str, summary: dict, events: pd.DataFrame,
     supports, concerns, checks = [], [], []
 
     # News direction
-    notes = summary.get('direction_notes') or []
     analyst = summary.get('analyst_actions') or {}
     guidance = summary.get('guidance') or {}
 
@@ -506,6 +506,9 @@ def _confirmation_scorecard(ticker: str, summary: dict, events: pd.DataFrame,
     # holdings context because most are routine compensation events.
     if not insiders.empty:
         signal = insiders[insiders['txn_code'].isin(['P', 'S'])].copy()
+        # Plan trades, exercise sales and fund (10% holder) trades are not
+        # decisions; the screen's insider factor drops them, and so does this.
+        signal = signal[FA.insider_note(signal) == '']
         if not signal.empty:
             buys = signal[signal['shares'] > 0]['value'].sum()
             sells = signal[signal['shares'] < 0]['value'].sum()
@@ -924,17 +927,21 @@ def _load_company(n_clicks, ticker, days):
                     and r['post_txn_shares'] + abs(r['shares_raw']) > 0
                     else np.nan, axis=1)
 
-            buys = signal[signal['side'] == 'BUY']['value'].sum()
-            sells = signal[signal['side'] == 'SELL']['value'].sum()
-            n_buyers = signal[signal['side'] == 'BUY']['insider'].nunique()
-            n_sellers = signal[signal['side'] == 'SELL']['insider'].nunique()
+            # Every row is listed, but only discretionary ones are counted:
+            # the note says why a row is left out of the totals.
+            signal['note'] = FA.insider_note(signal)
+            chosen = signal[signal['note'] == '']
+            buys = chosen[chosen['side'] == 'BUY']['value'].sum()
+            sells = chosen[chosen['side'] == 'SELL']['value'].sum()
+            n_buyers = chosen[chosen['side'] == 'BUY']['insider'].nunique()
+            n_sellers = chosen[chosen['side'] == 'SELL']['insider'].nunique()
 
             # Interpret the insider activity
-            interpretation = _insider_interpretation(signal, buys, sells,
+            interpretation = _insider_interpretation(chosen, buys, sells,
                                                      n_buyers, n_sellers)
 
             show_cols = ['txn_date', 'insider', 'role', 'side',
-                         'shares', 'price', 'value']
+                         'shares', 'price', 'value', 'note']
             if has_holdings and signal['pct_of_holdings'].notna().any():
                 signal['% held'] = signal['pct_of_holdings'].apply(
                     lambda v: f'{v:.0f}%' if pd.notna(v) else '—')
@@ -942,8 +949,8 @@ def _load_company(n_clicks, ticker, days):
 
             panels.append(C.card('👤 Insider activity (Form 4, open market)', [
                 C.metric_row([
-                    (f'${buys/1e6:.1f}M', 'bought', TH.POS),
-                    (f'${sells/1e6:.1f}M', 'sold', TH.NEG),
+                    (f'${buys/1e6:.1f}M', 'bought (discretionary)', TH.POS),
+                    (f'${sells/1e6:.1f}M', 'sold (discretionary)', TH.NEG),
                     (n_buyers, 'distinct buyers', TH.TEXT),
                     (n_sellers, 'distinct sellers', TH.TEXT),
                 ]),

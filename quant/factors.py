@@ -452,6 +452,148 @@ def _sell_conviction_weight(row) -> float:
 
 
 # ─────────────────────────────────────────────
+# INSIDER SIGNAL — WHICH TRADES ARE DECISIONS
+# ─────────────────────────────────────────────
+
+# Trades scored are those filed in the last INSIDER_WINDOW_DAYS; each is
+# classified against the insider's own ROUTINE_YEARS prior years of trading.
+INSIDER_WINDOW_DAYS = 180
+ROUTINE_YEARS = 3
+INSIDER_HISTORY_DAYS = INSIDER_WINDOW_DAYS + 366 * ROUTINE_YEARS + 31
+
+# A token purchase is not a vote of confidence; it does not make a cluster.
+MIN_CLUSTER_BUY_VALUE = 10_000
+
+# Parser flags (data/sec.py) marking a row as mechanics rather than a choice.
+NON_DISCRETIONARY_FLAGS = frozenset({'10b5-1', 'plan', 'exercise'})
+
+
+def _flagged(flags: pd.Series) -> pd.Series:
+    """True where a row carries any non-discretionary flag."""
+    parts = flags.fillna('').astype(str).str.split(',')
+    return parts.map(lambda fs: bool(NON_DISCRETIONARY_FLAGS.intersection(fs)))
+
+
+def _holder_only(role: pd.Series) -> pd.Series:
+    """
+    True for a 10% owner that is neither a director nor an officer.
+
+    Those are usually funds. Their trades follow fund flows, mandates and
+    exits rather than knowledge of the business, and the evidence that
+    officers' and directors' purchases predict returns does not extend to
+    them.
+    """
+    r = role.fillna('').astype(str)
+    return (r.str.contains('10% Owner', regex=False)
+            & ~r.str.contains('Director', regex=False)
+            & ~r.str.contains('Officer', regex=False))
+
+
+_FLAG_LABELS = {'10b5-1': '10b5-1 plan', 'plan': 'plan purchase/sale',
+                'exercise': 'exercise sale'}
+
+
+def insider_note(df: pd.DataFrame) -> pd.Series:
+    """Why each row is not scored as a decision, or '' when it is (for the UI)."""
+    notes = []
+    flags = df['flags'] if 'flags' in df else pd.Series('', index=df.index)
+    holder = _holder_only(df['role']) if 'role' in df else pd.Series(False, index=df.index)
+    for f, h in zip(flags.fillna(''), holder):
+        why = [_FLAG_LABELS[x] for x in str(f).split(',') if x in _FLAG_LABELS]
+        if h:
+            why.append('10% holder only')
+        notes.append(', '.join(why))
+    return pd.Series(notes, index=df.index)
+
+
+def routine_trades(trades: pd.DataFrame, history: pd.DataFrame,
+                   years: int = ROUTINE_YEARS) -> pd.Series:
+    """
+    Pure: True for trades by an insider who traded in the same calendar month
+    in each of the previous `years` years (Cohen, Malloy & Pomorski 2012).
+
+    Routine traders — about half of all insider trades — earn essentially no
+    abnormal return; the predictive power sits in the opportunistic rest.
+    `history` holds the open-market trades knowable at the as-of date; an
+    insider without that much history is treated as opportunistic.
+    """
+    if trades.empty or history.empty:
+        return pd.Series(False, index=trades.index)
+    hd = pd.to_datetime(history['txn_date'])
+    seen = set(zip(history['ticker'], history['insider'], hd.dt.year, hd.dt.month))
+    td = pd.to_datetime(trades['txn_date'])
+    keys = zip(trades['ticker'], trades['insider'], td.dt.year, td.dt.month)
+    return pd.Series([all((t, i, y - k, m) in seen for k in range(1, years + 1))
+                      for t, i, y, m in keys], index=trades.index)
+
+
+def insider_signal(ins: pd.DataFrame, as_of: date | str,
+                   window_days: int = INSIDER_WINDOW_DAYS) -> pd.DataFrame:
+    """
+    Pure: INSIDER_NET_BUY and INSIDER_CLUSTER per ticker from Form 4 rows.
+
+    Most of what Form 4 reports is not a decision: grants (A), exercises (M)
+    and tax withholding (F) are excluded by code, and qualified ESPP purchases
+    are not reported at all. What remains under the open-market codes P and S
+    is still diluted by five things, each removed here before scoring:
+
+      1. trades under a Rule 10b5-1 plan, scheduled months in advance;
+      2. footnoted plan mechanics — ESPP, DRIP, 401(k), sell-to-cover;
+      3. sales that are the cashless leg of an option exercise;
+      4. 10% owners who are not officers or directors (mostly funds);
+      5. routine traders, who trade in the same month every year;
+    plus small, regular, quarterly purchases that look like payroll plans
+    even without a footnote (`_filter_likely_espp`).
+
+    `ins` may hold rows older than the window: they are the history the
+    routine test needs. Rows filed after `as_of` must not be present.
+    """
+    empty = pd.DataFrame(columns=['INSIDER_NET_BUY', 'INSIDER_CLUSTER'])
+    if ins is None or ins.empty:
+        return empty
+    cutoff = pd.Timestamp(as_of)
+    ps = ins[ins['txn_code'].isin(config.INSIDER_SIGNAL_CODES)]
+    filed = pd.to_datetime(ps['filed'])
+    history = ps[filed <= cutoff]
+    signal = history[pd.to_datetime(history['filed'])
+                     >= cutoff - pd.Timedelta(days=window_days)].copy()
+    if signal.empty:
+        return empty
+
+    if 'flags' in signal:
+        signal = signal[~_flagged(signal['flags'])]
+    if 'role' in signal:
+        signal = signal[~_holder_only(signal['role'])]
+    signal = signal[~routine_trades(signal, history)]
+    signal = _filter_likely_espp(signal)
+    if signal.empty:
+        return empty
+
+    signal['buy_val'] = np.where(signal['shares'] > 0, signal['value'].fillna(0), 0.0)
+    signal['sell_raw'] = np.where(signal['shares'] < 0, signal['value'].fillna(0), 0.0)
+    signal['sell_val'] = signal['sell_raw']
+    # Weight sells by % of holdings: a director selling 3% of their position
+    # is diversification; a CEO selling 40% is a conviction signal.
+    if 'post_txn_shares' in signal.columns:
+        signal['sell_val'] = signal['sell_raw'] * signal.apply(
+            _sell_conviction_weight, axis=1)
+
+    agg = signal.groupby('ticker').agg(
+        buy=('buy_val', 'sum'), sell=('sell_val', 'sum'), sell_raw=('sell_raw', 'sum'))
+    # Unweighted denominator: with the weighted one, any sell-only name came
+    # out at exactly -1 whatever its conviction weight.
+    total = agg['buy'] + agg['sell_raw']
+    out = pd.DataFrame(index=agg.index)
+    out['INSIDER_NET_BUY'] = (agg['buy'] - agg['sell']) / total.replace(0, np.nan)
+    # Distinct insiders making a real purchase, after every filter above.
+    real_buys = signal[(signal['shares'] > 0)
+                       & (signal['value'].fillna(0) >= MIN_CLUSTER_BUY_VALUE)]
+    out['INSIDER_CLUSTER'] = (real_buys.groupby('ticker')['insider'].nunique()
+                              .reindex(out.index).fillna(0))
+    return out
+
+
+# ─────────────────────────────────────────────
 # ALTERNATIVE-DATA FACTORS
 # ─────────────────────────────────────────────
 
@@ -467,50 +609,21 @@ def alt_factors(tickers: list[str], as_of: date | str,
     as_of = pd.to_datetime(as_of).date()
     out = pd.DataFrame(index=pd.Index(tickers, name='ticker'))
 
-    # ── insider activity (Form 4, open-market only) ───────────────
+    # ── insider activity (Form 4, discretionary trades only) ──────
+    # History reaches back beyond the scoring window so each trade can be
+    # classified as routine or opportunistic; see insider_signal.
     if _bt_insiders is not None:
         cutoff = pd.Timestamp(as_of)
-        lo = cutoff - pd.Timedelta(days=180)
-        mask = ((_bt_insiders['filed'] >= lo)
+        mask = ((_bt_insiders['filed'] >= cutoff - pd.Timedelta(days=INSIDER_HISTORY_DAYS))
                 & (_bt_insiders['filed'] <= cutoff)
                 & (_bt_insiders['ticker'].isin(tickers)))
         ins = _bt_insiders[mask]
     else:
-        ins = sec.insiders_asof(tickers, as_of, lookback_days=180)
-    if not ins.empty:
-        signal = ins[ins['txn_code'].isin(config.INSIDER_SIGNAL_CODES)].copy()
-        if not signal.empty:
-            # Filter out likely ESPP purchases: small recurring buys at
-            # regular intervals are compensation mechanics, not conviction.
-            signal = _filter_likely_espp(signal)
-
-            signal['buy_val'] = np.where(signal['shares'] > 0,
-                                         signal['value'].fillna(0), 0.0)
-            signal['sell_raw'] = np.where(signal['shares'] < 0,
-                                          signal['value'].fillna(0), 0.0)
-            signal['sell_val'] = signal['sell_raw']
-
-            # Weight sells by % of holdings: a director selling 3% of their
-            # position is routine diversification; a CEO selling 40% is a
-            # conviction signal.  When post_txn_shares is available, scale
-            # sell value by the fraction disposed.
-            if 'post_txn_shares' in signal.columns:
-                signal['sell_conviction'] = signal.apply(
-                    _sell_conviction_weight, axis=1)
-                signal['sell_val'] = signal['sell_raw'] * signal['sell_conviction']
-
-            agg = signal.groupby('ticker').agg(
-                buy=('buy_val', 'sum'), sell=('sell_val', 'sum'),
-                sell_raw=('sell_raw', 'sum'),
-                n_buyers=('insider', lambda s: s[signal.loc[s.index, 'shares'] > 0].nunique()),
-            )
-            # Unweighted denominator: with the weighted one, any sell-only name
-            # came out at exactly -1 whatever its conviction weight.
-            total = agg['buy'] + agg['sell_raw']
-            out['INSIDER_NET_BUY'] = ((agg['buy'] - agg['sell'])
-                                      / total.replace(0, np.nan)).reindex(out.index)
-            # Several distinct insiders buying at once is the stronger form.
-            out['INSIDER_CLUSTER'] = agg['n_buyers'].reindex(out.index).fillna(0)
+        ins = sec.insiders_asof(tickers, as_of, lookback_days=INSIDER_HISTORY_DAYS)
+    sig = insider_signal(ins, as_of)
+    if not sig.empty:
+        out['INSIDER_NET_BUY'] = sig['INSIDER_NET_BUY'].reindex(out.index)
+        out['INSIDER_CLUSTER'] = sig['INSIDER_CLUSTER'].reindex(out.index).fillna(0)
 
     # ── 8-K event intensity ───────────────────────────────────────
     if _bt_events is not None:

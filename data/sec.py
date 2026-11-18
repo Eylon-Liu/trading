@@ -379,9 +379,56 @@ def _raw_form_doc(primary_doc: str | None) -> str:
     return _XSL_PREFIX.sub('', doc)
 
 
+# Bump when _parse_form4 changes what it stores. Rows written by an older
+# version are re-parsed from the cached filing on the next insider sync.
+INSIDER_PARSE_VERSION = 2
+
+_TRUE = {'1', 'true', 'y', 'yes'}
+
+# Footnote / remarks language marking a transaction as plan mechanics rather
+# than a decision. Qualified ESPP purchases are exempt from Section 16
+# reporting, but non-qualified plans, dividend reinvestment, 401(k) and
+# deferred-compensation purchases, and sell-to-cover sales do appear — coded
+# P or S — and say what they are in a footnote.
+_PLAN_PATTERNS = re.compile(
+    r'employee stock purchase|\bespp\b|dividend reinvest|\bdrip\b|401\s*\(?k\)?'
+    r'|deferred compensation|sell[- ]to[- ]cover|sold to cover'
+    r'|(?:satisfy|cover)\w*\s+(?:the\s+)?(?:\w+\s+)?tax\s+withholding',
+    re.I)
+_PLAN_10B51 = re.compile(r'10b5\s*-\s*1', re.I)
+
+
+def _is_true(v: str | None) -> bool:
+    return (v or '').strip().lower() in _TRUE
+
+
 def _parse_form4(raw: bytes, ticker: str, cik: str, acc: str,
                  filed: date) -> list[dict]:
-    """Extract non-derivative transactions from a Form 4 ownership document."""
+    """
+    Extract non-derivative transactions from a Form 4 ownership document.
+
+    Beyond reading the table, four things decide whether a row means what the
+    insider factor assumes it means:
+
+      * **Issuer.** A company's EDGAR submissions also list Form 4s it filed
+        as a *reporting owner* of another company — a 10% holder's purchases
+        of someone else's stock. Those are dropped unless the issuer CIK is
+        this filing's company.
+      * **Rule 10b5-1.** Since April 2023 the form carries a checkbox
+        (`aff10b5One`, written 0/1 or true/false) for trades under a
+        pre-arranged plan. Scheduled months ahead, they say nothing about
+        today; the remarks and footnotes are also read, since the box is one
+        per form and older forms only say so in text. Flag `10b5-1`.
+      * **Plan mechanics.** Footnotes identifying ESPP, DRIP, 401(k),
+        deferred-comp or sell-to-cover rows. Flag `plan`.
+      * **Exercise sales.** An S on the same day as an M (option exercise)
+        in the same filing is the cashless leg of the exercise. Flag
+        `exercise`.
+
+    Rows sharing (insider, date, code, direction) are summed. A sale executed
+    in several lots is reported as several rows at different prices, and the
+    table's key would otherwise keep only the last lot.
+    """
     try:
         text = raw.decode('utf-8', errors='replace')
         text = F4_NS_STRIP.sub('', text, count=1)   # Form 4 namespacing is inconsistent
@@ -389,39 +436,81 @@ def _parse_form4(raw: bytes, ticker: str, cik: str, acc: str,
     except (etree.XMLSyntaxError, ValueError):
         return []
 
+    issuer_cik = (root.findtext('.//issuer/issuerCik') or '').strip()
+    if issuer_cik and cik and issuer_cik.isdigit() and str(cik).strip().isdigit() \
+            and int(issuer_cik) != int(cik):
+        return []                                  # filed as owner of another issuer
+
     owner = root.findtext('.//reportingOwnerId/rptOwnerName') or 'unknown'
     roles = []
     for tag, label in (('isDirector', 'Director'), ('isOfficer', 'Officer'),
                        ('isTenPercentOwner', '10% Owner')):
-        v = root.findtext(f'.//reportingOwnerRelationship/{tag}')
-        if v and v.strip() in ('1', 'true'):
+        if _is_true(root.findtext(f'.//reportingOwnerRelationship/{tag}')):
             roles.append(label)
     title = root.findtext('.//reportingOwnerRelationship/officerTitle')
     if title:
         roles.append(title.strip())
 
-    rows = []
-    for txn in root.findall('.//nonDerivativeTransaction'):
-        code = txn.findtext('.//transactionCoding/transactionCode')
+    footnotes = {fn.get('id'): ' '.join(fn.itertext())
+                 for fn in root.findall('.//footnotes/footnote')}
+    remarks = root.findtext('.//remarks') or ''
+    form_flags = set()
+    if _is_true(root.findtext('.//aff10b5One')) or _PLAN_10B51.search(remarks):
+        form_flags.add('10b5-1')
+
+    parsed = []
+    for order, txn in enumerate(root.findall('.//nonDerivativeTransaction')):
+        code = (txn.findtext('.//transactionCoding/transactionCode') or '').strip()
         if not code:
             continue
-        txn_date = _d(txn.findtext('.//transactionDate/value'))
+        txn_date = _d(txn.findtext('.//transactionDate/value')) or filed
         shares = _num(txn.findtext('.//transactionShares/value'))
         price = _num(txn.findtext('.//transactionPricePerShare/value'))
-        acq_disp = txn.findtext('.//transactionAcquiredDisposedCode/value')
+        acq_disp = (txn.findtext('.//transactionAcquiredDisposedCode/value') or '').strip()
         post_txn = _num(txn.findtext(
             './/postTransactionAmounts/sharesOwnedFollowingTransaction/value'))
-
         if shares is not None and acq_disp == 'D':
             shares = -abs(shares)
 
+        flags = set(form_flags)
+        notes = ' '.join(footnotes.get(ref.get('id'), '')
+                         for ref in txn.iter('footnoteId'))
+        if _PLAN_10B51.search(notes):
+            flags.add('10b5-1')
+        if _PLAN_PATTERNS.search(notes):
+            flags.add('plan')
+        parsed.append({'order': order, 'code': code, 'date': txn_date,
+                       'dir': acq_disp, 'shares': shares, 'price': price,
+                       'post': post_txn, 'flags': flags})
+
+    exercise_days = {p['date'] for p in parsed if p['code'] == 'M'}
+    merged: dict[tuple, dict] = {}
+    for p in parsed:
+        if p['code'] == 'S' and p['date'] in exercise_days:
+            p['flags'].add('exercise')
+        key = (p['date'], p['code'], p['dir'])
+        m = merged.setdefault(key, {'shares': None, 'value': None, 'post': None,
+                                    'flags': set(), 'last': -1})
+        if p['shares'] is not None:
+            m['shares'] = (m['shares'] or 0.0) + p['shares']
+            if p['price']:
+                m['value'] = (m['value'] or 0.0) + abs(p['shares']) * p['price']
+        if p['order'] > m['last']:
+            m['last'], m['post'] = p['order'], p['post']
+        m['flags'] |= p['flags']
+
+    rows = []
+    for (txn_date, code, _dir), m in merged.items():
+        shares, value = m['shares'], m['value']
+        price = (value / abs(shares)) if (value and shares) else None
         rows.append({
             'accession': acc, 'ticker': ticker, 'insider': owner[:120],
-            'txn_date': txn_date or filed, 'txn_code': code.strip(),
+            'txn_date': txn_date, 'txn_code': code,
             'cik': cik, 'filed': filed, 'role': ', '.join(roles)[:120] or None,
-            'shares': shares, 'price': price,
-            'value': (abs(shares) * price) if (shares is not None and price) else None,
-            'post_txn_shares': post_txn,
+            'shares': shares, 'price': price, 'value': value,
+            'post_txn_shares': m['post'],
+            'flags': ','.join(sorted(m['flags'])) or None,
+            'parse_version': INSIDER_PARSE_VERSION,
         })
     return rows
 
@@ -433,14 +522,18 @@ def _num(s):
         return None
 
 
-def update_insiders(tickers: list[str], lookback_days: int = 730,
+def update_insiders(tickers: list[str], lookback_days: int = 1460,
                     max_per_ticker: int = 250) -> int:
     """
     Parse recent Form 4 filings into individual transactions.
 
     Bounded deliberately: AAPL alone has 587 Form 4s on file, so an unbounded
     backfill across a large universe would be tens of thousands of requests.
-    The window covers the horizon the insider factor actually uses.
+    The window covers the horizon the insider factor uses: 180 days of
+    trades, classified against the three prior years (routine vs.
+    opportunistic), so four years in all. Filings parsed by an older parser
+    version are re-parsed from the HTTP cache — no network — and their old
+    rows replaced, so a parser fix reaches stored history.
     """
     cutoff = date.today() - timedelta(days=lookback_days)
     written = 0
@@ -459,9 +552,12 @@ def update_insiders(tickers: list[str], lookback_days: int = 730,
         if pending.empty:
             continue
 
-        done = set(db.read_sql(
-            'SELECT DISTINCT accession FROM insider_txns WHERE ticker = :t',
-            {'t': ticker})['accession'])
+        stored = db.read_sql(
+            'SELECT accession, MIN(COALESCE(parse_version, 0)) AS v '
+            'FROM insider_txns WHERE ticker = :t GROUP BY accession',
+            {'t': ticker})
+        done = set(stored.loc[stored['v'] >= INSIDER_PARSE_VERSION, 'accession'])
+        stale = set(stored['accession']) - done
 
         jobs = [r for _i, r in pending.iterrows() if r['accession'] not in done]
         if not jobs:
@@ -485,10 +581,20 @@ def update_insiders(tickers: list[str], lookback_days: int = 730,
                     raw, ticker, r['cik'], r['accession'],
                     pd.to_datetime(r['filing_date']).date()))
 
+        redo = [r['accession'] for r in jobs if r['accession'] in stale]
+        with db.connect() as conn:
+            if redo:
+                # Replace, not merge: a re-parse can legitimately produce
+                # fewer rows (summed lots) or none (another issuer's filing).
+                ph = ','.join(f':a{i}' for i in range(len(redo)))
+                conn.execute(db.text(
+                    f'DELETE FROM insider_txns WHERE ticker = :t AND accession IN ({ph})'),
+                    {'t': ticker, **{f'a{i}': a for i, a in enumerate(redo)}})
+            if rows:
+                written += db.upsert(db.insider_txns, rows, conn=conn)
         if rows:
-            written += db.upsert(db.insider_txns, rows)
-            log.info('insiders %s: %d transactions from %d filings',
-                     ticker, len(rows), len(jobs))
+            log.info('insiders %s: %d transactions from %d filings (%d re-parsed)',
+                     ticker, len(rows), len(jobs), len(redo))
         db.record_ingest('insiders', ticker, rows=len(rows))
 
     return written
@@ -701,7 +807,7 @@ def insiders_asof(tickers: list[str], as_of: date | str,
 
     return db.read_sql(f"""
         SELECT ticker, filed, txn_date, insider, role, txn_code,
-               shares, price, value, post_txn_shares
+               shares, price, value, post_txn_shares, flags
         FROM insider_txns
         WHERE ticker IN ({ph}) AND filed BETWEEN :lo AND :hi
         ORDER BY filed DESC
