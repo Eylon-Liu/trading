@@ -79,7 +79,8 @@ install)
         [ -f "$src" ] || { echo "❌  $src not found"; exit 1; }
         # Fill in this checkout's real paths. The template's placeholders
         # used to be copied verbatim, so the job pointed at /Users/CHANGEME.
-        sed -e "s|__ROOT__|$ROOT|g" -e "s|__PATH__|$JOB_PATH|g" "$src" > "$dst"
+        sed -e "s|__ROOT__|$ROOT|g" -e "s|__PATH__|$JOB_PATH|g" \
+            -e "s|__PYTHON__|$PY|g" "$src" > "$dst"
         plutil -lint "$dst" >/dev/null
         launchctl unload "$dst" 2>/dev/null || true
         launchctl load "$dst"

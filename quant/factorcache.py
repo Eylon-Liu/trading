@@ -46,7 +46,8 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # date (future index members, with fundamentals only).
 # 14: share crosscheck no longer relaxed by splits after as_of; INSIDER_NET_BUY
 # conviction weighting now separates sell-only names.
-CODE_VERSION = 16
+# 17: equity smaller than half a year's earnings no longer yields ROE/ROIC/D/E.
+CODE_VERSION = 17
 
 # Entries are self-invalidating via the data version, so this only bounds
 # unbounded growth from many one-off as-of dates.

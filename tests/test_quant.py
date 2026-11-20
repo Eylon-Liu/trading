@@ -415,6 +415,10 @@ def test_equity_ratios_are_dropped_when_equity_is_negligible():
     assert np.isnan(F._meaningful_equity(-1.4e8, 4.0e9))     # negative
     assert np.isnan(F._meaningful_equity(1e7, 4.0e9))        # 0.25% of assets
     assert F._meaningful_equity(4.4e11, 5.6e11) == 4.4e11    # healthy
+    # Mettler-Toledo: 2.1% of assets, but equity under a tenth of a year's
+    # earnings — ROE 1,203%. MetLife: 3% of assets and a 23% ROE is real.
+    assert np.isnan(F._meaningful_equity(7.8e7, 3.7e9, 9.3e8))
+    assert F._meaningful_equity(2.2e10, 7.3e11, 5.2e9) == 2.2e10
 
 
 def test_invested_capital_is_nan_without_usable_equity():
@@ -503,6 +507,40 @@ def test_validate_flags_impossible_ratios():
     found = V.check_factor_bounds(factors)
     assert found and found[0].count == 1
     assert 'ERIE' in [t for t, _v in found[0].examples]
+
+
+def test_findings_with_bare_name_examples_render():
+    """Survivorship and infinity checks list names, not (name, value) pairs.
+
+    The table formatter unpacked every example as a pair, so ticking
+    "Test historical membership" crashed the Data tab's sanity check.
+    """
+    from quant import validate as V
+    findings = [V.Finding('survivorship', 'error', 2, 'gone', ['ANTM', 'ATVI']),
+                V.Finding('infinite values', 'error', 1, 'inf', ['ROE']),
+                V.Finding('ROE out of range', 'error', 1, 'x', [('MTD', 12.0)])]
+    out = V.to_frame(findings)
+    assert out['examples'].tolist() == ['ANTM, ATVI', 'ROE', 'MTD=12.0']
+
+
+def test_utility_total_revenue_tag_beats_lease_income():
+    """DTE files its revenue only as RegulatedAndUnregulatedOperatingRevenue.
+
+    Unmapped, the lease-income line was its revenue: $58M against $16.5B,
+    a net margin of 2,648%.
+    """
+    from data.taxonomy import SEC_TAG_MAP
+    assert 'RegulatedAndUnregulatedOperatingRevenue' in SEC_TAG_MAP['revenue']
+    facts = _facts([
+        {'concept': 'revenue', 'tag': 'OperatingLeaseLeaseIncome',
+         'period_start': '2026-01-01', 'period_end': '2026-03-31',
+         'filed': '2026-04-30', 'val': 12e6},
+        {'concept': 'revenue', 'tag': 'RegulatedAndUnregulatedOperatingRevenue',
+         'period_start': '2026-01-01', 'period_end': '2026-03-31',
+         'filed': '2026-04-30', 'val': 4.1e9},
+    ])
+    out = F._concept_frame(facts, 'revenue', {})
+    assert out.iloc[0]['tag'] == 'RegulatedAndUnregulatedOperatingRevenue'
 
 
 # ─────────────────────────────────────────────

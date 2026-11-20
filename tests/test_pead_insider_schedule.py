@@ -184,7 +184,20 @@ def test_launchd_job_is_a_tick_not_a_local_clock_time():
         assert 'StartCalendarInterval' not in data, f'{p.name} uses a local clock'
     sched = plistlib.loads((ROOT / 'tools/launchd/com.quant.scheduler.plist').read_bytes())
     assert sched['StartInterval'] <= 600
-    assert sched['ProgramArguments'][-1] == 'tick'
+    assert sched['ProgramArguments'][-2:] == ['scheduler', '--once']
+
+
+def test_launchd_runs_python_not_bash():
+    """
+    macOS privacy protection stops /bin/bash from reading a project under
+    ~/Desktop or ~/Documents: every tick exited 126, "Operation not
+    permitted", and no routine ran. The interpreter holds that access.
+    """
+    for p in (ROOT / 'tools' / 'launchd').glob('*.plist'):
+        args = plistlib.loads(p.read_bytes())['ProgramArguments']
+        assert args[0] == '__PYTHON__', f'{p.name} starts {args[0]}'
+    setup = (ROOT / 'tools/setup_schedule.sh').read_text()
+    assert setup.count('s|__PYTHON__|$PY|g') == 2        # scheduler and web
 
 
 def test_launchd_comments_contain_no_double_hyphen():
@@ -194,8 +207,6 @@ def test_launchd_comments_contain_no_double_hyphen():
             assert '--' not in comment, p.name
 
 
-def test_tick_mode_and_legacy_cleanup_exist():
-    routine = (ROOT / 'tools/daily_routine.sh').read_text()
+def test_legacy_cleanup_exists():
     setup = (ROOT / 'tools/setup_schedule.sh').read_text()
-    assert 'scheduler --once' in routine
     assert 'com.quant.morning' in setup and 'remove_legacy' in setup

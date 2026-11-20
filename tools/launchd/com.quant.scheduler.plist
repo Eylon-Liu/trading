@@ -8,20 +8,27 @@
 
     <!-- A five-minute tick, not a clock time. launchd only knows this Mac's
          local zone, while the routine's times are New York times
-         (QUANT_TZ, QUANT_MORNING_TIME, QUANT_EVENING_TIME). Each tick runs the
-         scheduler once (daily_routine.sh tick), which decides in QUANT_TZ, DST included,
+         (QUANT_TZ, QUANT_MORNING_TIME, QUANT_EVENING_TIME). Each tick runs
+         `cli.py scheduler` once, which decides in QUANT_TZ, DST included,
          whether the morning email or the evening preparation is due, runs it
          once per day, and catches up a run missed while the Mac slept.
          launchd never starts a tick while the previous one is still running.
 
-         __ROOT__ and __PATH__ are filled in by `tools/setup_schedule.sh
-         install`; do not copy this file into LaunchAgents by hand. -->
+         Python is launched directly, not through bash. macOS privacy
+         protection stops /bin/bash from reading a project kept in Desktop or
+         Documents (exit 126, "Operation not permitted"), and the interpreter
+         is what already holds that access.
+
+         __ROOT__, __PYTHON__ and __PATH__ are filled in by
+         `tools/setup_schedule.sh install`; do not copy this file into
+         LaunchAgents by hand. -->
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>__ROOT__/tools/daily_routine.sh</string>
-        <string>tick</string>
+        <string>__PYTHON__</string>
+        <string>__ROOT__/cli.py</string>
+        <string>scheduler</string>
+        <string>--once</string>
     </array>
 
     <key>StartInterval</key>

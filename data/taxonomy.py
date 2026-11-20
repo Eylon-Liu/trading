@@ -21,6 +21,8 @@ SEC_TAG_MAP: dict[str, list[str]] = {
         'RevenueFromContractWithCustomerExcludingAssessedTax',
         'RevenueFromContractWithCustomerIncludingAssessedTax',
         'Revenues', 'SalesRevenueNet', 'SalesRevenueGoodsNet',
+        # Utilities' total line (DTE files nothing else but lease income).
+        'RegulatedAndUnregulatedOperatingRevenue',
         'RevenuesNetOfInterestExpense',
         'InterestAndDividendIncomeOperating',
         'RealEstateRevenueNet',

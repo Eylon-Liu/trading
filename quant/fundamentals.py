@@ -572,6 +572,9 @@ def earnings_surprise(facts: pd.DataFrame, memo: dict | None = None
 # Book equity below this share of assets makes any equity-denominated ratio
 # meaningless rather than merely large.
 MIN_EQUITY_TO_ASSETS = 0.01
+# |ROE| above this means the equity has been bought back or written down to
+# almost nothing, not that the business is that profitable.
+MAX_MEANINGFUL_ROE = 2.0
 
 # Net income below this share of revenue is too small to divide by: the ratio
 # it produces says more about how close the denominator got to zero than about
@@ -597,7 +600,8 @@ def _invested_capital(equity: float, debt: float) -> float:
     return equity + (debt if np.isfinite(debt) else 0.0)
 
 
-def _meaningful_equity(equity: float, assets: float) -> float:
+def _meaningful_equity(equity: float, assets: float,
+                       net_income: float = np.nan) -> float:
     """
     Equity, or NaN when it is too small or negative to divide by.
 
@@ -608,12 +612,19 @@ def _meaningful_equity(equity: float, assets: float) -> float:
     once winsorized they look merely excellent — which is worse, because the
     name then ranks on a quality score it has not earned.
 
+    A share of assets alone cannot separate the two cases: insurers carry 3-4%
+    of assets as equity with ordinary ROEs, while Mettler-Toledo's 2.1% came
+    with an ROE of 1,203%. Equity smaller than half a year's earnings is the
+    depleted case wherever it occurs.
+
     NaN drops the factor for that name and the coverage floor decides whether
     enough remains to score it at all.
     """
     if not np.isfinite(equity) or equity <= 0:
         return np.nan
     if np.isfinite(assets) and assets > 0 and equity / assets < MIN_EQUITY_TO_ASSETS:
+        return np.nan
+    if np.isfinite(net_income) and abs(net_income) > MAX_MEANINGFUL_ROE * equity:
         return np.nan
     return equity
 
@@ -902,6 +913,7 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
         all_pe = [g['period_end'].max() for g in cg.values()
                   if not g.empty and 'period_end' in g.columns]
 
+        usable_equity = _meaningful_equity(equity, assets, ni)
         rows.append({
             'ticker': ticker,
             'revenue_ttm': rev, 'net_income_ttm': ni, 'operating_income_ttm': op_inc,
@@ -914,17 +926,16 @@ def build_fundamentals(tickers: list[str], as_of: date | str,
             'gross_margin': _safe_div(gp, rev),
             'operating_margin': _safe_div(op_inc, rev),
             'net_margin': _safe_div(ni, rev),
-            'roe': _safe_div(ni, _meaningful_equity(equity, assets)),
+            'roe': _safe_div(ni, usable_equity),
             'roa': roa,
-            'roic': _safe_div(op_inc, _invested_capital(
-                _meaningful_equity(equity, assets), debt)),
+            'roic': _safe_div(op_inc, _invested_capital(usable_equity, debt)),
             'gross_profitability': _safe_div(gp, assets),
             'asset_turnover': _safe_div(rev, assets),
-            'debt_to_equity': _safe_div(debt, _meaningful_equity(equity, assets)),
+            'debt_to_equity': _safe_div(debt, usable_equity),
             'net_debt_to_equity': _safe_div(
                 debt - cash if np.isfinite(debt) and np.isfinite(cash)
                 else np.nan,
-                _meaningful_equity(equity, assets)),
+                usable_equity),
             'current_ratio': _safe_div(cur_a, cur_l),
             'fcf_conversion': _safe_div(fcf, _meaningful_income(ni, rev)),
             'eps': eps,

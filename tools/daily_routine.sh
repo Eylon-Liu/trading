@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# Scheduled routine — a thin wrapper around `python cli.py daily`.
+# The daily routine by hand — a thin wrapper around `python cli.py daily`.
+# The schedule itself is `cli.py scheduler --once`, which launchd runs directly.
 #
 #   bash tools/daily_routine.sh morning   # the one email of the day:
 #                                         #   trading day  -> full brief
@@ -8,8 +9,6 @@
 #   bash tools/daily_routine.sh evening   # weekday evening: full ingest, screens and a
 #                                         # database backup; no email. Prepares the
 #                                         # next morning's brief so it is fast.
-#   bash tools/daily_routine.sh tick      # what launchd runs every 5 minutes: run
-#                                         # whichever of the two is due *in QUANT_TZ*
 #
 # The old mode names still work: quick = morning, full = evening.
 #
@@ -45,26 +44,16 @@ fi
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 MODE="${1:-morning}"
-
-if [ "$MODE" = "tick" ]; then
-    # The scheduler writes a routine_*.log per run it starts; a tick with
-    # nothing due prints nothing.
-    "$PYTHON" cli.py scheduler --once
-    rc=$?
-    find "$LOG_DIR" -name 'routine_*.log' -mtime +14 -delete 2>/dev/null || true
-    exit "$rc"
-fi
-
 LOGFILE="$LOG_DIR/routine_$(date +%Y%m%d_%H%M)_${MODE}.log"
 
 case "$MODE" in
     morning|quick) ARGS=(daily --mode quick) ;;
     evening|full)  ARGS=(daily --mode full --no-email --backup) ;;
-    *) echo "usage: $0 {morning|evening|tick}" >&2; exit 2 ;;
+    *) echo "usage: $0 {morning|evening}" >&2; exit 2 ;;
 esac
 
-# Echo to the terminal only when run by hand. Under launchd stdout is the
-# launchd_*.log, and teeing there stored every routine's output twice.
+# Echo to the terminal only when there is one; from cron or another job,
+# stdout is a log of its own and teeing there stored the output twice.
 if [ -t 1 ]; then out() { tee -a "$LOGFILE"; }; else out() { cat >> "$LOGFILE"; }; fi
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S')  routine: $MODE  python: $PYTHON ===" | out

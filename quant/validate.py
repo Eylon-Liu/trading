@@ -204,7 +204,10 @@ def check_survivorship(preset: str = 'SPY',
                         f'no stored {preset} membership at or before {as_of} — '
                         f'cannot measure survivorship')]
 
-    tickers = mem['ticker'].tolist()
+    # Same mapping as the backtest gate: a renamed listing (ANTM -> ELV) still
+    # trades and is priced under today's symbol, so it is not a survivorship gap.
+    from data.members import current_symbols
+    tickers = current_symbols(mem['ticker'].tolist())
     ph = ','.join(f':t{i}' for i in range(len(tickers)))
     params: dict = {f't{i}': t for i, t in enumerate(tickers)}
     params['a'] = str(as_of - timedelta(days=60))
@@ -408,10 +411,16 @@ def run_all(factors: pd.DataFrame | None = None,
     return sorted(findings, key=lambda f: (order.get(f.severity, 3), -f.count))
 
 
+def _example(e) -> str:
+    # Most checks give (ticker, value) pairs; infinities and survivorship give
+    # bare names, which the old `for t, v in` unpacked into an exception.
+    return f'{e[0]}={e[1]}' if isinstance(e, tuple) and len(e) == 2 else str(e)
+
+
 def to_frame(findings: list[Finding]) -> pd.DataFrame:
     if not findings:
         return pd.DataFrame()
     return pd.DataFrame([{
         'severity': f.severity, 'check': f.check, 'count': f.count,
-        'examples': ', '.join(f'{t}={v}' for t, v in f.examples[:4]) or '—',
+        'examples': ', '.join(_example(e) for e in f.examples[:4]) or '—',
     } for f in findings])
